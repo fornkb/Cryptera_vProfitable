@@ -13,7 +13,7 @@ import numpy as np
 
 
 # Per-timeframe fractal half-widths (left, right) used everywhere swings are needed.
-SWING_WIDTHS = {"4h": (5, 5), "1h": (4, 3), "15m": (3, 2)}
+SWING_WIDTHS = {"1d": (4, 4), "4h": (5, 5), "1h": (4, 3), "15m": (3, 2)}
 DEFAULT_WIDTH = (3, 3)
 
 
@@ -117,32 +117,62 @@ def _has_displacement_fvg(df: pd.DataFrame, start_idx: int, end_idx: int, direct
     return False
 
 
+def _seq_state(prices) -> int:
+    """
+    Classify a swing-price sequence as rising(+1) / falling(-1) / mixed(0) using
+    the last up-to-4 confirmed points (majority of step directions). A wider
+    window than the previous last-2 comparison makes structure resistant to a
+    single equal-high or one deep pullback flipping the label (BUG-08).
+    """
+    pts = list(prices)[-4:]
+    if len(pts) < 2:
+        return 0
+    ups = sum(1 for a, b in zip(pts, pts[1:]) if b > a)
+    downs = sum(1 for a, b in zip(pts, pts[1:]) if b < a)
+    if ups > downs:
+        return 1
+    if downs > ups:
+        return -1
+    return 0
+
+
+def _hl_label(prices, up_tok, dn_tok) -> str:
+    """Majority-vote state -> token; tie falls back to the last-two comparison."""
+    st = _seq_state(prices)
+    if st > 0:
+        return up_tok
+    if st < 0:
+        return dn_tok
+    return up_tok if (len(prices) >= 2 and prices[-1] > prices[-2]) else dn_tok
+
+
 def get_market_structure(confirmed_highs, confirmed_lows, df=None, recent_bars=12):
     """
     Determine structure label plus event-based BOS and CHoCH.
 
     confirmed_highs / confirmed_lows: ordered lists of {idx, ts, price}.
+    Structure label is derived from the last 3-4 confirmed swings on each side
+    (majority progression, BUG-08) rather than the last two only.
     BOS  = first close beyond the most recent confirmed swing in the trend
            direction (continuation), flagged 'fresh' if within recent_bars.
     CHoCH = first counter-trend close beyond the last protected swing.
     """
     neutral = (
         "NEUTRAL",
-        {"level": None, "direction": None, "fresh": False, "displacement": False},
-        {"detected": False, "direction": None, "level": None, "fresh": False},
+        {"level": None, "direction": None, "fresh": False, "displacement": False, "bars_ago": None},
+        {"detected": False, "direction": None, "level": None, "fresh": False, "bars_ago": None},
     )
     if len(confirmed_highs) < 2 or len(confirmed_lows) < 2:
         return neutral
 
-    sh1, sh2 = confirmed_highs[-2]["price"], confirmed_highs[-1]["price"]
-    sl1, sl2 = confirmed_lows[-2]["price"], confirmed_lows[-1]["price"]
-
-    high_state = "HH" if sh2 > sh1 else "LH"
-    low_state = "HL" if sl2 > sl1 else "LL"
+    high_prices = [h["price"] for h in confirmed_highs]
+    low_prices = [l["price"] for l in confirmed_lows]
+    high_state = _hl_label(high_prices, "HH", "LH")
+    low_state = _hl_label(low_prices, "HL", "LL")
     structure = f"{high_state}/{low_state}"
 
-    bos = {"level": None, "direction": None, "fresh": False, "displacement": False}
-    choch = {"detected": False, "direction": None, "level": None, "fresh": False}
+    bos = {"level": None, "direction": None, "fresh": False, "displacement": False, "bars_ago": None}
+    choch = {"detected": False, "direction": None, "level": None, "fresh": False, "bars_ago": None}
 
     if df is None or df.empty:
         return structure, bos, choch
@@ -175,6 +205,7 @@ def get_market_structure(confirmed_highs, confirmed_lows, df=None, recent_bars=1
             "level": last_high["price"],
             "direction": "BULLISH",
             "fresh": (n - 1 - break_pos_up) <= recent_bars,
+            "bars_ago": int(n - 1 - break_pos_up),
             "displacement": _has_displacement_fvg(df, last_high["idx"], break_pos_up, "BULLISH"),
         }
     elif break_pos_dn is not None:
@@ -182,6 +213,7 @@ def get_market_structure(confirmed_highs, confirmed_lows, df=None, recent_bars=1
             "level": last_low["price"],
             "direction": "BEARISH",
             "fresh": (n - 1 - break_pos_dn) <= recent_bars,
+            "bars_ago": int(n - 1 - break_pos_dn),
             "displacement": _has_displacement_fvg(df, last_low["idx"], break_pos_dn, "BEARISH"),
         }
 
@@ -193,7 +225,7 @@ def get_market_structure(confirmed_highs, confirmed_lows, df=None, recent_bars=1
             if c < last_low["price"]:
                 pos = last_low["idx"] + 1 + k
                 choch = {"detected": True, "direction": "BEARISH", "level": last_low["price"],
-                         "fresh": (n - 1 - pos) <= recent_bars}
+                         "fresh": (n - 1 - pos) <= recent_bars, "bars_ago": int(n - 1 - pos)}
                 break
     elif structure == "LH/LL":
         after = closes[last_high["idx"] + 1:]
@@ -201,7 +233,7 @@ def get_market_structure(confirmed_highs, confirmed_lows, df=None, recent_bars=1
             if c > last_high["price"]:
                 pos = last_high["idx"] + 1 + k
                 choch = {"detected": True, "direction": "BULLISH", "level": last_high["price"],
-                         "fresh": (n - 1 - pos) <= recent_bars}
+                         "fresh": (n - 1 - pos) <= recent_bars, "bars_ago": int(n - 1 - pos)}
                 break
 
     return structure, bos, choch
@@ -269,15 +301,18 @@ def find_order_blocks(df: pd.DataFrame, value_area: dict, lookback=50):
                                             "created_at_idx": j, "high_volume_node": _tag_hvn((hi + lo) / 2)})
                     break
 
+    # Mitigation is wick-aware (BUG-17): an OB whose zone was traded through by a
+    # WICK (stops taken) counts as mitigated even if no candle CLOSED beyond it,
+    # so a swept level is not offered as a fresh unswept entry candidate.
     unmit_bull = []
     for ob in bullish_obs:
-        sub = df["close"].iloc[ob["created_at_idx"] + 1:]
+        sub = df["low"].iloc[ob["created_at_idx"] + 1:]
         if sub.empty or sub.min() >= ob["bottom"]:
             unmit_bull.append({k: v for k, v in ob.items() if k != "created_at_idx"})
 
     unmit_bear = []
     for ob in bearish_obs:
-        sub = df["close"].iloc[ob["created_at_idx"] + 1:]
+        sub = df["high"].iloc[ob["created_at_idx"] + 1:]
         if sub.empty or sub.max() <= ob["top"]:
             unmit_bear.append({k: v for k, v in ob.items() if k != "created_at_idx"})
 
@@ -311,14 +346,27 @@ def find_fvg(df: pd.DataFrame, lookback=50):
                             "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
                             "filled": bool(filled)})
 
+    def _gap_dist(f):
+        """0 when price sits inside the gap (straddling), else distance to the nearest edge."""
+        if f["bottom"] <= current_price <= f["top"]:
+            return 0.0
+        return min(abs(current_price - f["top"]), abs(current_price - f["bottom"]))
+
+    def _straddles(f):
+        return bool(f["bottom"] <= current_price <= f["top"])
+
+    # A gap straddling current price is the most actionable one — include it
+    # (BUG-16). Demand (bull) gaps at/below price; supply (bear) gaps at/above.
     nearest_bull = None
-    below = [f for f in bullish if not f["filled"] and f["top"] <= current_price]
-    if below:
-        nearest_bull = max(below, key=lambda x: x["top"])
+    cand_bull = [f for f in bullish if not f["filled"] and f["bottom"] <= current_price]
+    if cand_bull:
+        nearest_bull = min(cand_bull, key=_gap_dist)
+        nearest_bull = {**nearest_bull, "straddles_price": _straddles(nearest_bull)}
     nearest_bear = None
-    above = [f for f in bearish if not f["filled"] and f["bottom"] >= current_price]
-    if above:
-        nearest_bear = min(above, key=lambda x: x["bottom"])
+    cand_bear = [f for f in bearish if not f["filled"] and f["top"] >= current_price]
+    if cand_bear:
+        nearest_bear = min(cand_bear, key=_gap_dist)
+        nearest_bear = {**nearest_bear, "straddles_price": _straddles(nearest_bear)}
 
     return {
         "nearest_bullish_fvg": nearest_bull,
@@ -330,8 +378,14 @@ def find_fvg(df: pd.DataFrame, lookback=50):
 
 # ---------------- liquidity pools ---------------- #
 
-def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002):
-    """Cluster swings within an ATR-scaled tolerance into BSL / SSL pools (top 3 each)."""
+def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002, current_price: float = None):
+    """
+    Cluster swings within an ATR-scaled tolerance into BSL / SSL pools. Keep the
+    3 pools NEAREST to current price on each side (BUG-11) — those are the ones
+    that actually get swept and targeted — rather than the 3 most extreme, which
+    truncated away the actionable near-price levels. Falls back to the extremes
+    when current price is unknown.
+    """
     tolerance = max(0.001, min(0.01, atr_pct * 0.5))
     high_prices = sorted([s[1] for s in swing_highs])
     low_prices = sorted([s[1] for s in swing_lows])
@@ -354,6 +408,10 @@ def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002):
 
     bsl = _cluster(high_prices, take_max=True)
     ssl = _cluster(low_prices, take_max=False)
+    if current_price is not None:
+        buy = sorted(bsl, key=lambda p: abs(p - current_price))[:3]
+        sell = sorted(ssl, key=lambda p: abs(p - current_price))[:3]
+        return {"buy_side": buy, "sell_side": sell}
     return {"buy_side": sorted(bsl, reverse=True)[:3], "sell_side": sorted(ssl)[:3]}
 
 
@@ -384,20 +442,22 @@ def get_premium_discount(swing_high, swing_low, current_price, leg_direction="bu
     }
 
 
-def _current_dealing_range(confirmed_highs, confirmed_lows):
+def _current_dealing_range(confirmed_highs, confirmed_lows, current_price=None):
     """
-    Most recent dealing range = the latest confirmed swing high and the latest
-    confirmed swing low that bracket current price (single leg), not max/min of a
-    mixed window (fixes B9). Also returns the leg direction: the leg is bullish
-    when the most recent confirmed swing is the high (low->high move), bearish
-    when it is the low.
+    Most recent dealing range that BRACKETS current price (BUG-09). Start from the
+    latest confirmed swing high/low; if that pair does not bracket price (e.g.
+    after a breakout price sits outside the last leg), walk out to the nearest
+    confirmed high above price and nearest confirmed low below price so the
+    premium/discount + OTE math is computed on a range that actually contains
+    price. Returns (high, low, leg_direction, brackets_price). `brackets_price`
+    is False when price is beyond all confirmed structure (strong breakout) — the
+    caller should treat premium/discount as directional context only.
     """
     if not confirmed_highs or not confirmed_lows:
-        return None, None, None
+        return None, None, None, False
     last_high = confirmed_highs[-1]
     last_low = confirmed_lows[-1]
     leg = "bullish" if last_high["ts"] >= last_low["ts"] else "bearish"
-    # Pair the most recent high with the most recent low; order them as a range.
     hi = last_high["price"]
     lo = last_low["price"]
     if hi <= lo:
@@ -406,21 +466,33 @@ def _current_dealing_range(confirmed_highs, confirmed_lows):
             hi = max(hi, confirmed_highs[-2]["price"])
         if len(confirmed_lows) >= 2:
             lo = min(lo, confirmed_lows[-2]["price"])
-    return hi, lo, leg
+
+    brackets = True
+    if current_price is not None and not (lo <= current_price <= hi):
+        highs_above = [h["price"] for h in confirmed_highs if h["price"] >= current_price]
+        lows_below = [l["price"] for l in confirmed_lows if l["price"] <= current_price]
+        if highs_above:
+            hi = min(highs_above)          # nearest confirmed resistance above price
+        if lows_below:
+            lo = max(lows_below)           # nearest confirmed support below price
+        brackets = bool(highs_above and lows_below and lo <= current_price <= hi)
+    return hi, lo, leg, brackets
 
 
 # ---------------- context assembly ---------------- #
 
-def build_smc_context(df_4h, df_1h, df_15m, value_areas: dict = None):
+def build_smc_context(df_4h, df_1h, df_15m, df_1d=None, value_areas: dict = None):
     """
     Build multi-timeframe SMC context. `value_areas` is an optional
     {tf: {vah,val,poc}} dict computed once upstream to avoid recomputation (B11).
+    The optional 1D leg adds daily structure + daily liquidity pools that the
+    geometry engine uses as higher-timeframe targets.
     """
     from price_action import get_value_area
 
     context = {}
     value_areas = value_areas or {}
-    for tf, df in (("4h", df_4h), ("1h", df_1h), ("15m", df_15m)):
+    for tf, df in (("1d", df_1d), ("4h", df_4h), ("1h", df_1h), ("15m", df_15m)):
         if df is None or df.empty:
             continue
 
@@ -436,9 +508,10 @@ def build_smc_context(df_4h, df_1h, df_15m, value_areas: dict = None):
         va = value_areas.get(tf) or get_value_area(df)
         obs = find_order_blocks(df, va)
         fvgs = find_fvg(df)
-        liq = find_liquidity_levels(sh, sl, atr_pct=_atr_pct(df))
+        liq = find_liquidity_levels(sh, sl, atr_pct=_atr_pct(df), current_price=current_price)
 
-        dealing_high, dealing_low, leg_dir = _current_dealing_range(confirmed_highs, confirmed_lows)
+        dealing_high, dealing_low, leg_dir, brackets = _current_dealing_range(
+            confirmed_highs, confirmed_lows, current_price=current_price)
         if dealing_high is not None and dealing_low is not None:
             pd_zone = get_premium_discount(dealing_high, dealing_low, current_price,
                                            leg_direction=leg_dir or "bullish")
@@ -457,7 +530,7 @@ def build_smc_context(df_4h, df_1h, df_15m, value_areas: dict = None):
             "fvg": fvgs,
             "liquidity_levels": liq,
             "premium_discount": pd_zone,
-            "dealing_range": {"high": dealing_high, "low": dealing_low},
+            "dealing_range": {"high": dealing_high, "low": dealing_low, "brackets_price": brackets},
             "developing_swings": {
                 "highs": [d["price"] for d in dev_h],
                 "lows": [d["price"] for d in dev_l],

@@ -229,6 +229,30 @@ def find_untested_pocs(df: pd.DataFrame, n_sessions: int = 4, session_bars: int 
     return deduped[:5]
 
 
+def weekly_levels(df_1d: pd.DataFrame) -> dict:
+    """
+    Previous-week high/low and current-week open from daily candles (HTF draws for
+    the 1D timeframe). Weeks are ISO weeks in UTC. Falls back to the current week
+    when only one week of daily data is present.
+    """
+    out = {"pwh": None, "pwl": None, "weekly_open": None}
+    if df_1d is None or df_1d.empty:
+        return out
+    ts = pd.to_datetime(df_1d["timestamp"])
+    iso = ts.dt.isocalendar()
+    wk_key = (iso["year"].astype(int) * 100 + iso["week"].astype(int)).to_numpy()
+    d = df_1d.assign(_wk=wk_key)
+    groups = [g for _, g in d.groupby("_wk", sort=True)]
+    if not groups:
+        return out
+    cur = groups[-1]
+    out["weekly_open"] = round(float(cur["open"].iloc[0]), 6)
+    prev = groups[-2] if len(groups) >= 2 else cur
+    out["pwh"] = round(float(prev["high"].max()), 6)
+    out["pwl"] = round(float(prev["low"].min()), 6)
+    return out
+
+
 def get_anchored_vwap(df: pd.DataFrame, anchor_idx: int):
     """Volume-weighted average price of typical price from `anchor_idx` to now."""
     if df is None or df.empty or anchor_idx is None or anchor_idx < 0 or anchor_idx >= len(df):
@@ -267,7 +291,7 @@ def compute_avwap_levels(df: pd.DataFrame, tf: str) -> dict:
     return out
 
 
-def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dict:
+def build_pa_context(df_1h, df_15m, df_4h=None, df_1d=None, value_areas: dict = None) -> dict:
     """value_areas: optional pre-computed {tf:{vah,val,poc}} to avoid recompute (B11)."""
     if df_15m is None or df_15m.empty:
         return {}
@@ -281,6 +305,8 @@ def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dic
                                       else {"vah": current_price, "val": current_price, "poc": current_price})
     va_4h = value_areas.get("4h") or (get_value_area(df_4h) if df_4h is not None and not df_4h.empty
                                       else {"vah": current_price, "val": current_price, "poc": current_price})
+    va_1d = value_areas.get("1d") or (get_value_area(df_1d) if df_1d is not None and not df_1d.empty
+                                      else {"vah": current_price, "val": current_price, "poc": current_price})
 
     sh, sl = find_swings(df_15m, left=3, right=2)
     sr_levels = get_sr_levels(sh, sl, current_price, value_area=va_1h, atr_pct=_atr_pct(df_15m))
@@ -289,6 +315,11 @@ def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dic
         else (current_price, current_price, current_price)
 
     untested_pocs_4h = find_untested_pocs(df_4h) if df_4h is not None and not df_4h.empty else []
+    # Daily untested POCs use weekly windows (5 daily bars) as HTF magnets/targets.
+    untested_pocs_1d = find_untested_pocs(df_1d, n_sessions=6, session_bars=5) \
+        if df_1d is not None and not df_1d.empty else []
+    weekly = weekly_levels(df_1d) if df_1d is not None and not df_1d.empty \
+        else {"pwh": None, "pwl": None, "weekly_open": None}
 
     avwap = {
         "15m": compute_avwap_levels(df_15m, "15m"),
@@ -300,11 +331,16 @@ def build_pa_context(df_1h, df_15m, df_4h=None, value_areas: dict = None) -> dic
         "value_area_15m": va_15m,
         "value_area_1h": va_1h,
         "value_area_4h": va_4h,
+        "value_area_1d": va_1d,
         "poc_1h": va_1h.get("poc", current_price),
         "sr_levels": sr_levels,
         "avwap": avwap,
         "pdh": pdh,
         "pdl": pdl,
         "pdc": pdc,
+        "pwh": weekly["pwh"],
+        "pwl": weekly["pwl"],
+        "weekly_open": weekly["weekly_open"],
         "untested_pocs_4h": untested_pocs_4h,
+        "untested_pocs_1d": untested_pocs_1d,
     }

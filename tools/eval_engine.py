@@ -137,6 +137,9 @@ def main():
         "by_event_guard": defaultdict(_accumulator),
         "by_volume_gate": defaultdict(_accumulator),
         "by_action": defaultdict(_accumulator),
+        # Does the LLM's candidate-picking add or subtract alpha vs the engine
+        # primary? Hit-rate split on trade_management.selected_from_engine.
+        "by_selected_from_engine": defaultdict(_accumulator),
     }
 
     labelled = 0
@@ -158,6 +161,9 @@ def main():
         action = header.get("action") or "HOLD"
         vr_15m = (snap.get("volatility_regime") or {}).get("15m", {}).get("regime", "unknown")
         event_active = "active" if (snap.get("event_guard") or {}).get("active") else "clear"
+        tm = (analysis.get("trade_decision") or {}).get("trade_management") or {}
+        sel = tm.get("selected_from_engine")
+        sel_key = "engine_primary" if sel is True else ("llm_alternative" if sel is False else "unknown")
 
         _record(buckets["overall"], outcome)
         _record(buckets["by_score"][_bucket_score(score)], outcome)
@@ -166,6 +172,7 @@ def main():
         _record(buckets["by_event_guard"][event_active], outcome)
         _record(buckets["by_volume_gate"][gate], outcome)
         _record(buckets["by_action"][action], outcome)
+        _record(buckets["by_selected_from_engine"][sel_key], outcome)
 
     report = {
         "snapshots_scanned": seen,

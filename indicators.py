@@ -145,8 +145,28 @@ def detect_volatility_regime(df: pd.DataFrame) -> dict:
     }
 
 
+ADX_TREND_FLOOR = 20.0  # 4H ADX must clear this for a "Trending" classification (BUG-08)
+
+
+def _adx_last(df) -> float:
+    if df is None or df.empty or "ADX" not in df.columns:
+        return None
+    v = df["ADX"].iloc[-1]
+    return float(v) if pd.notna(v) else None
+
+
 def detect_regime(df_4h, df_1h, df_15m, smc_context: dict = None) -> str:
-    """Global regime: SMC structure first, weighted EMA/RSI fallback."""
+    """
+    Global regime (raw, pre-hysteresis): multi-swing 4H structure gated by a 4H
+    ADX floor, with a weighted EMA/RSI fallback that also respects the floor.
+    A directional structure with weak 4H ADX (< ADX_TREND_FLOOR) is treated as a
+    range, not a trend (BUG-08) — this stops the mean-revert rubric firing on
+    limp trends and the continuation rubric firing on choppy drift. Hysteresis
+    (compute_regime_with_hysteresis) is applied by the caller across runs.
+    """
+    adx_4h = _adx_last(df_4h)
+    trend_ok = adx_4h is None or adx_4h >= ADX_TREND_FLOOR
+
     if smc_context:
         struct_4h = smc_context.get("4h", {}).get("structure", "NEUTRAL")
         struct_1h = smc_context.get("1h", {}).get("structure", "NEUTRAL")
@@ -159,10 +179,13 @@ def detect_regime(df_4h, df_1h, df_15m, smc_context: dict = None) -> str:
         def is_bear(s):
             return "LH" in s and "LL" in s
 
-        if is_bull(struct_4h):
+        if trend_ok and is_bull(struct_4h):
             return "Trending Bullish"
-        if is_bear(struct_4h):
+        if trend_ok and is_bear(struct_4h):
             return "Trending Bearish"
+        # Directional 4H structure but sub-floor ADX -> not a tradable trend.
+        if not trend_ok and (is_bull(struct_4h) or is_bear(struct_4h)):
+            return "Ranging / Sideways"
         if bos_1h.get("level") is None and not choch_1h.get("detected") and not (is_bull(struct_1h) or is_bear(struct_1h)):
             return "Ranging / Sideways"
 
@@ -181,8 +204,87 @@ def detect_regime(df_4h, df_1h, df_15m, smc_context: dict = None) -> str:
         return score
 
     weighted = 0.5 * tf_score(df_4h) + 0.3 * tf_score(df_1h) + 0.2 * tf_score(df_15m)
-    if weighted > 0.8:
+    if trend_ok and weighted > 0.8:
         return "Trending Bullish"
-    if weighted < -0.8:
+    if trend_ok and weighted < -0.8:
         return "Trending Bearish"
     return "Ranging / Sideways"
+
+
+def regime_bucket(regime: str) -> str:
+    """Rubric bucket a regime string maps to: 'ranging' (mean-revert) or 'trending'."""
+    r = regime or ""
+    return "ranging" if ("Ranging" in r or "Sideways" in r) else "trending"
+
+
+def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int = 2):
+    """
+    Pure hysteresis over the RUBRIC bucket (trending vs ranging). A rubric flip is
+    the most expensive kind of regime noise (it changes trade-direction logic), so
+    require `runs` consecutive raw classifications in the new bucket before the
+    effective regime switches buckets. Direction changes WITHIN the same bucket
+    (e.g. Trending Bullish -> Trending Bearish) apply immediately. IO-free so it
+    unit-tests without disk; the caller persists `new_state` keyed by symbol.
+
+    prior_state: {"effective","candidate","candidate_runs"} (or {} on first run).
+    Returns (effective_regime, new_state).
+    """
+    effective = (prior_state or {}).get("effective")
+    if not effective:
+        return raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
+
+    if regime_bucket(raw_regime) == regime_bucket(effective):
+        # same rubric -> accept immediately (picks up direction changes too)
+        return raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
+
+    # candidate is in the opposite rubric bucket
+    prev_cand = (prior_state or {}).get("candidate")
+    cand_runs = int((prior_state or {}).get("candidate_runs", 0) or 0)
+    if prev_cand is not None and regime_bucket(prev_cand) == regime_bucket(raw_regime):
+        cand_runs += 1
+    else:
+        cand_runs = 1
+    if cand_runs >= runs:
+        return raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
+    return effective, {"effective": effective, "candidate": raw_regime, "candidate_runs": cand_runs}
+
+
+# ---------------- session-aware volume + ICT kill zones ---------------- #
+
+def kill_zone(hour_utc: int) -> str:
+    """ICT kill-zone tag for a UTC hour (approximate fixed windows)."""
+    if 7 <= hour_utc < 10:
+        return "LONDON"
+    if 12 <= hour_utc < 15:
+        return "NEWYORK"
+    if 0 <= hour_utc < 4:
+        return "ASIA"
+    return "OFF"
+
+
+def session_volume_context(df_15m: pd.DataFrame) -> dict:
+    """
+    Session-aware relative volume: compare the last closed 15m bar's volume to the
+    mean volume of bars sharing its UTC hour-of-day over the available history,
+    instead of the trailing-30-bar mean. This removes the time-of-day bias that
+    made the flat-lookback gate flag normal Asia-session bars as LOW_VOL. Also
+    tags the current ICT kill zone. Falls back gracefully on thin data.
+    """
+    out = {"session_relative_volume": None, "kill_zone": "OFF", "hour_utc": None, "slot_samples": 0}
+    if df_15m is None or df_15m.empty or "volume" not in df_15m.columns:
+        return out
+    ts = pd.to_datetime(df_15m["timestamp"])
+    hours = ts.dt.hour.to_numpy()
+    vols = df_15m["volume"].to_numpy(dtype=float)
+    last_hour = int(hours[-1])
+    last_vol = float(vols[-1])
+    same = vols[:-1][hours[:-1] == last_hour] if len(vols) > 1 else vols[:0]
+    base = float(same.mean()) if same.size else float(vols.mean() if vols.size else 1.0)
+    srel = round(last_vol / max(base, 1e-9), 2) if base > 0 else None
+    out.update({
+        "session_relative_volume": srel,
+        "kill_zone": kill_zone(last_hour),
+        "hour_utc": last_hour,
+        "slot_samples": int(same.size),
+    })
+    return out

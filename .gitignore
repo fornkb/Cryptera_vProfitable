@@ -28,6 +28,8 @@ improvements_report.md
 CLAUDE.md
 # engine-managed OI history fallback
 data/oi_history.json
+# per-symbol regime hysteresis state (regenerated each run)
+data/regime_state.json
 # fitted weights (machine/data-specific, regenerate)
 data/calibration.json
 

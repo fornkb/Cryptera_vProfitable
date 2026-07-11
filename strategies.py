@@ -15,6 +15,7 @@ score -> empirical-win-rate mapping.
 
 import os
 import json
+import math
 import pandas as pd
 import numpy as np
 
@@ -29,7 +30,7 @@ def load_calibration() -> dict:
     global _CALIBRATION_CACHE
     if _CALIBRATION_CACHE is not None:
         return _CALIBRATION_CACHE
-    data = {"weights": {}, "mr_weights": {}, "score_to_winrate": []}
+    data = {"weights": {}, "mr_weights": {}, "score_to_winrate": [], "logistic": {}}
     try:
         if os.path.exists(_CALIBRATION_PATH):
             with open(_CALIBRATION_PATH) as f:
@@ -46,6 +47,30 @@ def _empirical_winrate(score: int, calib: dict):
         if b.get("min", 0) <= score <= b.get("max", 100):
             return b.get("win_rate")
     return None
+
+
+def _logistic_winrate(breakdown: dict, score_mode: str, calib: dict):
+    """
+    Calibration v2 (BUG-12): win probability from a standardized logistic model
+    fitted per rubric over the confluence_breakdown components. Returns None when
+    no logistic model is present (engine then falls back to the score bucket).
+    """
+    model = (calib.get("logistic") or {}).get(score_mode)
+    if not model:
+        return None
+    coef = model.get("coef") or {}
+    mean = model.get("mean") or {}
+    std = model.get("std") or {}
+    z = float(model.get("intercept", 0.0))
+    for k, w in coef.items():
+        mu = float(mean.get(k, 0.0))
+        sd = float(std.get(k, 1.0)) or 1.0
+        x = float(breakdown.get(k, 0.0) or 0.0)
+        z += float(w) * ((x - mu) / sd)
+    try:
+        return round(1.0 / (1.0 + math.exp(-z)), 4)
+    except OverflowError:
+        return 1.0 if z > 0 else 0.0
 
 
 # ---------------- helpers ---------------- #
@@ -285,8 +310,12 @@ def _c7_cvd(windowed, bias):
     if absorption:
         return 0, "15m CVD opposes 4H (absorption)", True
     matches = sum(1 for s in (c4, c1, c15) if s == target)
-    if matches >= 2:
-        return 10, ("strong CVD alignment" if matches == 3 else "CVD aligned 2 TFs"), False
+    # Rebudgeted to 15 max (BUG-08 rubric decorrelation): CVD is orthogonal
+    # evidence, so full 3-TF alignment earns more than the location cluster.
+    if matches == 3:
+        return 15, "strong CVD alignment (3 TF)", False
+    if matches == 2:
+        return 10, "CVD aligned 2 TFs", False
     return 0, f"CVD aligned {matches} TF(s)", False
 
 
@@ -386,10 +415,50 @@ def _m6_range_confirmed(smc_context):
 
 # ---------------- volume gate ---------------- #
 
+# Rubric decorrelation (audit §3.6): C2 (OB proximity), C5 (FVG magnet) and C6
+# (OTE) all answer "is price at a good LOCATION" — left uncapped a single location
+# could bank 40 pts and dominate the score. They now share one capped budget so
+# freed headroom goes to orthogonal evidence (C3 sweep -> 15, C7 CVD -> 15). The
+# individual c2/c5/c6 keys are preserved (calibration/labeling stability); only
+# their SUM is bounded. Per-regime action thresholds are deferred until eval data
+# supports refitting them (current_status Phase 2).
+LOCATION_CAP = 25
+LOCATION_KEYS = ("c2_ob_proximity", "c5_fvg_magnet", "c6_ote_bonus")
+
+
+def _rebudget_sweep(pts: int) -> int:
+    """Scale the C3 sweep slot to a 15-pt max (HTF sweep 15, 15m-only 9)."""
+    if pts >= 10:
+        return 15
+    if pts >= 6:
+        return 9
+    return 0
+
+
+def _apply_location_cap(breakdown: dict) -> tuple[dict, int]:
+    """Proportionally scale the location components so their sum <= LOCATION_CAP."""
+    total = sum(int(breakdown.get(k, 0) or 0) for k in LOCATION_KEYS)
+    if total <= LOCATION_CAP or total <= 0:
+        return breakdown, total
+    f = LOCATION_CAP / total
+    for k in LOCATION_KEYS:
+        breakdown[k] = int(round(int(breakdown.get(k, 0) or 0) * f))
+    return breakdown, LOCATION_CAP
+
+
 def _volume_gate(windowed):
-    rel = float(windowed.get("15m", {}).get("relative_volume", 1.0) or 1.0)
-    state = "HARD_GATE" if rel < 0.1 else ("LOW_VOL_WARNING" if rel < 0.3 else "CLEAR")
-    return {"state": state, "rel_vol_15m": rel}
+    """
+    Session-aware volume gate: prefer the same-time-of-day relative volume
+    (removes the Asia-hours false LOW_VOL bias) and fall back to the flat
+    trailing relative volume when session data is unavailable.
+    """
+    w15 = windowed.get("15m", {}) or {}
+    rel = float(w15.get("relative_volume", 1.0) or 1.0)
+    srel = w15.get("session_relative_volume")
+    gate_val = float(srel) if srel is not None else rel
+    state = "HARD_GATE" if gate_val < 0.1 else ("LOW_VOL_WARNING" if gate_val < 0.3 else "CLEAR")
+    return {"state": state, "rel_vol_15m": rel, "session_rel_vol_15m": srel,
+            "kill_zone": w15.get("kill_zone", "OFF"), "gate_basis": "session" if srel is not None else "trailing"}
 
 
 # ---------------- order-flow / positioning modifiers (T1-4) ---------------- #
@@ -444,10 +513,14 @@ def _order_flow_modifier(direction, orderbook, funding, open_interest, sentiment
                 mod += 2
                 notes.append(f"longs paying (funding p{pct:.0f}) - short tailwind")
 
-    # 3) Open interest vs price (continuation confirm / squeeze warn)
+    # 3) Open interest vs price (continuation confirm / squeeze warn).
+    #    Match the OI window to the price window (BUG-10): change_4h_pct is a
+    #    single-4H-bar delta, so compare it against the last CLOSED 4H bar's price
+    #    change, not the ~40h window_price_change_pct.
     oi = open_interest or {}
     oi_chg = oi.get("change_4h_pct")
-    px_chg = float(windowed.get("4h", {}).get("window_price_change_pct", 0.0) or 0.0)
+    w4 = windowed.get("4h", {}) or {}
+    px_chg = float(w4.get("bar_price_change_pct", w4.get("window_price_change_pct", 0.0)) or 0.0)
     if oi_chg is not None:
         px_dir = 1 if px_chg > 0 else (-1 if px_chg < 0 else 0)
         want = 1 if direction == "bullish" else -1
@@ -500,6 +573,13 @@ def _order_flow_modifier(direction, orderbook, funding, open_interest, sentiment
 
 
 # ---------------- deterministic trade geometry (T1-5) ---------------- #
+
+def _dist_atr(level, ref_price, atr_abs):
+    """Absolute distance from a reference price in 15m-ATR multiples (None if no ATR)."""
+    if atr_abs and atr_abs > 0 and level is not None and ref_price is not None:
+        return round(abs(float(level) - float(ref_price)) / atr_abs, 2)
+    return None
+
 
 def _nearest_level(cands, entry, direction):
     """Nearest real structural level beyond entry in the trade direction, or None."""
@@ -582,11 +662,11 @@ def _merge_confluent(rows, tol=0.0015):
     return merged
 
 
-def _rank_entries(labeled, ref_price, dealing_range):
+def _rank_entries(labeled, ref_price, dealing_range, atr_abs=None):
     """
     labeled: [(price, source, hvn)] -> confluence-merged, nearest-first entry
-    candidates, each annotated with tf, hvn, confluence stack, and premium/discount
-    zone (#1).
+    candidates, each annotated with tf, hvn, confluence stack, premium/discount
+    zone (#1), and ATR distance from current price (LLM does no arithmetic).
     """
     rows = [{"price": round(float(p), 6), "source": s, "hvn": bool(h)}
             for p, s, h in labeled if p is not None]
@@ -594,14 +674,16 @@ def _rank_entries(labeled, ref_price, dealing_range):
     merged = _merge_confluent(rows)
     for m in merged:
         m["zone"] = _zone_of(m["price"], dealing_range)
+        m["dist_from_price_atr"] = _dist_atr(m["price"], ref_price, atr_abs)
     return merged
 
 
-def _rank_targets(labeled, entry, risk, direction):
+def _rank_targets(labeled, entry, risk, direction, ref_price=None, atr_abs=None):
     """
     labeled: [(price, source)] -> confluence-merged targets strictly beyond entry,
-    nearest first, each with R:R, tf, and confluence stack. HVN is not meaningful
-    for targets so it is dropped.
+    nearest first, each with R:R, tf, confluence stack, and ATR distance from
+    current price (reachability within the horizon). HVN is not meaningful for
+    targets so it is dropped.
     """
     rows = []
     for p, s in labeled:
@@ -617,6 +699,7 @@ def _rank_targets(labeled, entry, risk, direction):
     for m in merged:
         m.pop("hvn", None)
         m["rr"] = round(abs(m["price"] - entry) / risk, 2) if risk > 0 else None
+        m["dist_from_price_atr"] = _dist_atr(m["price"], ref_price if ref_price is not None else entry, atr_abs)
     return merged
 
 
@@ -641,9 +724,12 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     ctx15 = smc_context.get("15m", {}) or {}
     liq15 = ctx15.get("liquidity_levels", {}) or {}
     liq1h = smc_context.get("1h", {}).get("liquidity_levels", {}) or {}
+    liq1d = smc_context.get("1d", {}).get("liquidity_levels", {}) or {}
     pa = pa_context or {}
     va = pa.get("value_area_1h", {}) or {}
     untested = [u["poc"] for u in pa.get("untested_pocs_4h", []) or []]
+    untested_1d = [u["poc"] for u in pa.get("untested_pocs_1d", []) or []]
+    pwh, pwl = pa.get("pwh"), pa.get("pwl")  # previous-week high/low (HTF draws)
 
     # Anchored VWAP levels are real dynamic S/R — valid structural targets (P4)
     avwap = pa.get("avwap", {}) or {}
@@ -676,9 +762,12 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
         obs = ctx15.get("order_blocks", {}).get(direction, []) or []
         fvg = (ctx15.get("fvg", {}) or {}).get(f"nearest_{direction}_fvg")
         if direction == "bullish":
-            ob_entries = [(ob["top"], "15m bull OB", bool(ob.get("high_volume_node"))) for ob in obs]
+            # Enter at OB MIDPOINT rather than the near edge (audit §3.5) — a more
+            # realistic fill than assuming the extreme edge always tags.
+            ob_entries = [((ob["top"] + ob["bottom"]) / 2.0, "15m bull OB mid",
+                           bool(ob.get("high_volume_node"))) for ob in obs]
             if fvg and not fvg.get("filled", True):
-                ob_entries.append((fvg["top"], "15m bull FVG", False))
+                ob_entries.append(((fvg["top"] + fvg["bottom"]) / 2.0, "15m bull FVG mid", False))
             valid_entries = [(p, s, h) for p, s, h in ob_entries if p <= price * 1.002]
             entry = max((p for p, _, _ in valid_entries), default=price)
             e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
@@ -697,13 +786,17 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                 stop_labeled.append((dr_low - buf, "below dealing-range low - buffer"))
             target_labeled = [(l, "15m BSL") for l in (liq15.get("buy_side", []) or [])] + \
                              [(l, "1h BSL") for l in (liq1h.get("buy_side", []) or [])] + \
+                             [(l, "1d BSL") for l in (liq1d.get("buy_side", []) or [])] + \
                              [(l, "untested 4H POC") for l in untested] + \
+                             [(l, "untested daily POC") for l in untested_1d] + \
+                             ([(pwh, "PWH")] if pwh else []) + \
                              avwap_pairs + ([(va.get("vah"), "VAH")] if va.get("vah") else [])
-            tp_src = "BSL / untested POC / AVWAP / VAH"
+            tp_src = "BSL / untested POC / PWH / AVWAP / VAH"
         else:
-            ob_entries = [(ob["bottom"], "15m bear OB", bool(ob.get("high_volume_node"))) for ob in obs]
+            ob_entries = [((ob["top"] + ob["bottom"]) / 2.0, "15m bear OB mid",
+                           bool(ob.get("high_volume_node"))) for ob in obs]
             if fvg and not fvg.get("filled", True):
-                ob_entries.append((fvg["bottom"], "15m bear FVG", False))
+                ob_entries.append(((fvg["top"] + fvg["bottom"]) / 2.0, "15m bear FVG mid", False))
             valid_entries = [(p, s, h) for p, s, h in ob_entries if p >= price * 0.998]
             entry = min((p for p, _, _ in valid_entries), default=price)
             e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
@@ -722,9 +815,12 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                 stop_labeled.append((dr_high + buf, "above dealing-range high + buffer"))
             target_labeled = [(l, "15m SSL") for l in (liq15.get("sell_side", []) or [])] + \
                              [(l, "1h SSL") for l in (liq1h.get("sell_side", []) or [])] + \
+                             [(l, "1d SSL") for l in (liq1d.get("sell_side", []) or [])] + \
                              [(l, "untested 4H POC") for l in untested] + \
+                             [(l, "untested daily POC") for l in untested_1d] + \
+                             ([(pwl, "PWL")] if pwl else []) + \
                              avwap_pairs + ([(va.get("val"), "VAL")] if va.get("val") else [])
-            tp_src = "SSL / untested POC / AVWAP / VAL"
+            tp_src = "SSL / untested POC / PWL / AVWAP / VAL"
 
     if entry is None or sl is None or entry == sl:
         return out
@@ -759,10 +855,12 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
         "stop_loss_source": sl_src,
         "take_profit_source": tp_src,
         "candidates": {
-            "entries": _rank_entries(entry_labeled, price, ctx15.get("dealing_range", {})),
-            "stops": [{"price": round(float(p), 6), "source": s, "tf": _tf_of_source(s)}
+            "entries": _rank_entries(entry_labeled, price, ctx15.get("dealing_range", {}), atr_abs=atr_abs),
+            "stops": [{"price": round(float(p), 6), "source": s, "tf": _tf_of_source(s),
+                       "dist_from_price_atr": _dist_atr(p, price, atr_abs)}
                       for p, s in stop_labeled if p is not None],
-            "targets": _rank_targets(target_labeled, entry, risk, direction),
+            "targets": _rank_targets(target_labeled, entry, risk, direction,
+                                     ref_price=price, atr_abs=atr_abs),
         },
     })
     return out
@@ -828,14 +926,17 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         c6, n6 = _c6_ote(smc_context, trend_bias)
         c7, n7, absorption = _c7_cvd(windowed_indicators, trend_bias)
         c8, n8 = _c8_stoch(windowed_indicators, trend_bias)
+        c3 = _rebudget_sweep(c3)  # sweep slot rebudgeted to 15-pt max
         raw = {"c1_trend_alignment": c1, "c2_ob_proximity": c2, "c3_liquidity_sweep": c3,
                "c4_momentum": c4, "c5_fvg_magnet": c5, "c6_ote_bonus": c6,
                "c7_cvd_alignment": c7, "c8_stochrsi": c8}
         breakdown = {k: int(round(v * weights.get(k, 1.0))) for k, v in raw.items()}
+        breakdown, loc_total = _apply_location_cap(breakdown)
         notes = {"c1_trend_alignment": n1, "c2_ob_proximity": n2,
                  "c3_liquidity_sweep": f"{n3} [{c3_tier}]", "c4_momentum": n4,
                  "c5_fvg_magnet": n5, "c6_ote_bonus": n6, "c7_cvd_alignment": n7,
-                 "c8_stochrsi": n8}
+                 "c8_stochrsi": n8,
+                 "location_composite": f"C2+C5+C6 = {loc_total}/{LOCATION_CAP} (capped)"}
         base = sum(breakdown.values())
         geo_bias = trend_bias
 
@@ -853,7 +954,11 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
                                       market_regime, score_mode,
                                       mr_edge=(mr_edge if is_ranging else None))
 
-    win_rate = _empirical_winrate(final, calib)
+    win_rate = _logistic_winrate(breakdown, score_mode, calib)
+    win_rate_source = "logistic"
+    if win_rate is None:
+        win_rate = _empirical_winrate(final, calib)
+        win_rate_source = "score_bucket" if win_rate is not None else "none"
 
     return {
         "score_mode": score_mode,
@@ -870,5 +975,6 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         "confluence_notes": notes,
         "engine_trade": geometry,
         "empirical_win_rate": win_rate,
+        "win_rate_source": win_rate_source,
         "current_price": price,
     }

@@ -4,6 +4,7 @@ Cryptera v3.2 - Rule-based SMC engine + Gemini AI structured JSON narration.
 
 import pandas as pd
 import asyncio
+import copy
 import requests
 import json
 import os
@@ -15,19 +16,23 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 
-from indicators import calculate_indicators, detect_regime, detect_volatility_regime
+from indicators import (calculate_indicators, detect_regime, detect_volatility_regime,
+                        compute_regime_with_hysteresis, session_volume_context)
 from strategies import evaluate_strategies
 from smc import build_smc_context
 from price_action import build_pa_context, calculate_previous_day, get_value_area
 
 
-SCHEMA_VERSION = "3.2.4"
+SCHEMA_VERSION = "3.3.0"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
 OI_HISTORY_PATH = os.path.join(DATA_DIR, "oi_history.json")
 EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
+REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
+REGIME_HYSTERESIS_RUNS = 2  # consecutive raw runs required before a rubric flip (BUG-08)
 SNAPSHOT_RETENTION = 1000  # per symbol
+HORIZON_HOURS = 24  # forward window the geometry/targets are judged against
 
 
 # ---------------- utilities ---------------- #
@@ -49,17 +54,27 @@ def to_native(obj):
     return obj
 
 
+def _atr_last(df) -> float:
+    """Last closed-bar absolute ATR, or None."""
+    if df is None or df.empty or "ATR" not in df.columns:
+        return None
+    v = df["ATR"].iloc[-1]
+    return round(float(v), 6) if pd.notna(v) else None
+
+
 # ---------------- config ---------------- #
 
-TIMEFRAMES = ["4h", "1h", "15m"]
+# 1D added (audit §3.3): daily structure + daily liquidity pools become HTF draws
+# for the geometry target menu; entries stay keyed off 4H/1H/15M.
+TIMEFRAMES = ["1d", "4h", "1h", "15m"]
 # Single market namespace (BUG-01): OHLCV, taker flow, depth, funding, and OI
 # all come from Binance USDT-perp (fapi). Never mix spot and futures series.
 MARKET = "binance-usdm"
 # >= 260 closed bars so EMA_200 / ATR_Pct(100) are live after the forming
 # candle is dropped (BUG-02).
-LIMITS = {"4h": 300, "1h": 300, "15m": 300}
-WINDOW_SIZE = {"4h": 10, "1h": 20, "15m": 30}
-TF_MS = {"4h": 4 * 3600_000, "1h": 3600_000, "15m": 15 * 60_000}  # bar length in ms
+LIMITS = {"1d": 300, "4h": 300, "1h": 300, "15m": 300}
+WINDOW_SIZE = {"1d": 14, "4h": 10, "1h": 20, "15m": 30}
+TF_MS = {"1d": 24 * 3600_000, "4h": 4 * 3600_000, "1h": 3600_000, "15m": 15 * 60_000}  # bar length in ms
 
 
 def get_window_dict(df: pd.DataFrame, size: int) -> dict:
@@ -96,9 +111,16 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
     close_series = [round(float(x), 2) for x in recent_5["close"].tolist()]
     rsi_series = [round(float(x), 2) for x in recent_5["RSI"].tolist()] if "RSI" in recent_5.columns else []
 
+    # Single-bar (last CLOSED bar) price change — matches per-bar OI deltas so the
+    # OF modifier compares like windows (BUG-10). For 4h this is a true ~4h change.
+    bar_change_pct = 0.0
+    if len(closes) >= 2 and closes[-2]:
+        bar_change_pct = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 3)
+
     return {
         "current_price": round(end_p, 4),
         "window_price_change_pct": price_change_pct,
+        "bar_price_change_pct": bar_change_pct,
         "rsi": rsi_latest,
         "relative_volume": vol_relative,
         "supertrend_direction": supertrend_latest,
@@ -115,7 +137,7 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
 
 # ---------------- chart series (for the dashboard candlestick chart) ---------------- #
 
-CHART_BARS = {"4h": 120, "1h": 150, "15m": 180}
+CHART_BARS = {"1d": 90, "4h": 120, "1h": 150, "15m": 180}
 
 
 def build_chart_series(data: dict) -> dict:
@@ -144,7 +166,7 @@ def build_chart_series(data: dict) -> dict:
 
 OHLCV_CACHE = OrderedDict()
 OHLCV_CACHE_MAX = 50
-CACHE_TTL_SECONDS = {"4h": 300, "1h": 120, "15m": 20}
+CACHE_TTL_SECONDS = {"1d": 900, "4h": 300, "1h": 120, "15m": 20}
 
 
 def _cache_get(key):
@@ -302,6 +324,41 @@ def fetch_orderbook(symbol):
         "mid_price": round(mid, 6),
         "depth_bins": depth_bins,
     }
+
+
+def _read_json_file(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json_file(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f)
+    except Exception as e:
+        print(f"[Warning] Failed to persist {os.path.basename(path)}: {e}")
+
+
+def apply_regime_hysteresis(symbol: str, raw_regime: str) -> str:
+    """
+    Persist per-symbol regime state and gate rubric flips through
+    compute_regime_with_hysteresis (BUG-08). Direction changes within a rubric
+    bucket apply immediately; trend<->range flips need REGIME_HYSTERESIS_RUNS
+    consecutive raw runs. Returns the effective regime to score with.
+    """
+    state = _read_json_file(REGIME_STATE_PATH, {})
+    prior = state.get(symbol) or {}
+    effective, new_state = compute_regime_with_hysteresis(raw_regime, prior, runs=REGIME_HYSTERESIS_RUNS)
+    new_state["updated"] = int(time.time())
+    state[symbol] = new_state
+    _write_json_file(REGIME_STATE_PATH, state)
+    return effective
 
 
 def _load_oi_history():
@@ -503,8 +560,8 @@ GEMINI_SYSTEM_INSTRUCTION = """
 ICT/SMC institutional trade engine. Return a JSON object matching the enforced schema. Signals are computed on CLOSED candles; `live_price` is the current price for distance/trigger context only.
 
 Rules
-1. Use only numbers present in the snapshot. Never invent levels.
-2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier). Echo it; only set `header.score_override` on a specific factual error.
+1. Use only numbers present in the snapshot. Never invent levels. Every candidate/level already carries `dist_from_price_atr` (distance from live price in 15m-ATR units) — use it, do not compute distances yourself. `atr_context` gives atr_15m/1h/4h and the horizon_hours: reject any target more than a few x atr_1h away as unreachable in-window. `live_vs_close_pct` is how far the forming bar has drifted from the last closed 15m close — if it exceeds ~1 ATR, phrase entry triggers relative to live_price.
+2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier). Echo it into `header.score`; only set `header.score_override` on a specific factual error. `header.action` is decided from the FINAL score in `header.score` (the overridden value when you set `score_override`, else `confluence_score`) — apply the thresholds to THAT number.
 3. TRADE PLAN = SELECT THE BEST REAL CANDIDATE, NEVER INVENT. This is the highest-stakes decision in the output — the score only says *whether*; the candidate you pick decides the actual outcome. Choose deliberately.
    `strategies.engine_trade` gives a deterministic primary (entry/stop_loss/take_profit/rr) AND a candidate menu in `engine_trade.candidates`. Each candidate carries quality metadata — USE IT to rank, do not just take the nearest:
      - `candidates.entries[]` {price, source, tf, hvn, zone, confluence, confluence_count} — choose ONE as `trade_decision.entry`
@@ -525,9 +582,10 @@ Regime-conditional scoring — read `strategies.score_mode`:
  header.score_breakdown = copy `strategies.confluence_breakdown` VERBATIM, only the keys of
  the active mode (trend → c1_...c8_ keys; mean_revert → m1_...m6_ keys). Never fill both sets.
  score_mode == "trend" (trending regime): components C1-C8 measure trend continuation.
-   C1 trend(25) ADX-tiered on 4H/1H agreement · C2 ob_prox(15) distance to 15m/1H OB·FVG
-   C3 sweep(10) HTF sweep+reclaim (6 if 15m-only) · C4 momentum(15) 1H RSI/MACD ±slope
-   C5 fvg_magnet(15) · C6 ote(10) · C7 cvd(10) real taker-flow CVD · C8 stoch(5)
+   C1 trend(25) ADX-tiered on 4H/1H agreement · C2 ob_prox + C5 fvg_magnet + C6 ote share ONE
+   LOCATION composite capped at 25 total (a single good location can no longer bank 40)
+   C3 sweep(15) HTF sweep+reclaim (9 if 15m-only) · C4 momentum(15) 1H RSI/MACD ±slope
+   C7 cvd(15) real taker-flow CVD (3-TF aligned = 15, 2-TF = 10) · C8 stoch(5)
  score_mode == "mean_revert" (ranging regime): FADE the value-area edge, do not chase trend.
    M1 edge_distance(25) proximity to VAH/VAL · M2 edge_sweep(15) sweep of the edge
    M3 cvd_absorption(15) · M4 stoch_extreme(15) · M5 rejection candle(10) · M6 range_intact(10)
@@ -535,8 +593,15 @@ Regime-conditional scoring — read `strategies.score_mode`:
 
 Order flow: `strategies.order_flow_modifier` (already in the score) reflects L2 depth imbalance,
 funding crowding + trajectory, OI build, F&G extremes, and BTC-dominance (alt macro headwind) —
-cite `order_flow_notes` in the sentiment reasoning. `price_action.avwap` holds anchored-VWAP
+cite `order_flow_notes` in the sentiment reasoning. `funding.current` is a decimal rate per 8h
+(0.0001 = 0.01%), not a percentage — do not misread it. `price_action.avwap` holds anchored-VWAP
 dynamic S/R from the last swing high/low; cite it as a level when relevant.
+
+HTF draws: `smc_context.1d` gives daily structure/BOS and daily liquidity pools; `price_action`
+carries `pwh`/`pwl` (previous-week high/low), `weekly_open`, and `untested_pocs_1d`. These are the
+higher-timeframe targets the geometry menu draws toward — the strongest runners sit at daily pools.
+Sessions: `volume_gate.kill_zone` (LONDON / NEWYORK = high-liquidity ICT windows, ASIA / OFF = thin);
+`session_rel_vol_15m` is the same-time-of-day relative volume the gate is based on.
 
 Thresholds
  score >= 60 → ACTIVE_TRADE   45-59 → CONDITIONAL_ENTRY   < 45 → HOLD
@@ -555,15 +620,21 @@ Action-specific filling
 
 Field formats
  mtf_context.<tf>.nearest_ob / nearest_fvg : "<low>-<high>" or "NONE".
+ mtf_context.d1 : daily structure/bos + `htf_draw` = the dominant daily target and side (e.g. "PWH 152.4 — draw above").
  forward_scenario.key_levels.<tf> : ["<price> — <label>", ...] sourced from snapshot.
  narrative.summary : ≤ 2 sentences.
 """.strip()
 
 
 GEMINI_MODEL_NAME = "gemini-3.5-flash"
-# Gemini 3.5 uses string-enum thinking levels instead of numeric budgets.
-# minimal | low | medium (default) | high. `medium` is the sweet spot for C1-C8
-# verification — high adds ~30% latency for marginal lift on rule-following tasks.
+# Gemini 3.5 uses string-enum thinking levels instead of numeric budgets:
+# minimal | low | medium (default) | high. The LLM's job here is no longer pure
+# rule-following — as of v3.3 it must SELECT the best candidate from the engine
+# menu (the highest-stakes decision in the output), which rewards deeper thinking,
+# so the constant and this comment agree on `high`. This is the pre-measurement
+# default: `tools/ab_thinking.py` A/B-tests high vs medium over labeled snapshots;
+# switch to the measured winner once >= ~30 labeled snapshots exist (empty corpus
+# now, so measurement is deferred — current_status Phase 2).
 GEMINI_THINKING_LEVEL = "high"
 
 _INT = {"type": "integer"}
@@ -643,6 +714,10 @@ GEMINI_RESPONSE_SCHEMA = {
         "mtf_context": {
             "type": "object",
             "properties": {
+                "d1": _tf_schema(
+                    {"htf_draw": _STR},
+                    ["bos", "htf_draw"],
+                ),
                 "h4": _tf_schema(
                     {"adx": _NUM,
                      "adx_tier": {"type": "string", "enum": ["WEAK", "MEDIUM", "STRONG", "VERY_STRONG"]}},
@@ -658,7 +733,7 @@ GEMINI_RESPONSE_SCHEMA = {
                 ),
                 "cross_tf_momentum": _STR,
             },
-            "required": ["h4", "h1", "m15", "cross_tf_momentum"],
+            "required": ["d1", "h4", "h1", "m15", "cross_tf_momentum"],
         },
         "narrative": {
             "type": "object",
@@ -845,6 +920,39 @@ def _extract_response_dict(response) -> dict | None:
             return {"error": "JSON parse failed", "raw_text": raw}
 
 
+def _build_llm_view(snapshot: dict) -> dict:
+    """
+    Token-lean copy of the snapshot for the LLM prompt (audit §4). The full
+    snapshot is still persisted to disk for the dashboard; this trims only what
+    the model is sent:
+      * drop the duplicate top-level `engine_trade` (kept under `strategies`),
+      * prune per-TF order blocks to the 2 most recent per side,
+      * drop the raw FVG lists (the actionable `nearest_*` gaps are retained),
+      * drop developing-swing arrays (early-warning channel, not rubric input),
+      * drop `supertrend.level` (dead field; the pill only needs direction).
+    """
+    view = copy.deepcopy(snapshot)
+    view.pop("engine_trade", None)
+    smc = view.get("smc_context") or {}
+    for ctx in smc.values():
+        if not isinstance(ctx, dict):
+            continue
+        obs = ctx.get("order_blocks")
+        if isinstance(obs, dict):
+            for side in ("bullish", "bearish"):
+                if isinstance(obs.get(side), list):
+                    obs[side] = obs[side][-2:]
+        fvg = ctx.get("fvg")
+        if isinstance(fvg, dict):
+            fvg.pop("bullish_fvgs", None)
+            fvg.pop("bearish_fvgs", None)
+        ctx.pop("developing_swings", None)
+    st = view.get("supertrend")
+    if isinstance(st, dict):
+        st.pop("level", None)
+    return view
+
+
 def query_gemini(snapshot: dict) -> dict:
     """
     Call Gemini 3.5 Flash via the google-genai SDK with schema-enforced JSON
@@ -857,7 +965,9 @@ def query_gemini(snapshot: dict) -> dict:
     except RuntimeError as e:
         return {"error": str(e)}
 
-    prompt = f"DATA SNAPSHOT:\n{json.dumps(snapshot, indent=2)}"
+    # Compact separators (no indentation): indentation alone is ~15-20% of prompt
+    # tokens on a snapshot this size (audit §4).
+    prompt = f"DATA SNAPSHOT:\n{json.dumps(snapshot, separators=(',', ':'))}"
 
     for label, include_schema in (("schema", True), ("plain-json", False)):
         try:
@@ -930,16 +1040,19 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     # Compute each TF's value area once and reuse (avoids recomputation, B11)
     value_areas = {tf: get_value_area(data[tf]) for tf in data}
 
-    # SMC + PA contexts
-    smc_context = build_smc_context(data["4h"], data["1h"], data["15m"], value_areas=value_areas)
-    pa_context = build_pa_context(data["1h"], data["15m"], df_4h=data["4h"], value_areas=value_areas)
+    # SMC + PA contexts (1D leg adds daily structure + HTF draws)
+    smc_context = build_smc_context(data["4h"], data["1h"], data["15m"],
+                                    df_1d=data.get("1d"), value_areas=value_areas)
+    pa_context = build_pa_context(data["1h"], data["15m"], df_4h=data["4h"],
+                                  df_1d=data.get("1d"), value_areas=value_areas)
     pdh, pdl, pdc = calculate_previous_day(data["1h"])
 
     # Volatility regimes per TF
     vol_regime = {tf: detect_volatility_regime(data[tf]) for tf in data}
 
-    # Global regime (SMC-driven); drives regime-conditional scoring
-    regime = detect_regime(data["4h"], data["1h"], data["15m"], smc_context=smc_context)
+    # Global regime (SMC-driven) with cross-run hysteresis on the rubric (BUG-08)
+    raw_regime = detect_regime(data["4h"], data["1h"], data["15m"], smc_context=smc_context)
+    regime = apply_regime_hysteresis(symbol, raw_regime)
 
     # 1H Supertrend pulled out for the dashboard pill
     latest_1h = data["1h"].iloc[-1]
@@ -948,6 +1061,9 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     supertrend_direction = "BULLISH" if st_dir_val == 1 else ("BEARISH" if st_dir_val == -1 else "NEUTRAL")
 
     windowed_indicators = {tf: get_window_dict(data[tf], WINDOW_SIZE[tf]) for tf in data}
+    # Session-aware relative volume + ICT kill zone injected into the 15m window so
+    # the volume gate uses a same-time-of-day baseline, not a flat 30-bar mean.
+    windowed_indicators["15m"].update(session_volume_context(data["15m"]))
 
     strategies = evaluate_strategies(
         data["4h"], data["1h"], data["15m"],
@@ -959,13 +1075,29 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
         btc_dominance=btc_dominance,
     )
 
+    # live_price drift vs the last CLOSED 15m close (entry-trigger phrasing) + a
+    # volatility budget line so the LLM can veto targets it can't reach in-horizon.
+    close_15m = float(data["15m"]["close"].iloc[-1])
+    live_vs_close_pct = round((live_price - close_15m) / close_15m * 100, 3) \
+        if (live_price and close_15m) else 0.0
+    atr_context = {
+        "atr_15m": _atr_last(data.get("15m")),
+        "atr_1h": _atr_last(data.get("1h")),
+        "atr_4h": _atr_last(data.get("4h")),
+        "horizon_hours": HORIZON_HOURS,
+        "note": "a target more than a few x atr_1h away is unlikely to fill within horizon_hours",
+    }
+
     snapshot = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "symbol": symbol,
         "market": MARKET,
         "live_price": live_price,
+        "live_vs_close_pct": live_vs_close_pct,
         "market_regime": regime,
+        "raw_regime": raw_regime,
+        "atr_context": atr_context,
         "volatility_regime": vol_regime,
         "event_guard": event_guard,
         "previous_day": {"pdh": pdh, "pdl": pdl, "pdc": pdc},
@@ -984,7 +1116,7 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     snapshot_native = to_native(snapshot)
 
     print("Generating structured trade plan from Gemini...")
-    analysis = query_gemini(snapshot_native)
+    analysis = query_gemini(_build_llm_view(snapshot_native))
     snapshot_native["analysis"] = analysis
 
     # Attach chart OHLC AFTER the LLM call so it never inflates the prompt.

@@ -97,35 +97,59 @@ Escalate to Fable 5 medium only if the calibration-v2 statistics get stuck.
 
 Scope = audit §6 items 8–18 (audit §3 has the design detail per item):
 
-- [ ] BUG-08 — regime detection rebuild: last 4–6 swings, 4H ADX ≥ 20 floor for
-      "Trending", N-run hysteresis before rubric switch
-- [ ] BUG-09 — dealing range must bracket price (else recompute/flag)
-- [ ] BUG-10 — OF modifier: match OI change window to price-change window
-- [ ] BUG-11 — keep nearest liquidity pools, not the 3 most extreme
-- [ ] BUG-16 / BUG-17 — straddling FVGs visible; OB mitigation counts wicks
-      (geometry realism, audit §3.5: OB-midpoint entries, unswept-entry filter)
-- [ ] Prompt: drop duplicate top-level `engine_trade`; compact
-      `json.dumps(..., separators=(",",":"))`; prune to 2 OBs/2 FVGs per side,
-      drop filled FVGs and dead fields (audit §4)
-- [ ] Prompt: add `dist_from_price_atr` on all candidates/levels, `bars_ago` on
-      BOS/CHoCH, `live_vs_close_pct` drift flag, ATR-vs-horizon line, funding
-      units note; resolve score_override-vs-action contradiction
-- [ ] Add 1D timeframe: daily structure, weekly open, PWH/PWL, daily untested
-      POCs wired into pools/target menu
-- [ ] Session-aware volume gate (same-time-of-day baseline) + ICT kill-zone tag
-- [ ] BUG-12 — calibration v2: logistic regression over `confluence_breakdown`,
-      timeout credit via MFE, snapshot de-dup (one per symbol-hour or 1/overlap
-      weights); keep equal-weights fallback
-- [ ] Rubric decorrelation: C2/C5/C6 → location composite (~25 max), rebudget to
-      orthogonal evidence; per-regime action thresholds once eval data supports it
-- [ ] LLM-vs-engine divergence cut in `tools/eval_engine.py`
-      (`selected_from_engine` true vs false hit-rate)
-- [ ] Thinking-level + prompt A/B over 30–50 labeled snapshots; make
-      `GEMINI_THINKING_LEVEL` and its comment agree with the measured winner
-- [ ] Relabel + recalibrate; compare against Phase 1 baseline; record deltas
-- [ ] Commit as v3.3; tick boxes + results note here
+- [x] BUG-08 — regime rebuild: multi-swing structure (`smc._seq_state`/`_hl_label`,
+      last 3–4 swings/side), 4H ADX ≥ 20 floor in `detect_regime`, 2-run rubric
+      hysteresis (`indicators.compute_regime_with_hysteresis` + `apply_regime_hysteresis`
+      persisting `data/regime_state.json`); `bars_ago` added to BOS/CHoCH
+- [x] BUG-09 — `_current_dealing_range` recomputes to bracket price (nearest
+      confirmed high above / low below) and sets `brackets_price=false` on breakout
+- [x] BUG-10 — OF modifier compares `oi.change_4h_pct` against the last-closed 4H
+      bar change (`bar_price_change_pct`), not the ~40h window
+- [x] BUG-11 — `find_liquidity_levels(current_price=…)` keeps the 3 pools NEAREST
+      price per side (extremes only as fallback)
+- [x] BUG-16 / BUG-17 — straddling FVGs selected (`nearest_*` + `straddles_price`);
+      OB mitigation is wick-aware (lows/highs, not closes) so swept OBs drop out =
+      unswept-entry filter; entries now at OB **midpoint**
+- [x] Prompt: `_build_llm_view` drops the duplicate top-level `engine_trade`,
+      prunes OBs to 2/side, drops raw FVG lists + developing-swing arrays +
+      `supertrend.level`; `json.dumps(separators=(",",":"))` (8k vs indented)
+- [x] Prompt: `dist_from_price_atr` on every entry/stop/target candidate,
+      `bars_ago` on BOS/CHoCH, `live_vs_close_pct` drift, `atr_context`
+      (atr_15m/1h/4h + horizon), funding-units note; action follows the FINAL/
+      overridden score (contradiction resolved in system instruction)
+- [x] Add 1D timeframe: 1D fetch (`LIMITS`/`TF_MS`/`WINDOW_SIZE`/`CACHE`/`CHART_BARS`),
+      daily SMC leg (`smc_context.1d`), `weekly_levels` (PWH/PWL/weekly_open),
+      `untested_pocs_1d`; 1D BSL/SSL + PWH/PWL + daily POCs wired into the target
+      menu; `mtf_context.d1` in the schema
+- [x] Session-aware volume gate: `session_volume_context` (same UTC hour-of-day
+      baseline) injected into 15m window; `_volume_gate` uses session rel-vol +
+      `kill_zone` (LONDON/NEWYORK/ASIA/OFF) tag
+- [x] BUG-12 — calibration v2: pure-numpy standardized logistic regression per
+      rubric, timeout MFE partial credit (`realized_rr/target_rr`), 1/(symbol-hour
+      cluster) de-dup weights; engine prefers `logistic` win-prob else score bucket;
+      equal-weights fallback retained (`win_rate_source` recorded)
+- [x] Rubric decorrelation: C2+C5+C6 share a LOCATION composite capped at 25
+      (`_apply_location_cap`), freed budget rebudgeted to C3 sweep (→15) and C7 CVD
+      (→15). Per-regime action thresholds DEFERRED (needs eval data — no corpus yet)
+- [x] LLM-vs-engine divergence cut: `by_selected_from_engine` bucket in
+      `tools/eval_engine.py` (engine_primary vs llm_alternative hit-rate)
+- [x] Thinking-level A/B: harness `tools/ab_thinking.py` (replays snapshots at each
+      level, replays outcomes). `GEMINI_THINKING_LEVEL` + comment made self-consistent
+      on `high` (candidate-selection is now the high-stakes task); measured winner
+      DEFERRED until ≥30 labeled snapshots exist
+- [x] Relabel + recalibrate: **no-op** — corpus empty (0 snapshots, no
+      `calibration.json`), same as Phase 1; labeler/eval/calibrate all run clean
+      post-change. First trustworthy baseline comes from v3.3-labeled snapshots
+- [x] Commit as v3.3 (schema_version → 3.3.0); boxes ticked + note here
 
-**Phase 2 vs baseline (fill in):** _pending_
+**Phase 2 vs baseline:** no baseline exists on this machine (corpus empty), so
+per-item deltas cannot be measured yet. Verification instead: 48 synthetic checks
+(structure/hysteresis/ADX floor/dealing-range bracket/nearest-pools/straddle-FVG/
+wick-OB/decorrelation/session-gate/weekly-levels/geometry/calibrate-v2/LLM-view)
+ALL PASS + one mocked-LLM end-to-end run on live SOL perp (1D leg live, session
+gate + kill zone, regime hysteresis persisted, compact prompt, geometry candidates
+carry ATR distances) ALL PASS. Measurement-gated items (per-regime thresholds,
+thinking-level A/B winner) are built as machinery and deferred to first corpus.
 
 ## Phase 3 — Architecture, robustness, hygiene (v3.3.x)
 
@@ -174,3 +198,12 @@ Scope = audit §5 + §6 items 19–20 + remaining P2/P3:
 - 2026-07-11 — **Phase 1 complete (v3.2.4)**: BUG-01…07 fixed, verified
   offline (20 synthetic checks) + one mocked-LLM run. Corpus was empty →
   baseline deferred to first labeled v3.2.4 snapshots. Phase 2 next.
+- 2026-07-11 — **Phase 2 complete (v3.3.0)**: audit §6 items 8–18 landed —
+  regime rebuild (BUG-08), dealing-range bracket (BUG-09), OI-window match
+  (BUG-10), nearest pools (BUG-11), straddle-FVG + wick-OB + OB-mid entries
+  (BUG-16/17), 1D timeframe, session-aware gate + kill zones, rubric
+  decorrelation, calibration v2 (BUG-12, logistic + timeout credit + de-dup),
+  divergence eval cut, thinking A/B harness, and the prompt compaction/enrichment
+  pass. 48 synthetic checks + one mocked-LLM live-perp run ALL PASS. Corpus still
+  empty → relabel/recalibrate/A/B-winner/per-regime-thresholds deferred to first
+  v3.3 snapshots. Phase 3 (Sonnet 5) next.
