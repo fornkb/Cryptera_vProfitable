@@ -265,10 +265,12 @@ def _c5_fvg_magnet(price, smc_context, bias, atr_map):
     return 0, "no FVG magnet within range"
 
 
-def _c6_ote(smc_context):
+def _c6_ote(smc_context, bias):
+    """OTE credit only when the retracement leg points the same way as the trade (BUG-05)."""
     for tf in ("1h", "4h"):
-        if smc_context.get(tf, {}).get("premium_discount", {}).get("in_ote", False):
-            return 10, f"in OTE on {tf.upper()}"
+        pdz = smc_context.get(tf, {}).get("premium_discount", {}) or {}
+        if pdz.get("in_ote", False) and pdz.get("leg_direction") == bias:
+            return 10, f"in OTE on {tf.upper()} ({bias} leg)"
     return 0, "not in OTE"
 
 
@@ -529,6 +531,7 @@ def _select_structural_tp(cands, entry, risk, direction):
 
 
 _TF_RANK = {"4h": 3, "1h": 2, "15m": 1}
+SL_ATR_CAP = 3.0  # max structural SL width in 15m-ATR multiples (BUG-06)
 
 
 def _tf_of_source(src):
@@ -634,6 +637,7 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
         return out
 
     buf = max(atr_abs * 0.5, price * 0.001)  # SL buffer
+    sl_cap = SL_ATR_CAP * max(atr_abs, price * 0.001)  # max SL width (BUG-06)
     ctx15 = smc_context.get("15m", {}) or {}
     liq15 = ctx15.get("liquidity_levels", {}) or {}
     liq1h = smc_context.get("1h", {}).get("liquidity_levels", {}) or {}
@@ -679,12 +683,17 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
             entry = max((p for p, _, _ in valid_entries), default=price)
             e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
             entry_labeled = valid_entries + [(price, "current price", False)]
-            swing_low = liq15.get("sell_side", [None])[0] or ctx15.get("dealing_range", {}).get("low")
-            sl = (swing_low - buf) if swing_low else price - buf * 3
-            sl_src = "below 15m swing low - buffer"
-            stop_labeled = [(sl, sl_src)]
+            # Nearest protected swing BELOW entry (BUG-06) — not the widest pool.
             dr_low = ctx15.get("dealing_range", {}).get("low")
-            if dr_low and abs((dr_low - buf) - sl) / max(sl, 1e-9) > 0.0005:
+            ssl_below = [l for l in (liq15.get("sell_side", []) or []) if l and l < entry]
+            swing_low = max(ssl_below) if ssl_below else (dr_low if dr_low and dr_low < entry else None)
+            sl = (swing_low - buf) if swing_low else entry - buf * 3
+            sl_src = "below nearest protected 15m swing low - buffer"
+            if entry - sl > sl_cap:
+                sl = entry - sl_cap
+                sl_src = f"ATR-capped ({SL_ATR_CAP:g}x 15m ATR below entry)"
+            stop_labeled = [(sl, sl_src)]
+            if dr_low and dr_low < entry and abs((dr_low - buf) - sl) / max(sl, 1e-9) > 0.0005:
                 stop_labeled.append((dr_low - buf, "below dealing-range low - buffer"))
             target_labeled = [(l, "15m BSL") for l in (liq15.get("buy_side", []) or [])] + \
                              [(l, "1h BSL") for l in (liq1h.get("buy_side", []) or [])] + \
@@ -699,12 +708,17 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
             entry = min((p for p, _, _ in valid_entries), default=price)
             e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
             entry_labeled = valid_entries + [(price, "current price", False)]
-            swing_high = liq15.get("buy_side", [None])[0] or ctx15.get("dealing_range", {}).get("high")
-            sl = (swing_high + buf) if swing_high else price + buf * 3
-            sl_src = "above 15m swing high + buffer"
-            stop_labeled = [(sl, sl_src)]
+            # Nearest protected swing ABOVE entry (BUG-06) — not the widest pool.
             dr_high = ctx15.get("dealing_range", {}).get("high")
-            if dr_high and abs((dr_high + buf) - sl) / max(sl, 1e-9) > 0.0005:
+            bsl_above = [l for l in (liq15.get("buy_side", []) or []) if l and l > entry]
+            swing_high = min(bsl_above) if bsl_above else (dr_high if dr_high and dr_high > entry else None)
+            sl = (swing_high + buf) if swing_high else entry + buf * 3
+            sl_src = "above nearest protected 15m swing high + buffer"
+            if sl - entry > sl_cap:
+                sl = entry + sl_cap
+                sl_src = f"ATR-capped ({SL_ATR_CAP:g}x 15m ATR above entry)"
+            stop_labeled = [(sl, sl_src)]
+            if dr_high and dr_high > entry and abs((dr_high + buf) - sl) / max(sl, 1e-9) > 0.0005:
                 stop_labeled.append((dr_high + buf, "above dealing-range high + buffer"))
             target_labeled = [(l, "15m SSL") for l in (liq15.get("sell_side", []) or [])] + \
                              [(l, "1h SSL") for l in (liq1h.get("sell_side", []) or [])] + \
@@ -811,7 +825,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         c3, n3, c3_tier = detect_mtf_sweep(df_15m, smc_context, pdh, pdl, trend_bias)
         c4, n4 = _c4_momentum(df_1h, windowed_indicators, trend_bias)
         c5, n5 = _c5_fvg_magnet(price, smc_context, trend_bias, atr_map)
-        c6, n6 = _c6_ote(smc_context)
+        c6, n6 = _c6_ote(smc_context, trend_bias)
         c7, n7, absorption = _c7_cvd(windowed_indicators, trend_bias)
         c8, n8 = _c8_stoch(windowed_indicators, trend_bias)
         raw = {"c1_trend_alignment": c1, "c2_ob_proximity": c2, "c3_liquidity_sweep": c3,

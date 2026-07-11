@@ -597,7 +597,7 @@ document.addEventListener("DOMContentLoaded", () => {
         ul.innerHTML += `
             <li class="level-li-item"><span>OI now</span><span class="font-mono">${oi.value != null ? Number(oi.value).toLocaleString() : "—"}</span></li>
             <li class="level-li-item"><span>OI Δ 1h / 4h</span><span class="font-mono">${fmtSigned(oi.change_1h_pct, 2)}% / ${fmtSigned(oi.change_4h_pct, 2)}%</span></li>
-            <li class="level-li-item"><span>OI 30d pctile</span><span class="font-mono">${oi.percentile_30d != null ? oi.percentile_30d + "%" : "—"}</span></li>
+            <li class="level-li-item"><span>OI 20d pctile</span><span class="font-mono">${oi.percentile_20d != null ? oi.percentile_20d + "%" : "—"}</span></li>
             <li class="level-li-item"><span>Funding now / 24h</span><span class="font-mono">${funding.current != null ? (funding.current * 100).toFixed(4) + "%" : "—"} / ${funding.avg_24h != null ? (funding.avg_24h * 100).toFixed(4) + "%" : "—"}</span></li>
             <li class="level-li-item"><span>Funding pctile</span><span class="font-mono">${funding.percentile_window != null ? funding.percentile_window + "%" : "—"}</span></li>`;
         if (btcd) {

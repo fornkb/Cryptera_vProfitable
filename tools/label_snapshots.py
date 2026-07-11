@@ -26,14 +26,13 @@ Output: each snapshot file is rewritten in place with an `outcome` block.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
-import ccxt.async_support as ccxt
 import pandas as pd
+import requests
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
@@ -51,6 +50,20 @@ def _parse_snapshot_time(filename: str) -> datetime | None:
         return None
 
 
+def _snapshot_time(snapshot: dict, filename: str) -> datetime | None:
+    """
+    True snapshot moment. Prefer `generated_at` (always UTC) over the filename —
+    filenames written before v3.2.4 used the machine-local clock (BUG-03).
+    """
+    gen = snapshot.get("generated_at")
+    if gen:
+        try:
+            return datetime.fromisoformat(gen.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return _parse_snapshot_time(filename)
+
+
 def _symbol_from_filename(filename: str) -> str | None:
     parts = filename.replace(".json", "").split("_")
     if len(parts) < 5:
@@ -58,16 +71,27 @@ def _symbol_from_filename(filename: str) -> str | None:
     return f"{parts[1]}/{parts[2]}"
 
 
-async def _fetch_future_candles(exchange, symbol: str, since_ms: int, horizon_hours: int):
-    """Fetch up to `horizon_hours` of 15m candles starting from `since_ms`."""
+def _fetch_future_candles(symbol: str, since_ms: int, horizon_hours: int):
+    """
+    Fetch up to `horizon_hours` of 15m USDT-perp candles starting from
+    `since_ms`. Same market namespace as the engine (fapi, BUG-01) — outcomes
+    are replayed on the prices the geometry was built from.
+    """
     needed = max(4, int(horizon_hours * 4))
     try:
-        candles = await exchange.fetch_ohlcv(symbol, "15m", since=since_ms, limit=needed + 4)
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/klines",
+            params={"symbol": symbol.replace("/", ""), "interval": "15m",
+                    "startTime": since_ms, "limit": min(needed + 4, 1500)},
+            timeout=10,
+        ).json()
     except Exception as e:
         print(f"[WARN] fetch failed for {symbol} @ {since_ms}: {e}")
         return None
-    if not candles:
+    if not isinstance(r, list) or not r:
         return None
+    candles = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
+               for k in r]
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     cutoff = pd.Timestamp(since_ms, unit="ms", tz="UTC") + pd.Timedelta(hours=horizon_hours)
@@ -167,7 +191,7 @@ def _direction_to_side(direction: str) -> str | None:
     return None
 
 
-async def label_snapshot_file(exchange, path: str, horizon_hours: int, force: bool):
+def label_snapshot_file(path: str, horizon_hours: int, force: bool):
     with open(path, "r") as f:
         snapshot = json.load(f)
 
@@ -175,7 +199,7 @@ async def label_snapshot_file(exchange, path: str, horizon_hours: int, force: bo
         return False
 
     filename = os.path.basename(path)
-    snap_time = _parse_snapshot_time(filename)
+    snap_time = _snapshot_time(snapshot, filename)
     symbol = snapshot.get("symbol") or _symbol_from_filename(filename)
     if snap_time is None or symbol is None:
         print(f"[SKIP] cannot parse symbol/time from {filename}")
@@ -186,7 +210,7 @@ async def label_snapshot_file(exchange, path: str, horizon_hours: int, force: bo
         return False
 
     since_ms = int(snap_time.timestamp() * 1000)
-    df = await _fetch_future_candles(exchange, symbol, since_ms, horizon_hours)
+    df = _fetch_future_candles(symbol, since_ms, horizon_hours)
     if df is None or df.empty:
         print(f"[WARN] no future data for {filename}")
         return False
@@ -217,7 +241,7 @@ async def label_snapshot_file(exchange, path: str, horizon_hours: int, force: bo
                                     float(eng["take_profit"]), df)
 
     snapshot["outcome"] = {
-        "labeled_at": datetime.utcnow().isoformat() + "Z",
+        "labeled_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "horizon_hours": horizon_hours,
         "bars_observed": int(len(df)),
         "trade_decision_outcome": trade_outcome,
@@ -230,7 +254,7 @@ async def label_snapshot_file(exchange, path: str, horizon_hours: int, force: bo
     return True
 
 
-async def main():
+def main():
     p = argparse.ArgumentParser()
     p.add_argument("--symbol", default=None, help="restrict to one symbol (e.g. BTC/USDT)")
     p.add_argument("--horizon", type=int, default=24, help="hours of look-forward (default 24)")
@@ -255,20 +279,16 @@ async def main():
         print("[INFO] no snapshots match the filter.")
         return
 
-    exchange = ccxt.binance({"enableRateLimit": True})
     updated = 0
-    try:
-        for path in targets:
-            try:
-                if await label_snapshot_file(exchange, path, args.horizon, args.force):
-                    updated += 1
-                    print(f"[OK] labelled {os.path.basename(path)}")
-            except Exception as e:
-                print(f"[ERR] {os.path.basename(path)}: {e}")
-    finally:
-        await exchange.close()
+    for path in targets:
+        try:
+            if label_snapshot_file(path, args.horizon, args.force):
+                updated += 1
+                print(f"[OK] labelled {os.path.basename(path)}")
+        except Exception as e:
+            print(f"[ERR] {os.path.basename(path)}: {e}")
     print(f"\nDone. Labelled {updated} / {len(targets)} snapshot(s).")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -357,19 +357,30 @@ def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002):
     return {"buy_side": sorted(bsl, reverse=True)[:3], "sell_side": sorted(ssl)[:3]}
 
 
-def get_premium_discount(swing_high, swing_low, current_price):
-    """Premium/discount + OTE (61.8%-78.6%) of a single dealing range."""
+def get_premium_discount(swing_high, swing_low, current_price, leg_direction="bullish"):
+    """
+    Premium/discount + direction-aware OTE (61.8%-78.6% retracement of the leg).
+    Bullish leg (low->high): OTE is the discount-side pullback band below the high.
+    Bearish leg (high->low): OTE is the mirrored premium-side band above the low
+    (BUG-05 — previously shorts were credited in the long/discount zone).
+    """
     if swing_high <= swing_low:
-        return {"zone": "neutral", "ote_zone": {"low": 0, "high": 0}, "in_ote": False}
+        return {"zone": "neutral", "ote_zone": {"low": 0, "high": 0},
+                "in_ote": False, "leg_direction": leg_direction}
     rng = swing_high - swing_low
     midpoint = swing_low + 0.5 * rng
     zone = "premium" if current_price > midpoint else "discount"
-    ote_low = swing_high - 0.786 * rng
-    ote_high = swing_high - 0.618 * rng
+    if leg_direction == "bearish":
+        ote_low = swing_low + 0.618 * rng
+        ote_high = swing_low + 0.786 * rng
+    else:
+        ote_low = swing_high - 0.786 * rng
+        ote_high = swing_high - 0.618 * rng
     return {
         "zone": zone,
         "ote_zone": {"low": round(ote_low, 4), "high": round(ote_high, 4)},
         "in_ote": ote_low <= current_price <= ote_high,
+        "leg_direction": leg_direction,
     }
 
 
@@ -377,12 +388,15 @@ def _current_dealing_range(confirmed_highs, confirmed_lows):
     """
     Most recent dealing range = the latest confirmed swing high and the latest
     confirmed swing low that bracket current price (single leg), not max/min of a
-    mixed window (fixes B9).
+    mixed window (fixes B9). Also returns the leg direction: the leg is bullish
+    when the most recent confirmed swing is the high (low->high move), bearish
+    when it is the low.
     """
     if not confirmed_highs or not confirmed_lows:
-        return None, None
+        return None, None, None
     last_high = confirmed_highs[-1]
     last_low = confirmed_lows[-1]
+    leg = "bullish" if last_high["ts"] >= last_low["ts"] else "bearish"
     # Pair the most recent high with the most recent low; order them as a range.
     hi = last_high["price"]
     lo = last_low["price"]
@@ -392,7 +406,7 @@ def _current_dealing_range(confirmed_highs, confirmed_lows):
             hi = max(hi, confirmed_highs[-2]["price"])
         if len(confirmed_lows) >= 2:
             lo = min(lo, confirmed_lows[-2]["price"])
-    return hi, lo
+    return hi, lo, leg
 
 
 # ---------------- context assembly ---------------- #
@@ -424,11 +438,13 @@ def build_smc_context(df_4h, df_1h, df_15m, value_areas: dict = None):
         fvgs = find_fvg(df)
         liq = find_liquidity_levels(sh, sl, atr_pct=_atr_pct(df))
 
-        dealing_high, dealing_low = _current_dealing_range(confirmed_highs, confirmed_lows)
+        dealing_high, dealing_low, leg_dir = _current_dealing_range(confirmed_highs, confirmed_lows)
         if dealing_high is not None and dealing_low is not None:
-            pd_zone = get_premium_discount(dealing_high, dealing_low, current_price)
+            pd_zone = get_premium_discount(dealing_high, dealing_low, current_price,
+                                           leg_direction=leg_dir or "bullish")
         else:
-            pd_zone = {"zone": "neutral", "in_ote": False, "ote_zone": {"low": 0, "high": 0}}
+            pd_zone = {"zone": "neutral", "in_ote": False,
+                       "ote_zone": {"low": 0, "high": 0}, "leg_direction": None}
 
         dev_h, dev_l = find_developing_swings(df)
 

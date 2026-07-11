@@ -2,7 +2,6 @@
 Cryptera v3.2 - Rule-based SMC engine + Gemini AI structured JSON narration.
 """
 
-import ccxt.async_support as ccxt
 import pandas as pd
 import asyncio
 import requests
@@ -11,7 +10,7 @@ import os
 import time
 import numpy as np
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
@@ -22,7 +21,7 @@ from smc import build_smc_context
 from price_action import build_pa_context, calculate_previous_day, get_value_area
 
 
-SCHEMA_VERSION = "3.2.3"
+SCHEMA_VERSION = "3.2.4"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
@@ -53,7 +52,12 @@ def to_native(obj):
 # ---------------- config ---------------- #
 
 TIMEFRAMES = ["4h", "1h", "15m"]
-LIMITS = {"4h": 200, "1h": 200, "15m": 300}
+# Single market namespace (BUG-01): OHLCV, taker flow, depth, funding, and OI
+# all come from Binance USDT-perp (fapi). Never mix spot and futures series.
+MARKET = "binance-usdm"
+# >= 260 closed bars so EMA_200 / ATR_Pct(100) are live after the forming
+# candle is dropped (BUG-02).
+LIMITS = {"4h": 300, "1h": 300, "15m": 300}
 WINDOW_SIZE = {"4h": 10, "1h": 20, "15m": 30}
 TF_MS = {"4h": 4 * 3600_000, "1h": 3600_000, "15m": 15 * 60_000}  # bar length in ms
 
@@ -159,11 +163,13 @@ def _cache_put(key, value):
 
 # ---------------- market data ---------------- #
 
-def fetch_taker_flow(symbol, tf, limit):
+def fetch_futures_klines(symbol, tf, limit):
     """
-    Fetch raw futures klines to obtain per-bar taker-buy base volume, indexed by
-    open timestamp. Enables REAL aggressive CVD (buy - sell) instead of the
-    candle-position proxy. Returns a DataFrame[timestamp, taker_buy_base] or None.
+    USDT-perp klines from fapi (single market namespace, BUG-01): OHLCV and
+    taker-buy base volume come from the SAME futures bars, so real CVD
+    (2*taker_buy - volume) is internally consistent — never mixed with spot.
+    Returns a DataFrame[timestamp, open, high, low, close, volume,
+    taker_buy_base] or None.
     """
     try:
         r = requests.get(
@@ -175,13 +181,15 @@ def fetch_taker_flow(symbol, tf, limit):
             return None
         rows = []
         for k in r:
-            # [0]=openTime ... [5]=volume ... [9]=takerBuyBaseVol
-            rows.append((int(k[0]), float(k[9])))
-        df = pd.DataFrame(rows, columns=["timestamp", "taker_buy_base"])
+            # [0]=openTime [1..4]=OHLC [5]=volume [9]=takerBuyBaseVol
+            rows.append((int(k[0]), float(k[1]), float(k[2]), float(k[3]),
+                         float(k[4]), float(k[5]), float(k[9])))
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low",
+                                         "close", "volume", "taker_buy_base"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
     except Exception as e:
-        print(f"[Warning] Taker-flow fetch failed for {tf}: {e}")
+        print(f"[Warning] Futures klines fetch failed for {tf}: {e}")
         return None
 
 
@@ -200,53 +208,43 @@ def _drop_forming_candle(df: pd.DataFrame, tf: str, now_ms: int) -> pd.DataFrame
 
 async def fetch_ohlcv(symbol):
     """
-    Fetch OHLCV + taker flow across timeframes (retry + LRU cache), drop the
-    forming candle, attach real-CVD inputs, and compute indicators on closed
-    bars. Returns (data: {tf: df}, live_price: float).
+    Fetch USDT-perp OHLCV + taker flow across timeframes (retry + LRU cache),
+    drop the forming candle, and compute indicators on closed bars. Raises if
+    the symbol does not resolve on the futures market — one namespace only.
+    Returns (data: {tf: df}, live_price: float).
     """
-    exchange = ccxt.binance({"enableRateLimit": True})
     raw_dfs = {}
     now = time.time()
     now_ms = int(now * 1000)
     live_price = None
 
-    try:
-        for tf in TIMEFRAMES:
-            cache_key = (symbol, tf)
-            cached = _cache_get(cache_key)
-            if cached is not None:
-                cached_time, cached_df = cached
-                if now - cached_time < CACHE_TTL_SECONDS[tf]:
-                    raw_dfs[tf] = cached_df.copy()
-                    continue
+    for tf in TIMEFRAMES:
+        cache_key = (symbol, tf)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            cached_time, cached_df = cached
+            if now - cached_time < CACHE_TTL_SECONDS[tf]:
+                raw_dfs[tf] = cached_df.copy()
+                continue
 
-            candles = None
-            for attempt in range(3):
-                try:
-                    candles = await exchange.fetch_ohlcv(symbol, tf, limit=LIMITS[tf])
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise e
-                    await asyncio.sleep(2 ** attempt)
+        df = None
+        for attempt in range(3):
+            df = await asyncio.to_thread(fetch_futures_klines, symbol, tf, LIMITS[tf])
+            if df is not None:
+                break
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+        if df is None:
+            raise RuntimeError(
+                f"No {tf} klines for {symbol} on {MARKET} — "
+                "symbol may not exist as a Binance USDT-perp.")
 
-            if candles is not None:
-                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-                # capture the freshest (possibly forming) 15m close as the live price
-                if tf == "15m":
-                    live_price = float(df["close"].iloc[-1])
-                # merge real taker-buy volume (best-effort) before dropping forming bar
-                taker = await asyncio.to_thread(fetch_taker_flow, symbol, tf, LIMITS[tf])
-                if taker is not None:
-                    df = df.merge(taker, on="timestamp", how="left")
-                df = _drop_forming_candle(df, tf, now_ms)
-                raw_dfs[tf] = df
-                _cache_put(cache_key, (now, df.copy()))
-            elif tf == "15m" and cache_key in OHLCV_CACHE:
-                pass
-    finally:
-        await exchange.close()
+        # capture the freshest (possibly forming) 15m close as the live price
+        if tf == "15m":
+            live_price = float(df["close"].iloc[-1])
+        df = _drop_forming_candle(df, tf, now_ms)
+        raw_dfs[tf] = df
+        _cache_put(cache_key, (now, df.copy()))
 
     if live_price is None and "15m" in raw_dfs and not raw_dfs["15m"].empty:
         live_price = float(raw_dfs["15m"]["close"].iloc[-1])
@@ -326,7 +324,7 @@ def _save_oi_history(hist):
 
 
 def fetch_open_interest(symbol):
-    """OI now + 1h / 4h deltas + 30-day percentile (history endpoint with local fallback)."""
+    """OI now + 1h / 4h deltas + ~20-day percentile (history endpoint with local fallback)."""
     sym_clean = symbol.replace("/", "")
     oi_now = 0.0
     try:
@@ -341,12 +339,13 @@ def fetch_open_interest(symbol):
 
     oi_change_1h = None
     oi_change_4h = None
-    oi_percentile_30d = None
+    oi_percentile_20d = None
 
     try:
+        # Binance caps this endpoint at limit=500 (BUG-04); 500 x 1h ~ 20.8 days.
         r = requests.get(
             "https://fapi.binance.com/futures/data/openInterestHist",
-            params={"symbol": sym_clean, "period": "1h", "limit": 30 * 24},
+            params={"symbol": sym_clean, "period": "1h", "limit": 500},
             timeout=8,
         ).json()
         if isinstance(r, list) and len(r) >= 2:
@@ -364,7 +363,7 @@ def fetch_open_interest(symbol):
                 oi_change_4h = round((oi_now - series[-5]) / series[-5] * 100, 3)
             if series:
                 below = sum(1 for v in series if v <= oi_now)
-                oi_percentile_30d = round(below / len(series) * 100, 1)
+                oi_percentile_20d = round(below / len(series) * 100, 1)
     except Exception as e:
         print(f"[Warning] OI history fetch failed: {e}")
 
@@ -375,16 +374,16 @@ def fetch_open_interest(symbol):
     sym_hist = sym_hist[-2000:]
     history[symbol] = sym_hist
     _save_oi_history(history)
-    if oi_percentile_30d is None and len(sym_hist) >= 10:
+    if oi_percentile_20d is None and len(sym_hist) >= 10:
         vals_local = [x["oi"] for x in sym_hist]
         below = sum(1 for v in vals_local if v <= oi_now)
-        oi_percentile_30d = round(below / len(vals_local) * 100, 1)
+        oi_percentile_20d = round(below / len(vals_local) * 100, 1)
 
     return {
         "value": oi_now,
         "change_1h_pct": oi_change_1h,
         "change_4h_pct": oi_change_4h,
-        "percentile_30d": oi_percentile_30d,
+        "percentile_20d": oi_percentile_20d,
     }
 
 
@@ -523,6 +522,8 @@ Rules
    TRADE MANAGEMENT: `tp1` = nearest HIGH-CONFLUENCE target (the first strong stacked level), `tp2` = a farther runner (>= 2R if available); set `tp1_rr`/`tp2_rr` from the candidate's `rr`; `move_to_breakeven_at` = tp1 or a candidate level between entry and tp1; `scale_out` describes the split (e.g. "50% at TP1, move SL to BE, 50% runner to TP2").
 
 Regime-conditional scoring — read `strategies.score_mode`:
+ header.score_breakdown = copy `strategies.confluence_breakdown` VERBATIM, only the keys of
+ the active mode (trend → c1_...c8_ keys; mean_revert → m1_...m6_ keys). Never fill both sets.
  score_mode == "trend" (trending regime): components C1-C8 measure trend continuation.
    C1 trend(25) ADX-tiered on 4H/1H agreement · C2 ob_prox(15) distance to 15m/1H OB·FVG
    C3 sweep(10) HTF sweep+reclaim (6 if 15m-only) · C4 momentum(15) 1H RSI/MACD ±slope
@@ -566,6 +567,7 @@ GEMINI_MODEL_NAME = "gemini-3.5-flash"
 GEMINI_THINKING_LEVEL = "high"
 
 _INT = {"type": "integer"}
+_INT_NULL = {"type": "integer", "nullable": True}
 _NUM = {"type": "number"}
 _STR = {"type": "string"}
 _BOOL = {"type": "boolean"}
@@ -607,15 +609,23 @@ GEMINI_RESPONSE_SCHEMA = {
                 "score": _INT,
                 "action": {"type": "string", "enum": ["ACTIVE_TRADE", "CONDITIONAL_ENTRY", "HOLD"]},
                 "volume_gate": {"type": "string", "enum": ["HARD_GATE", "LOW_VOL_WARNING", "CLEAR"]},
+                # Regime-conditional (BUG-07): keys mirror the engine's
+                # confluence_breakdown exactly; only the active mode's keys are
+                # filled (trend -> c1..c8, mean_revert -> m1..m6), never both.
                 "score_breakdown": {
                     "type": "object",
+                    "description": ("Echo strategies.confluence_breakdown verbatim. "
+                                    "Include ONLY the keys of the active score_mode: "
+                                    "c1..c8 when trend, m1..m6 when mean_revert."),
                     "properties": {
-                        "c1_trend": _INT, "c2_ob_prox": _INT, "c3_sweep": _INT,
-                        "c4_momentum": _INT, "c5_fvg_magnet": _INT, "c6_ote": _INT,
-                        "c7_cvd": _INT, "c8_stoch": _INT,
+                        "c1_trend_alignment": _INT_NULL, "c2_ob_proximity": _INT_NULL,
+                        "c3_liquidity_sweep": _INT_NULL, "c4_momentum": _INT_NULL,
+                        "c5_fvg_magnet": _INT_NULL, "c6_ote_bonus": _INT_NULL,
+                        "c7_cvd_alignment": _INT_NULL, "c8_stochrsi": _INT_NULL,
+                        "m1_edge_distance": _INT_NULL, "m2_edge_sweep": _INT_NULL,
+                        "m3_cvd_absorption": _INT_NULL, "m4_stoch_extreme": _INT_NULL,
+                        "m5_rejection": _INT_NULL, "m6_range_intact": _INT_NULL,
                     },
-                    "required": ["c1_trend", "c2_ob_prox", "c3_sweep", "c4_momentum",
-                                 "c5_fvg_magnet", "c6_ote", "c7_cvd", "c8_stoch"],
                 },
                 "score_override": {
                     "type": "object",
@@ -951,8 +961,9 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
 
     snapshot = {
         "schema_version": SCHEMA_VERSION,
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "symbol": symbol,
+        "market": MARKET,
         "live_price": live_price,
         "market_regime": regime,
         "volatility_regime": vol_regime,
@@ -980,7 +991,8 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     snapshot_native["chart_series"] = build_chart_series(data)
 
     os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # UTC filename so the labeler's timestamp parse is timezone-safe (BUG-03)
+    timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     snapshot_filename = f"snapshot_{symbol.replace('/', '_')}_{timestamp_str}.json"
     snapshot_path = os.path.join(SNAPSHOTS_DIR, snapshot_filename)
     with open(snapshot_path, "w") as f:
