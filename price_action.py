@@ -8,7 +8,8 @@ Candle-pattern detection is limited to confirmation-grade reversal patterns.
 
 import pandas as pd
 import numpy as np
-from smc import find_swings, fractal_swing_mask, SWING_WIDTHS, DEFAULT_WIDTH
+from smc import find_swings, fractal_swing_mask
+from config import SWING_WIDTHS, DEFAULT_WIDTH
 
 
 def _atr_pct(df: pd.DataFrame, fallback: float = 0.005) -> float:
@@ -50,9 +51,11 @@ def detect_candle_pattern(df: pd.DataFrame) -> str:
         return "bullish_engulfing"
     if g1 and r_0 and (c0["close"] <= c1["open"]) and (c0["open"] >= c1["close"]):
         return "bearish_engulfing"
-    if r_2 and r2 > 0 and (b1 / r2 <= 0.3) and g0 and (c0["close"] >= (c2["open"] + c2["close"]) / 2):
+    # Small-body test uses the MIDDLE candle's OWN range (b1/r1), not the first
+    # candle's (BUG-20) — a large first candle previously masked a fat middle body.
+    if r_2 and r1 > 0 and (b1 / r1 <= 0.3) and g0 and (c0["close"] >= (c2["open"] + c2["close"]) / 2):
         return "morning_star"
-    if g2 and r2 > 0 and (b1 / r2 <= 0.3) and r_0 and (c0["close"] <= (c2["open"] + c2["close"]) / 2):
+    if g2 and r1 > 0 and (b1 / r1 <= 0.3) and r_0 and (c0["close"] <= (c2["open"] + c2["close"]) / 2):
         return "evening_star"
     return "none"
 

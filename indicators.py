@@ -2,16 +2,15 @@
 Indicator Engine - SMC + Momentum + Volume + Volatility
 
 CVD is computed from real taker-initiated volume when the kline `taker_buy_base`
-column is present (see main.fetch_taker_flow); otherwise it falls back to a
-labelled candle-position proxy. Swing columns use the same fractal definition as
-smc.py (single source of truth).
+column is present (see main.fetch_futures_klines); otherwise it falls back to a
+labelled candle-position proxy.
 """
 
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
 
-from smc import fractal_swing_mask, SWING_WIDTHS, DEFAULT_WIDTH
+from config import ADX_TREND_FLOOR, KILL_ZONES
 
 
 def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
@@ -23,9 +22,6 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
 
     # === VOLATILITY ===
     df["ATR"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-    atr_mean = df["ATR"].rolling(50).mean()
-    atr_std = df["ATR"].rolling(50).std()
-    df["ATR_Z"] = (df["ATR"] - atr_mean) / atr_std
     df["ATR_Pct"] = df["ATR"].rolling(100, min_periods=20).rank(pct=True)
 
     # === MOMENTUM ===
@@ -37,11 +33,6 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
     else:
         df["MACD"] = np.nan
         df["MACD_SIGNAL"] = np.nan
-
-    # === VOLUME ===
-    vol_mean = df["volume"].rolling(20).mean()
-    vol_std = df["volume"].rolling(20).std()
-    df["VOL_Z"] = (df["volume"] - vol_mean) / vol_std
 
     # === SUPERTREND ===
     try:
@@ -107,18 +98,6 @@ def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFram
         df["cvd"] = df["cvd_delta_bar"].cumsum()
         df["cvd_real"] = False
 
-    # === SWING POINTS (shared fractal definition with smc.py) ===
-    left, right = SWING_WIDTHS.get(timeframe, DEFAULT_WIDTH)
-    is_high, is_low = fractal_swing_mask(df["high"], df["low"], left, right)
-    df["swing_high"] = is_high
-    df["swing_low"] = is_low
-
-    # === FAIR VALUE GAP flags (per candle) ===
-    high_2 = df["high"].shift(2)
-    low_2 = df["low"].shift(2)
-    df["fvg_bull"] = df["low"] > high_2
-    df["fvg_bear"] = df["high"] < low_2
-
     return df
 
 
@@ -143,9 +122,6 @@ def detect_volatility_regime(df: pd.DataFrame) -> dict:
         "atr_percentile": float(atr_pct) if atr_pct is not None and not pd.isna(atr_pct) else None,
         "bb_width": float(bb_width) if bb_width is not None and not pd.isna(bb_width) else None,
     }
-
-
-ADX_TREND_FLOOR = 20.0  # 4H ADX must clear this for a "Trending" classification (BUG-08)
 
 
 def _adx_last(df) -> float:
@@ -252,13 +228,10 @@ def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int
 # ---------------- session-aware volume + ICT kill zones ---------------- #
 
 def kill_zone(hour_utc: int) -> str:
-    """ICT kill-zone tag for a UTC hour (approximate fixed windows)."""
-    if 7 <= hour_utc < 10:
-        return "LONDON"
-    if 12 <= hour_utc < 15:
-        return "NEWYORK"
-    if 0 <= hour_utc < 4:
-        return "ASIA"
+    """ICT kill-zone tag for a UTC hour (fixed windows, config.KILL_ZONES)."""
+    for start, end, name in KILL_ZONES:
+        if start <= hour_utc < end:
+            return name
     return "OFF"
 
 

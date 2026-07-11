@@ -102,24 +102,28 @@ def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame) 
     """
     side: 'long' or 'short'.
     Walk forward bar by bar. A bar that touches BOTH SL and TP is conservatively
-    counted as `sl_first` (assume worst case — pessimistic estimator).
+    counted as `sl_first` (assume worst case — pessimistic estimator). A resting
+    limit order also counts as triggered if price gapped THROUGH the entry level
+    between two consecutive closed bars, even though no single bar's [low, high]
+    range contains it (BUG-18 — previously silently under-counted as not-triggered).
     """
     if df is None or df.empty:
         return {"triggered": False, "outcome": "no_data"}
 
     triggered = False
     entry_idx = None
+    prev_close = None
     for i, row in df.iterrows():
-        if side == "long":
-            if row["low"] <= entry <= row["high"]:
-                triggered = True
-                entry_idx = i
-                break
-        else:
-            if row["low"] <= entry <= row["high"]:
-                triggered = True
-                entry_idx = i
-                break
+        lo, hi = float(row["low"]), float(row["high"])
+        if lo <= entry <= hi:
+            triggered = True
+            entry_idx = i
+            break
+        if prev_close is not None and ((prev_close < entry < lo) or (prev_close > entry > hi)):
+            triggered = True
+            entry_idx = i
+            break
+        prev_close = float(row["close"])
 
     if not triggered:
         return {"triggered": False, "outcome": "not_triggered",

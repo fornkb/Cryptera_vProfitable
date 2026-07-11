@@ -47,7 +47,7 @@ within bounds, it does not invent levels.
 
 ```
         ┌──────────────── main.py (pipeline) ────────────────┐
-        │  Binance OHLCV + taker flow (ccxt + REST klines)   │
+        │  Binance USDT-perp OHLCV + taker flow (fapi REST)  │
         │  REST: L2 depth · funding · OI · F&G · BTC.D        │
         │  drop forming candle → calculate_indicators()      │
         └───────────────┬───────────────────────┬────────────┘
@@ -83,8 +83,8 @@ the parsed analysis + compact chart OHLC.
 ## Prerequisites
 
 - Python 3.10+
-- Dependencies in `requirements.txt`: `ccxt`, `pandas`, `pandas-ta`, `numpy`,
-  `requests`, `python-dotenv`, `google-genai`, `Flask`.
+- Dependencies in `requirements.txt`: `pandas`, `pandas-ta`, `numpy`,
+  `requests`, `python-dotenv`, `google-genai`, `Flask`, `asgiref`, `pytest`.
 - A Gemini API key with access to `gemini-3.5-flash`.
 
 ## Installation
@@ -231,7 +231,8 @@ Top-level keys written to each `snapshots/snapshot_*.json`:
 
 | path                        | role                                                                              |
 | --------------------------- | --------------------------------------------------------------------------------- |
-| `main.py`                   | pipeline · ccxt + taker-flow fetch · closed-candle handling · Gemini client · persistence |
+| `main.py`                   | pipeline · USDT-perp (fapi) OHLCV + taker-flow fetch · closed-candle handling · Gemini client · persistence |
+| `config.py`                 | centralized limits/thresholds/retention/model name (single source of truth) |
 | `indicators.py`             | EMA/ATR/RSI/MACD/Supertrend/StochRSI/ADX/BB · real-or-proxy CVD · volatility regime · shared fractal swings |
 | `smc.py`                    | unified fractal swings · event-based BOS/CHoCH+displacement · OBs · FVGs · BSL/SSL · single-leg premium/discount + OTE |
 | `price_action.py`           | confirmation candle patterns · range-distributed volume profile · ATR-scaled S/R · PDH/PDL/PDC · untested session POCs |
@@ -243,16 +244,17 @@ Top-level keys written to each `snapshots/snapshot_*.json`:
 | `data/events.json`          | operator-maintained list of high-impact macro events (tracked)                   |
 | `data/oi_history.json`      | engine-managed OI history fallback (git-ignored)                                  |
 | `data/calibration.json`     | optional fitted weights + score→win-rate (git-ignored)                           |
+| `data/snapshot_index.json`  | cached `/api/history` header index, self-healing (git-ignored)                   |
 | `tools/label_snapshots.py`  | label realised TP/SL outcomes (LLM plan, forward scenario, engine geometry)      |
 | `tools/eval_engine.py`      | aggregate per-bucket performance metrics                                          |
 | `tools/calibrate.py`        | fit component weights + score→win-rate from labelled snapshots                    |
-| `improvements_report.md`    | production-grade engine review (Tier 1-3, bugs, removals)                         |
+| `tests/`                    | pytest unit tests for the pure engine functions (swings, structure, geometry, labeling) |
 
 ---
 
 ## Roadmap
 
-Tier 1 of [improvements_report.md](improvements_report.md), all bugs, and all
+All bugs and improvements from the 2026-07-11 audit (see `current_status.md`) and all
 removals are implemented in 3.2. Still open:
 
 - **Tier 2** — closed-candle volume-gate seasonality, BTC-beta gating for alts,

@@ -7,6 +7,7 @@ import asyncio
 import copy
 import requests
 import json
+import logging
 import os
 import time
 import numpy as np
@@ -21,18 +22,14 @@ from indicators import (calculate_indicators, detect_regime, detect_volatility_r
 from strategies import evaluate_strategies
 from smc import build_smc_context
 from price_action import build_pa_context, calculate_previous_day, get_value_area
+from config import (SCHEMA_VERSION, DATA_DIR, SNAPSHOTS_DIR, OI_HISTORY_PATH,
+                    EVENTS_PATH, REGIME_STATE_PATH, REGIME_HYSTERESIS_RUNS,
+                    SNAPSHOT_RETENTION, HORIZON_HOURS, MARKET, TIMEFRAMES,
+                    REQUIRED_TIMEFRAMES, LIMITS, WINDOW_SIZE, TF_MS, CHART_BARS,
+                    OHLCV_CACHE_MAX, CACHE_TTL_SECONDS, EVENT_GUARD_WINDOW_HOURS,
+                    GEMINI_MODEL_NAME, GEMINI_THINKING_LEVEL)
 
-
-SCHEMA_VERSION = "3.3.0"
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(ROOT_DIR, "data")
-SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
-OI_HISTORY_PATH = os.path.join(DATA_DIR, "oi_history.json")
-EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
-REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
-REGIME_HYSTERESIS_RUNS = 2  # consecutive raw runs required before a rubric flip (BUG-08)
-SNAPSHOT_RETENTION = 1000  # per symbol
-HORIZON_HOURS = 24  # forward window the geometry/targets are judged against
+logger = logging.getLogger("cryptera")
 
 
 # ---------------- utilities ---------------- #
@@ -62,19 +59,23 @@ def _atr_last(df) -> float:
     return round(float(v), 6) if pd.notna(v) else None
 
 
-# ---------------- config ---------------- #
-
-# 1D added (audit §3.3): daily structure + daily liquidity pools become HTF draws
-# for the geometry target menu; entries stay keyed off 4H/1H/15M.
-TIMEFRAMES = ["1d", "4h", "1h", "15m"]
-# Single market namespace (BUG-01): OHLCV, taker flow, depth, funding, and OI
-# all come from Binance USDT-perp (fapi). Never mix spot and futures series.
-MARKET = "binance-usdm"
-# >= 260 closed bars so EMA_200 / ATR_Pct(100) are live after the forming
-# candle is dropped (BUG-02).
-LIMITS = {"1d": 300, "4h": 300, "1h": 300, "15m": 300}
-WINDOW_SIZE = {"1d": 14, "4h": 10, "1h": 20, "15m": 30}
-TF_MS = {"1d": 24 * 3600_000, "4h": 4 * 3600_000, "1h": 3600_000, "15m": 15 * 60_000}  # bar length in ms
+def _price_decimals(price: float) -> int:
+    """
+    Rounding precision scaled to price magnitude (BUG-14) — a flat round(x, 2)
+    collapses a sub-cent asset's close_series_last_5 to [0.0, ...], destroying
+    the signal for custom low-priced pairs.
+    """
+    if price is None or price <= 0:
+        return 4
+    if price >= 100:
+        return 2
+    if price >= 1:
+        return 4
+    if price >= 0.01:
+        return 6
+    if price >= 0.0001:
+        return 8
+    return 10
 
 
 def get_window_dict(df: pd.DataFrame, size: int) -> dict:
@@ -83,6 +84,7 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
     closes = recent["close"].tolist()
     start_p = closes[0] if closes else 1.0
     end_p = closes[-1] if closes else 1.0
+    decimals = _price_decimals(end_p)
     price_change_pct = round(((end_p - start_p) / start_p) * 100, 2) if start_p else 0.0
 
     def _safe(col, default=0.0):
@@ -108,7 +110,7 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
     cvd_real = bool(recent["cvd_real"].iloc[-1]) if "cvd_real" in recent.columns and not recent.empty else False
 
     recent_5 = df.tail(5)
-    close_series = [round(float(x), 2) for x in recent_5["close"].tolist()]
+    close_series = [round(float(x), decimals) for x in recent_5["close"].tolist()]
     rsi_series = [round(float(x), 2) for x in recent_5["RSI"].tolist()] if "RSI" in recent_5.columns else []
 
     # Single-bar (last CLOSED bar) price change — matches per-bar OI deltas so the
@@ -118,7 +120,7 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
         bar_change_pct = round(((closes[-1] - closes[-2]) / closes[-2]) * 100, 3)
 
     return {
-        "current_price": round(end_p, 4),
+        "current_price": round(end_p, decimals),
         "window_price_change_pct": price_change_pct,
         "bar_price_change_pct": bar_change_pct,
         "rsi": rsi_latest,
@@ -136,9 +138,6 @@ def get_window_dict(df: pd.DataFrame, size: int) -> dict:
 
 
 # ---------------- chart series (for the dashboard candlestick chart) ---------------- #
-
-CHART_BARS = {"1d": 90, "4h": 120, "1h": 150, "15m": 180}
-
 
 def build_chart_series(data: dict) -> dict:
     """
@@ -165,8 +164,6 @@ def build_chart_series(data: dict) -> dict:
 # ---------------- caching ---------------- #
 
 OHLCV_CACHE = OrderedDict()
-OHLCV_CACHE_MAX = 50
-CACHE_TTL_SECONDS = {"1d": 900, "4h": 300, "1h": 120, "15m": 20}
 
 
 def _cache_get(key):
@@ -211,8 +208,30 @@ def fetch_futures_klines(symbol, tf, limit):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
     except Exception as e:
-        print(f"[Warning] Futures klines fetch failed for {tf}: {e}")
+        # Demoted to debug: the caller retries up to 3x and logs one warning
+        # only if every attempt fails ("warn-once", BUG-23).
+        logger.debug(f"Futures klines fetch attempt failed for {tf}: {e}")
         return None
+
+
+def fetch_live_price(symbol: str):
+    """
+    Freshest (possibly still-forming) 15m close, independent of the OHLCV
+    cache TTL — used to refresh `live_price` on a 15m cache hit (BUG-19),
+    which previously fell back to the last CLOSED bar's close (stale by up
+    to one bar). Returns None on failure.
+    """
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/klines",
+            params={"symbol": symbol.replace("/", ""), "interval": "15m", "limit": 1},
+            timeout=5,
+        ).json()
+        if isinstance(r, list) and r:
+            return float(r[-1][4])
+    except Exception as e:
+        logger.warning(f"Live price refresh failed: {e}")
+    return None
 
 
 def _drop_forming_candle(df: pd.DataFrame, tf: str, now_ms: int) -> pd.DataFrame:
@@ -231,9 +250,12 @@ def _drop_forming_candle(df: pd.DataFrame, tf: str, now_ms: int) -> pd.DataFrame
 async def fetch_ohlcv(symbol):
     """
     Fetch USDT-perp OHLCV + taker flow across timeframes (retry + LRU cache),
-    drop the forming candle, and compute indicators on closed bars. Raises if
-    the symbol does not resolve on the futures market — one namespace only.
-    Returns (data: {tf: df}, live_price: float).
+    drop the forming candle, and compute indicators on closed bars. Required
+    timeframes (4h/1h/15m) raise if the symbol never resolves on the futures
+    market; the optional 1D leg degrades gracefully to None instead of
+    aborting the whole run (BUG-15) — every 1D consumer downstream already
+    tolerates a missing daily leg.
+    Returns (data: {tf: df|None}, live_price: float).
     """
     raw_dfs = {}
     now = time.time()
@@ -247,6 +269,12 @@ async def fetch_ohlcv(symbol):
             cached_time, cached_df = cached
             if now - cached_time < CACHE_TTL_SECONDS[tf]:
                 raw_dfs[tf] = cached_df.copy()
+                if tf == "15m":
+                    # Cache hit skips the fresh fetch below, so live_price
+                    # would otherwise fall back to the last CLOSED close
+                    # after the loop (stale by up to one bar) — refresh it
+                    # directly instead (BUG-19).
+                    live_price = await asyncio.to_thread(fetch_live_price, symbol)
                 continue
 
         df = None
@@ -257,9 +285,13 @@ async def fetch_ohlcv(symbol):
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
         if df is None:
-            raise RuntimeError(
-                f"No {tf} klines for {symbol} on {MARKET} — "
-                "symbol may not exist as a Binance USDT-perp.")
+            if tf in REQUIRED_TIMEFRAMES:
+                raise RuntimeError(
+                    f"No {tf} klines for {symbol} on {MARKET} — "
+                    "symbol may not exist as a Binance USDT-perp.")
+            logger.warning(f"No {tf} klines for {symbol} — continuing without this timeframe (degraded mode).")
+            raw_dfs[tf] = None
+            continue
 
         # capture the freshest (possibly forming) 15m close as the live price
         if tf == "15m":
@@ -268,12 +300,12 @@ async def fetch_ohlcv(symbol):
         raw_dfs[tf] = df
         _cache_put(cache_key, (now, df.copy()))
 
-    if live_price is None and "15m" in raw_dfs and not raw_dfs["15m"].empty:
+    if live_price is None and raw_dfs.get("15m") is not None and not raw_dfs["15m"].empty:
         live_price = float(raw_dfs["15m"]["close"].iloc[-1])
 
     data = {}
     for tf, df in raw_dfs.items():
-        data[tf] = await asyncio.to_thread(calculate_indicators, df, timeframe=tf)
+        data[tf] = None if df is None else await asyncio.to_thread(calculate_indicators, df, timeframe=tf)
     return data, live_price
 
 
@@ -287,7 +319,7 @@ def fetch_orderbook(symbol):
             timeout=8,
         ).json()
     except Exception as e:
-        print(f"[Warning] Orderbook fetch failed: {e}")
+        logger.warning(f"Orderbook fetch failed: {e}")
         return default
 
     bids = [(float(b[0]), float(b[1])) for b in r.get("bids", [])]
@@ -342,7 +374,7 @@ def _write_json_file(path, obj):
         with open(path, "w") as f:
             json.dump(obj, f)
     except Exception as e:
-        print(f"[Warning] Failed to persist {os.path.basename(path)}: {e}")
+        logger.warning(f"Failed to persist {os.path.basename(path)}: {e}")
 
 
 def apply_regime_hysteresis(symbol: str, raw_regime: str) -> str:
@@ -377,7 +409,7 @@ def _save_oi_history(hist):
         with open(OI_HISTORY_PATH, "w") as f:
             json.dump(hist, f)
     except Exception as e:
-        print(f"[Warning] Failed to persist OI history: {e}")
+        logger.warning(f"Failed to persist OI history: {e}")
 
 
 def fetch_open_interest(symbol):
@@ -392,7 +424,7 @@ def fetch_open_interest(symbol):
         ).json()
         oi_now = float(r.get("openInterest", 0.0))
     except Exception as e:
-        print(f"[Warning] OI fetch failed: {e}")
+        logger.warning(f"OI fetch failed: {e}")
 
     oi_change_1h = None
     oi_change_4h = None
@@ -422,7 +454,7 @@ def fetch_open_interest(symbol):
                 below = sum(1 for v in series if v <= oi_now)
                 oi_percentile_20d = round(below / len(series) * 100, 1)
     except Exception as e:
-        print(f"[Warning] OI history fetch failed: {e}")
+        logger.warning(f"OI history fetch failed: {e}")
 
     # Local fallback / augmentation
     history = _load_oi_history()
@@ -451,11 +483,15 @@ def fetch_funding(symbol):
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/fundingRate",
-            params={"symbol": symbol.replace("/", ""), "limit": 24},
+            # Binance caps this endpoint at limit=1000 (BUG-22): 24 samples (~8
+            # days) made the percentile-within-window noisy for a ±3/-4 modifier;
+            # widen to the max for a stable percentile. avg_24h still only uses
+            # the last 3 samples (~24h at the standard 8h funding interval).
+            params={"symbol": symbol.replace("/", ""), "limit": 1000},
             timeout=5,
         ).json()
     except Exception as e:
-        print(f"[Warning] Funding fetch failed: {e}")
+        logger.warning(f"Funding fetch failed: {e}")
         return default
 
     if not isinstance(r, list) or not r:
@@ -494,7 +530,7 @@ def fetch_sentiment():
         r = requests.get("https://api.alternative.me/fng/", timeout=5).json()
         return int(r["data"][0]["value"])
     except Exception:
-        print("[Warning] Fear & Greed API failed. Defaulting to neutral 50.")
+        logger.warning("Fear & Greed API failed. Defaulting to neutral 50.")
         return 50
 
 
@@ -520,11 +556,11 @@ def fetch_btc_dominance_proxy(symbol):
             "change_24h_pct": round(change_24h, 3),
         }
     except Exception as e:
-        print(f"[Warning] BTC.D proxy fetch failed: {e}")
+        logger.warning(f"BTC.D proxy fetch failed: {e}")
         return None
 
 
-def fetch_event_window(now_ts: float = None, window_hours: int = 2) -> dict:
+def fetch_event_window(now_ts: float = None, window_hours: int = EVENT_GUARD_WINDOW_HOURS) -> dict:
     """Active high-impact macro events near current time (data/events.json)."""
     if now_ts is None:
         now_ts = time.time()
@@ -540,7 +576,12 @@ def fetch_event_window(now_ts: float = None, window_hours: int = 2) -> dict:
     window_s = window_hours * 3600
     for e in events if isinstance(events, list) else []:
         try:
+            # Naive (offset-less) datetimes are ASSUMED UTC (BUG-13) — parsing
+            # them as machine-local time shifted the ±window_hours guard by the
+            # host's UTC offset. data/events.json is operator-maintained in UTC.
             dt = datetime.fromisoformat(e["datetime"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             ev_ts = dt.timestamp()
         except Exception:
             continue
@@ -626,16 +667,8 @@ Field formats
 """.strip()
 
 
-GEMINI_MODEL_NAME = "gemini-3.5-flash"
-# Gemini 3.5 uses string-enum thinking levels instead of numeric budgets:
-# minimal | low | medium (default) | high. The LLM's job here is no longer pure
-# rule-following — as of v3.3 it must SELECT the best candidate from the engine
-# menu (the highest-stakes decision in the output), which rewards deeper thinking,
-# so the constant and this comment agree on `high`. This is the pre-measurement
-# default: `tools/ab_thinking.py` A/B-tests high vs medium over labeled snapshots;
-# switch to the measured winner once >= ~30 labeled snapshots exist (empty corpus
-# now, so measurement is deferred — current_status Phase 2).
-GEMINI_THINKING_LEVEL = "high"
+# GEMINI_MODEL_NAME / GEMINI_THINKING_LEVEL live in config.py (single source of
+# truth for the model name + thinking-level, imported at module top).
 
 _INT = {"type": "integer"}
 _INT_NULL = {"type": "integer", "nullable": True}
@@ -982,7 +1015,7 @@ def query_gemini(snapshot: dict) -> dict:
                 s in msg for s in ("schema", "unknown field", "invalid_argument")
             )
             if schema_rejection:
-                print(f"[Warning] Gemini schema rejected ({e}); retrying without schema.")
+                logger.warning(f"Gemini schema rejected ({e}); retrying without schema.")
                 continue
             return {"error": f"Gemini call failed ({label}): {e}"}
 
@@ -997,24 +1030,26 @@ def query_gemini(snapshot: dict) -> dict:
 # ---------------- snapshot retention ---------------- #
 
 def _enforce_snapshot_retention(symbol: str, retention: int = SNAPSHOT_RETENTION):
-    """Keep at most `retention` snapshot files per symbol (oldest deleted first)."""
+    """
+    Keep at most `retention` snapshot files per symbol (oldest deleted first).
+    Sorts by the filename's embedded UTC timestamp, not mtime (BUG-21) —
+    label_snapshots.py rewrites files in place, which resets mtime and could
+    otherwise delete newer snapshots ahead of older relabelled ones. The
+    `YYYYMMDD_HHMMSS` suffix is fixed-width and zero-padded, so a plain
+    lexicographic sort on the filename is already chronological.
+    """
     if not os.path.isdir(SNAPSHOTS_DIR):
         return
     prefix = f"snapshot_{symbol.replace('/', '_')}_"
-    files = []
-    for name in os.listdir(SNAPSHOTS_DIR):
-        if name.startswith(prefix) and name.endswith(".json"):
-            full = os.path.join(SNAPSHOTS_DIR, name)
-            try:
-                files.append((os.path.getmtime(full), full))
-            except OSError:
-                continue
-    files.sort(key=lambda t: t[0])
+    files = sorted(
+        name for name in os.listdir(SNAPSHOTS_DIR)
+        if name.startswith(prefix) and name.endswith(".json")
+    )
     if len(files) <= retention:
         return
-    for _, path in files[: len(files) - retention]:
+    for name in files[: len(files) - retention]:
         try:
-            os.remove(path)
+            os.remove(os.path.join(SNAPSHOTS_DIR, name))
         except OSError:
             continue
 
@@ -1023,22 +1058,26 @@ def _enforce_snapshot_retention(symbol: str, retention: int = SNAPSHOT_RETENTION
 
 async def run_analysis(symbol: str) -> tuple[dict, dict]:
     """End-to-end pipeline. Returns (snapshot_dict, analysis_dict)."""
-    print(f"\nAnalyzing market data for {symbol}...")
+    logger.info(f"Analyzing market data for {symbol}...")
 
     data, live_price = await fetch_ohlcv(symbol)
     if live_price is not None:
-        print(f"[DEBUG] Live price for {symbol}: {live_price:.4f} (signals on closed bars)")
+        logger.debug(f"Live price for {symbol}: {live_price:.4f} (signals on closed bars)")
 
-    # External micro / macro data fetched in parallel-friendly order (sync REST)
-    orderbook = fetch_orderbook(symbol)
-    funding = fetch_funding(symbol)
-    sentiment = fetch_sentiment()
-    open_interest = fetch_open_interest(symbol)
-    btc_dominance = fetch_btc_dominance_proxy(symbol)
+    # External micro / macro data — independent sync REST calls, run concurrently
+    # on worker threads (BUG-24) instead of serially (~3-6s of avoidable latency).
+    orderbook, funding, sentiment, open_interest, btc_dominance = await asyncio.gather(
+        asyncio.to_thread(fetch_orderbook, symbol),
+        asyncio.to_thread(fetch_funding, symbol),
+        asyncio.to_thread(fetch_sentiment),
+        asyncio.to_thread(fetch_open_interest, symbol),
+        asyncio.to_thread(fetch_btc_dominance_proxy, symbol),
+    )
     event_guard = fetch_event_window()
 
-    # Compute each TF's value area once and reuse (avoids recomputation, B11)
-    value_areas = {tf: get_value_area(data[tf]) for tf in data}
+    # Compute each TF's value area once and reuse (avoids recomputation, B11).
+    # Skips a TF that degraded to None (BUG-15) — get_value_area requires a df.
+    value_areas = {tf: get_value_area(df) for tf, df in data.items() if df is not None}
 
     # SMC + PA contexts (1D leg adds daily structure + HTF draws)
     smc_context = build_smc_context(data["4h"], data["1h"], data["15m"],
@@ -1060,7 +1099,7 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     st_dir_val = latest_1h["SUPERTd_10_3.0"] if "SUPERTd_10_3.0" in latest_1h and not pd.isna(latest_1h["SUPERTd_10_3.0"]) else 0
     supertrend_direction = "BULLISH" if st_dir_val == 1 else ("BEARISH" if st_dir_val == -1 else "NEUTRAL")
 
-    windowed_indicators = {tf: get_window_dict(data[tf], WINDOW_SIZE[tf]) for tf in data}
+    windowed_indicators = {tf: get_window_dict(df, WINDOW_SIZE[tf]) for tf, df in data.items() if df is not None}
     # Session-aware relative volume + ICT kill zone injected into the 15m window so
     # the volume gate uses a same-time-of-day baseline, not a flat 30-bar mean.
     windowed_indicators["15m"].update(session_volume_context(data["15m"]))
@@ -1115,7 +1154,7 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     }
     snapshot_native = to_native(snapshot)
 
-    print("Generating structured trade plan from Gemini...")
+    logger.info("Generating structured trade plan from Gemini...")
     analysis = query_gemini(_build_llm_view(snapshot_native))
     snapshot_native["analysis"] = analysis
 
@@ -1129,7 +1168,7 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     snapshot_path = os.path.join(SNAPSHOTS_DIR, snapshot_filename)
     with open(snapshot_path, "w") as f:
         json.dump(snapshot_native, f, indent=2)
-    print(f"Snapshot saved to snapshots/{snapshot_filename}")
+    logger.info(f"Snapshot saved to snapshots/{snapshot_filename}")
 
     _enforce_snapshot_retention(symbol)
     return snapshot_native, analysis
@@ -1185,6 +1224,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         asyncio.run(main())
     except SystemExit:

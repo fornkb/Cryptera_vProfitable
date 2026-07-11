@@ -3,7 +3,7 @@ Cryptera v3.2 - Confluence Scoring Engine
 
 Regime-conditional scoring:
   * Trending regimes  -> trend-continuation rubric (C1-C8).
-  * Ranging regimes   -> mean-reversion rubric (M1-M8) that fades value-area
+  * Ranging regimes   -> mean-reversion rubric (M1-M6) that fades value-area
                          extremes instead of chasing trend.
 
 Order-flow / funding / OI / sentiment are wired in as bounded score modifiers
@@ -17,7 +17,9 @@ import os
 import json
 import math
 import pandas as pd
-import numpy as np
+
+from config import (LOCATION_CAP, LOCATION_KEYS, SL_ATR_CAP,
+                    VOLUME_HARD_GATE, VOLUME_LOW_VOL_WARNING)
 
 _CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "calibration.json")
 _CALIBRATION_CACHE = None
@@ -417,13 +419,12 @@ def _m6_range_confirmed(smc_context):
 
 # Rubric decorrelation (audit §3.6): C2 (OB proximity), C5 (FVG magnet) and C6
 # (OTE) all answer "is price at a good LOCATION" — left uncapped a single location
-# could bank 40 pts and dominate the score. They now share one capped budget so
-# freed headroom goes to orthogonal evidence (C3 sweep -> 15, C7 CVD -> 15). The
-# individual c2/c5/c6 keys are preserved (calibration/labeling stability); only
-# their SUM is bounded. Per-regime action thresholds are deferred until eval data
-# supports refitting them (current_status Phase 2).
-LOCATION_CAP = 25
-LOCATION_KEYS = ("c2_ob_proximity", "c5_fvg_magnet", "c6_ote_bonus")
+# could bank 40 pts and dominate the score. They now share one capped budget
+# (config.LOCATION_CAP/LOCATION_KEYS) so freed headroom goes to orthogonal
+# evidence (C3 sweep -> 15, C7 CVD -> 15). The individual c2/c5/c6 keys are
+# preserved (calibration/labeling stability); only their SUM is bounded.
+# Per-regime action thresholds are deferred until eval data supports refitting
+# them (current_status Phase 2).
 
 
 def _rebudget_sweep(pts: int) -> int:
@@ -433,6 +434,26 @@ def _rebudget_sweep(pts: int) -> int:
     if pts >= 6:
         return 9
     return 0
+
+
+# Per-component rubric maxes (post any internal capping, pre calibration weight).
+# Calibration weights are clamped to [0.5, 1.5] (tools/calibrate.py) but multiply
+# the RAW component value, so a 1.5x-weighted C1 (max 25) could otherwise print
+# 38/25 in the breakdown shown to the LLM (P3 hygiene) — clamp each component
+# back to its own documented max after weighting.
+_COMPONENT_MAX = {
+    "c1_trend_alignment": 25, "c2_ob_proximity": 15, "c3_liquidity_sweep": 15,
+    "c4_momentum": 15, "c5_fvg_magnet": 15, "c6_ote_bonus": 10,
+    "c7_cvd_alignment": 15, "c8_stochrsi": 5,
+    "m1_edge_distance": 25, "m2_edge_sweep": 15, "m3_cvd_absorption": 15,
+    "m4_stoch_extreme": 15, "m5_rejection": 10, "m6_range_intact": 10,
+}
+
+
+def _clamp_component_max(breakdown: dict) -> dict:
+    """Clamp each weighted component to its own rubric max (see _COMPONENT_MAX)."""
+    return {k: min(v, _COMPONENT_MAX[k]) if k in _COMPONENT_MAX else v
+            for k, v in breakdown.items()}
 
 
 def _apply_location_cap(breakdown: dict) -> tuple[dict, int]:
@@ -456,7 +477,8 @@ def _volume_gate(windowed):
     rel = float(w15.get("relative_volume", 1.0) or 1.0)
     srel = w15.get("session_relative_volume")
     gate_val = float(srel) if srel is not None else rel
-    state = "HARD_GATE" if gate_val < 0.1 else ("LOW_VOL_WARNING" if gate_val < 0.3 else "CLEAR")
+    state = ("HARD_GATE" if gate_val < VOLUME_HARD_GATE
+             else ("LOW_VOL_WARNING" if gate_val < VOLUME_LOW_VOL_WARNING else "CLEAR"))
     return {"state": state, "rel_vol_15m": rel, "session_rel_vol_15m": srel,
             "kill_zone": w15.get("kill_zone", "OFF"), "gate_basis": "session" if srel is not None else "trailing"}
 
@@ -611,7 +633,6 @@ def _select_structural_tp(cands, entry, risk, direction):
 
 
 _TF_RANK = {"4h": 3, "1h": 2, "15m": 1}
-SL_ATR_CAP = 3.0  # max structural SL width in 15m-ATR multiples (BUG-06)
 
 
 def _tf_of_source(src):
@@ -910,6 +931,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
             raw = {"m1_edge_distance": m1, "m2_edge_sweep": m2, "m3_cvd_absorption": m3,
                    "m4_stoch_extreme": m4, "m5_rejection": m5, "m6_range_intact": m6}
             breakdown = {k: int(round(v * mr_weights.get(k, 1.0))) for k, v in raw.items()}
+            breakdown = _clamp_component_max(breakdown)
             notes = {"m1_edge_distance": n1, "m2_edge_sweep": n2, "m3_cvd_absorption": n3,
                      "m4_stoch_extreme": n4, "m5_rejection": n5, "m6_range_intact": n6}
             base = sum(breakdown.values())
@@ -931,6 +953,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
                "c4_momentum": c4, "c5_fvg_magnet": c5, "c6_ote_bonus": c6,
                "c7_cvd_alignment": c7, "c8_stochrsi": c8}
         breakdown = {k: int(round(v * weights.get(k, 1.0))) for k, v in raw.items()}
+        breakdown = _clamp_component_max(breakdown)
         breakdown, loc_total = _apply_location_cap(breakdown)
         notes = {"c1_trend_alignment": n1, "c2_ob_proximity": n2,
                  "c3_liquidity_sweep": f"{n3} [{c3_tier}]", "c4_momentum": n4,

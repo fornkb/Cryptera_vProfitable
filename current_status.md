@@ -159,27 +159,53 @@ audit; volume over depth. Use max effort only for the unit-test design pass.
 
 Scope = audit §5 + §6 items 19–20 + remaining P2/P3:
 
-- [ ] `config.py`: centralize LIMITS, WINDOW_SIZE, swing widths, gate/score
-      thresholds, retention, model name
-- [ ] Parallel external fetches (`asyncio.gather` + `to_thread` for orderbook /
+- [x] `config.py`: centralize LIMITS, WINDOW_SIZE, swing widths, gate/score
+      thresholds, retention, model name — main.py/smc.py/indicators.py/
+      strategies.py/price_action.py import from it (single source of truth);
+      web/app.py imports the two gate thresholds for its fallback action logic
+- [x] Parallel external fetches (`asyncio.gather` + `to_thread` for orderbook /
       funding / OI / F&G / BTC.D) — BUG-24
-- [ ] Structured `logging` (warn-once for dead fetches); remove `debug=True` and
-      in-handler `asyncio.run` blocking pattern in `web/app.py` — BUG-23
-- [ ] Unit tests (pytest, synthetic candles): `fractal_swing_mask`,
-      `get_market_structure`, `get_value_area`, `_select_structural_tp`,
-      `_label_one` (both-sides bars, gaps), OTE direction, SL selection
-- [ ] Snapshot index for `/api/history` (SQLite or JSONL header index)
-- [ ] Graceful TF degradation — BUG-15
-- [ ] Remaining P2s: BUG-13 (events tz: require offsets / assume UTC), BUG-14
-      (price-magnitude-scaled rounding), BUG-18 (gap-through-entry fills),
-      BUG-19 (cache-hit `live_price` refresh), BUG-20 (star-pattern ratio),
-      BUG-21 (retention by filename timestamp), BUG-22 (funding percentile
-      window ≤1000)
-- [ ] P3 hygiene: dead columns/branches, `datetime.utcnow()` → `now(timezone.utc)`,
-      per-component calibration-weight renormalization, docstring "M1-M8" → M1-M6,
-      pin `pandas-ta` (exact versions), README fixed (drop `improvements_report.md`
-      ref or restore it)
-- [ ] Full test run + one mocked-LLM smoke run; commit; tick boxes here
+- [x] Structured `logging` (`logging.getLogger("cryptera")` / `"cryptera.web"`,
+      per-attempt kline-fetch failures demoted to debug so only the final
+      abort/degrade warns once); removed `debug=True` and the in-handler
+      `asyncio.run` blocking pattern in `web/app.py` (native async view via
+      `asgiref`, `threaded=True`) — BUG-23
+- [x] Unit tests (pytest, synthetic candles) in `tests/` (26 tests, all pass):
+      `fractal_swing_mask`, `get_market_structure` (BOS+CHoCH), `get_value_area`
+      (incl. zero-range fallback), `_select_structural_tp`, `_label_one`
+      (same-bar conservatism, gap-through-entry, timeout, no-data), OTE
+      direction (BUG-05 regression guard), SL selection (BUG-06: nearest pool
+      not widest, both sides, ATR cap)
+- [x] Snapshot index for `/api/history` — self-healing `data/snapshot_index.json`
+      (header cache keyed by filename; new files parsed incrementally, entries
+      for retention-deleted files dropped automatically)
+- [x] Graceful TF degradation — BUG-15: 4h/1h/15m still abort with a clear
+      `RuntimeError`; the 1D leg degrades to `None` + one warning instead of
+      aborting the whole run (every 1D consumer already tolerated `None`)
+- [x] Remaining P2s: BUG-13 (naive event datetimes assumed UTC), BUG-14
+      (`_price_decimals` scales rounding to price magnitude in `get_window_dict`),
+      BUG-18 (gap-through-entry now triggers in `_label_one`), BUG-19 (15m
+      cache-hit refetches live price via `fetch_live_price` instead of falling
+      back to the last closed close), BUG-20 (star-pattern body ratio uses the
+      middle candle's own range, not the first candle's), BUG-21 (retention
+      sorts by the filename's embedded UTC timestamp, not mtime), BUG-22
+      (funding history `limit` 24 → 1000)
+- [x] P3 hygiene: dropped dead columns (`ATR_Z`, `VOL_Z`, `swing_high`/`swing_low`,
+      `fvg_bull`/`fvg_bear` in indicators.py) and dead imports (`numpy` in
+      strategies.py, unused `ROOT_DIR` import in main.py); no `datetime.utcnow()`
+      calls existed (already clean); per-component calibration-weight
+      renormalization (`_clamp_component_max`, clamps each weighted component to
+      its own rubric max before the location cap / sum); docstring "M1-M8" →
+      "M1-M6"; `pandas-ta` pinned to the exact installed `0.4.71b0`; removed the
+      dead `ccxt` dependency (BUG-01 already dropped its only usage); README
+      file map + roadmap no longer reference the missing `improvements_report.md`,
+      and its stale `ccxt` mentions are fixed
+- [x] Full test run (26/26 pytest pass) + one mocked-LLM smoke run on live SOL
+      perp data (BUG-24 parallel fetches + BUG-19 live-price path + BUG-15
+      degraded-1D path all exercised, ~2.5-3.4s end-to-end) + a Flask
+      test-client smoke run of the async `/api/run` route and the self-healing
+      history index (build, incremental pickup, self-heal on delete) — ALL
+      PASS; commit; boxes ticked + note here
 
 ---
 
@@ -207,3 +233,16 @@ Scope = audit §5 + §6 items 19–20 + remaining P2/P3:
   pass. 48 synthetic checks + one mocked-LLM live-perp run ALL PASS. Corpus still
   empty → relabel/recalibrate/A/B-winner/per-regime-thresholds deferred to first
   v3.3 snapshots. Phase 3 (Sonnet 5) next.
+- 2026-07-11 — **Phase 3 complete**: `config.py` extraction, BUG-24 parallel
+  external fetches, structured logging + web/app.py async-view/threaded fix
+  (BUG-23), a real `tests/` pytest suite (26 tests), a self-healing
+  `/api/history` index, graceful 1D degradation (BUG-15), and the remaining
+  P2/P3 items (BUG-13/14/18/19/20/21/22 + hygiene). No snapshot-SHAPE change,
+  so `schema_version` stays 3.3.0 and no relabel/recalibrate is needed (corpus
+  still empty on this machine — same as Phase 1/2). All verification offline
+  or mocked per the ground rules; one live-data mocked-LLM smoke run plus a
+  Flask test-client smoke run, both cleaned up after (no snapshot/index left
+  behind). Known drift for a future session: `CLAUDE.md`'s pipeline/scoring
+  prose still describes the pre-Phase-2 pipeline (no 1D leg, session gate, or
+  calibration v2 mentioned) — only the file map was updated here; a full
+  CLAUDE.md refresh was out of Phase 3's explicit scope.

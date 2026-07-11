@@ -32,6 +32,8 @@ data/oi_history.json
 data/regime_state.json
 # fitted weights (machine/data-specific, regenerate)
 data/calibration.json
+# cached /api/history header index (regenerated, self-healing)
+data/snapshot_index.json
 
 # ---- tooling / IDE / OS ----
 .vscode/

@@ -11,10 +11,7 @@ Adaptive thresholds scale with ATR-as-a-fraction-of-price.
 import pandas as pd
 import numpy as np
 
-
-# Per-timeframe fractal half-widths (left, right) used everywhere swings are needed.
-SWING_WIDTHS = {"1d": (4, 4), "4h": (5, 5), "1h": (4, 3), "15m": (3, 2)}
-DEFAULT_WIDTH = (3, 3)
+from config import SWING_WIDTHS, DEFAULT_WIDTH
 
 
 def _atr_pct(df: pd.DataFrame, fallback: float = 0.005) -> float:
