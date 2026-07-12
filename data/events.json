@@ -1,12 +1,17 @@
 [
-  {
-    "datetime": "2026-12-31T13:30:00",
-    "name": "EXAMPLE — US CPI release",
-    "impact": "high"
-  },
-  {
-    "datetime": "2026-12-31T19:00:00",
-    "name": "EXAMPLE — FOMC rate decision",
-    "impact": "high"
-  }
+  { "datetime": "2026-07-14T12:30:00", "name": "US CPI release (Jun data)", "impact": "high" },
+  { "datetime": "2026-07-29T18:00:00", "name": "FOMC rate decision", "impact": "high" },
+  { "datetime": "2026-08-07T12:30:00", "name": "US Nonfarm Payrolls (Jul data)", "impact": "high" },
+  { "datetime": "2026-08-12T12:30:00", "name": "US CPI release (Jul data)", "impact": "high" },
+  { "datetime": "2026-09-04T12:30:00", "name": "US Nonfarm Payrolls (Aug data)", "impact": "high" },
+  { "datetime": "2026-09-11T12:30:00", "name": "US CPI release (Aug data)", "impact": "high" },
+  { "datetime": "2026-09-16T18:00:00", "name": "FOMC rate decision", "impact": "high" },
+  { "datetime": "2026-10-02T12:30:00", "name": "US Nonfarm Payrolls (Sep data)", "impact": "high" },
+  { "datetime": "2026-10-14T12:30:00", "name": "US CPI release (Sep data)", "impact": "high" },
+  { "datetime": "2026-10-28T18:00:00", "name": "FOMC rate decision", "impact": "high" },
+  { "datetime": "2026-11-06T13:30:00", "name": "US Nonfarm Payrolls (Oct data)", "impact": "high" },
+  { "datetime": "2026-11-10T13:30:00", "name": "US CPI release (Oct data)", "impact": "high" },
+  { "datetime": "2026-12-04T13:30:00", "name": "US Nonfarm Payrolls (Nov data)", "impact": "high" },
+  { "datetime": "2026-12-09T19:00:00", "name": "FOMC rate decision", "impact": "high" },
+  { "datetime": "2026-12-10T13:30:00", "name": "US CPI release (Nov data)", "impact": "high" }
 ]
