@@ -144,6 +144,15 @@ LABELTIMEREOF
 
 sudo systemctl daemon-reload
 
+echo "==> Installing the 'cryptera-status' helper command"
+# A quick at-a-glance status you can type from anywhere on the box: snapshot count +
+# each symbol's latest score/mode/gate (same classification the monitor uses).
+sudo tee /usr/local/bin/cryptera-status > /dev/null << STATUSEOF
+#!/usr/bin/env bash
+exec "${REPO_DIR}/venv/bin/python" "${REPO_DIR}/tools/status.py" "\$@"
+STATUSEOF
+sudo chmod +x /usr/local/bin/cryptera-status
+
 echo ""
 echo "==> Setup complete."
 echo ""
@@ -156,3 +165,6 @@ echo "    sudo systemctl enable --now cryptera-monitor"
 echo "    sudo systemctl enable --now cryptera-label.timer"
 echo "    sudo journalctl -u cryptera-monitor -f     # watch it live, Ctrl+C to stop watching"
 echo "    systemctl list-timers cryptera-label.timer # confirm the next labelling run is scheduled"
+echo ""
+echo "Anytime, for a quick glance at the corpus + each symbol's latest score/gate:"
+echo "    cryptera-status"
