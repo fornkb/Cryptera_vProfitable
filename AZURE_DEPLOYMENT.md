@@ -114,7 +114,8 @@ Deliberately different resource-group/VM names from any other Cryptera deploymen
 this never collides with or accidentally touches another VM:
 
 ```bash
-REGION="eastus"
+REGION="centralindia"   # matches your existing cryptera-vm (CRYPTERA-RG) -- confirmed
+                         # working for VM creation on this account/subscription
 RG="cryptera-v3-rg"
 VM="cryptera-v3-vm"
 
@@ -129,7 +130,9 @@ az vm create \
   --generate-ssh-keys \
   --public-ip-sku Basic
 
-# If Standard_B2ats_v2 isn't available in your region, use Standard_B1s instead.
+# If Standard_B2ats_v2 isn't available in centralindia for this subscription, use
+# Standard_B1s instead -- or match whatever size cryptera-vm itself uses:
+#   az vm show -g CRYPTERA-RG -n cryptera-vm --query hardwareProfile.vmSize -o tsv
 ```
 
 This prints the VM's public IP -- save it.
