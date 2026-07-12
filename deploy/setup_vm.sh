@@ -94,6 +94,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${REPO_DIR}
+# CRYPTERA_NO_CHART_SERIES=1 (FA-15): this headless corpus VM never reads chart_series
+# (only the web dashboard does) -- skipping it drops each snapshot from ~340KB to ~45KB.
+Environment=CRYPTERA_NO_CHART_SERIES=1
 ExecStart=${REPO_DIR}/venv/bin/python monitor.py --retention 0 --no-color
 Restart=always
 RestartSec=15

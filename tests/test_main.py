@@ -191,6 +191,87 @@ def test_btcdom_proxy_drops_forming_candle(monkeypatch):
     assert out["change_24h_pct"] == pytest.approx((108 - 102) / 102 * 100, abs=1e-3)
 
 
+# ---------------- FA-03: concurrent OI-history writes must not lose updates ---------------- #
+
+def test_fetch_open_interest_concurrent_threads_no_lost_updates(monkeypatch, tmp_path):
+    import threading
+    import json as _json
+    import main
+
+    class _Resp:
+        def __init__(self, data):
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    def fake_get(url, params=None, timeout=None):
+        if "openInterestHist" in url:
+            return _Resp([])
+        return _Resp({"openInterest": "123.45"})
+
+    hist_path = str(tmp_path / "oi_history.json")
+    monkeypatch.setattr(main, "OI_HISTORY_PATH", hist_path)
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main.requests, "get", fake_get)
+
+    n_threads, calls_per_thread = 8, 15
+    symbol = "TEST/USDT"
+
+    def worker():
+        for _ in range(calls_per_thread):
+            main.fetch_open_interest(symbol)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    with open(hist_path) as f:
+        hist = _json.load(f)  # raises if the file is ever left truncated/corrupt
+    assert len(hist[symbol]) == n_threads * calls_per_thread
+
+
+def test_write_json_file_atomic_no_leftover_tmp(tmp_path):
+    import os
+    import json as _json
+    from main import _write_json_file
+
+    path = str(tmp_path / "state.json")
+    _write_json_file(path, {"a": 1})
+    _write_json_file(path, {"a": 2})  # second write exercises the replace path
+    assert not os.path.exists(path + ".tmp")
+    with open(path) as f:
+        assert _json.load(f) == {"a": 2}
+
+
+# ---------------- FA-11: health report flags a placeholder/stale/empty calendar ---------------- #
+
+def test_calendar_health_states(monkeypatch, tmp_path):
+    import json as _json
+    import time
+    import main
+
+    events_path = tmp_path / "events.json"
+    monkeypatch.setattr(main, "EVENTS_PATH", str(events_path))
+
+    events_path.write_text(_json.dumps([
+        {"datetime": "2026-12-31T00:00:00", "name": "EXAMPLE — CPI", "impact": "high"}]))
+    assert main._calendar_health().startswith("PLACEHOLDER")
+
+    events_path.write_text(_json.dumps([]))
+    assert main._calendar_health().startswith("EMPTY")
+
+    far_future = "2099-01-01T00:00:00"
+    events_path.write_text(_json.dumps([{"datetime": far_future, "name": "CPI", "impact": "high"}]))
+    assert main._calendar_health().startswith("STALE")
+
+    soon = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + 3 * 86400))
+    events_path.write_text(_json.dumps([{"datetime": soon, "name": "CPI", "impact": "high"}]))
+    assert main._calendar_health() == "OK"
+
+
 # ---------------- plain-json fallback skeleton ---------------- #
 
 def test_schema_skeleton_covers_all_top_level_fields():

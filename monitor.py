@@ -13,8 +13,11 @@ Modes:
     python monitor.py --symbols SOL/USDT,BTC/USDT --retention 0 --no-color
 
 With no TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID configured it auto-degrades to collect-only.
-The hard bound -- Gemini calls/day <= DAILY_BUDGET - BUDGET_RESERVE -- is enforced by
-budget.can_spend (the reserve is never spent).
+The hard bound -- SUCCESSFUL narrations/day <= DAILY_BUDGET - BUDGET_RESERVE -- is enforced
+by budget.can_spend (the reserve is never spent). This bounds successful spends, not raw
+Gemini API call attempts (FA-12): `narrate` can retry across keys/schema tiers internally,
+and `_narrate_with_retry` adds one more outer attempt, all before a single `state.spend()`
+-- on an error-heavy day, real API calls can exceed DAILY_BUDGET while spend() stays low.
 
 Run:  python monitor.py   (24/7 via systemd -- see deploy/setup_vm.sh)
 """
@@ -23,6 +26,7 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import logging
 import os
 import time
 from datetime import timezone
@@ -100,8 +104,12 @@ def _seconds_to_next_tick(offset):
 
 
 async def _narrate_with_retry(snap):
-    """One Gemini call + at most one retry (still <=5/min via min_call_spacing). Never
-    raises -- returns an error dict on failure so the caller can fall back."""
+    """One `narrate` call + at most one outer retry (still <=5/min via min_call_spacing).
+    Never raises -- returns an error dict on failure so the caller can fall back. Each
+    `narrate` call is itself not one API call -- it walks up to 3 keys x transient
+    retries x 2 schema tiers internally (FA-12) -- so a failed-then-retried attempt here
+    can cost several real Gemini calls while `state.spend()` (module docstring) only
+    ever charges 1, on success."""
     analysis = await asyncio.to_thread(narrate, snap)
     if isinstance(analysis, dict) and "error" in analysis:
         await asyncio.sleep(Cfg.min_call_spacing_s)
@@ -167,7 +175,7 @@ async def cycle(state, rt):
                             if paths.get(sym):
                                 try:
                                     with open(paths[sym], "w") as f:
-                                        json.dump(snap, f, indent=2)
+                                        json.dump(snap, f, separators=(",", ":"))  # FA-14: compact
                                 except Exception as e:
                                     print(f"[persist] {sym} re-write with analysis failed: {e}")
                             # Telegram is a synchronous requests call (retries w/ backoff) -- run
@@ -303,6 +311,11 @@ async def main():
 
 
 if __name__ == "__main__":
+    # FA-10: monitor.py runs the whole engine (main.py's logger.info/.warning
+    # calls included) but never configured a handler -- entry points own this
+    # per CLAUDE.md, and monitor.py is the 24/7 systemd entry point, so every
+    # engine log line was silently dropped instead of landing in journald.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

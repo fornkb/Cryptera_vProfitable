@@ -60,6 +60,10 @@ MAX_TARGET_ATR_1H_MULTIPLE = 10   # drop target candidates beyond this many 1h-A
                                    # target more than a few x atr_1h away" rule as an
                                    # engine gate instead of an LLM judgment call
 EVENT_GUARD_WINDOW_HOURS = 2
+EVENT_CALENDAR_STALE_DAYS = 14     # data_health_report warns if no calendar entry falls
+                                   # within this many days, or any entry looks like a
+                                   # placeholder (FA-11) -- the guard would otherwise read
+                                   # "OK" while blind to everything except right now
 
 # ---------------- retention / horizon ---------------- #
 SNAPSHOT_RETENTION = 1000         # per symbol

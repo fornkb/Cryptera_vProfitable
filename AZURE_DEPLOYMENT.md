@@ -233,6 +233,11 @@ python -m tools.calibrate
 Run these on the VM, or `scp`/rsync `snapshots/` and `data/` back to your own machine to
 calibrate locally instead.
 
+**After refreshing `data/calibration.json` (FA-16): restart the service.** `monitor.py`
+loads calibration once, at first use, and caches it for the life of the process (it runs
+24/7) -- a `tools.calibrate` run that overwrites `calibration.json` has no effect until you
+`sudo systemctl restart cryptera-monitor`.
+
 **Stopping everything** (pause spending): `az vm deallocate --resource-group cryptera-v3-rg
 --name cryptera-v3-vm` stops compute billing (disk/IP still cost their small amount). To
 remove it completely: `az group delete --name cryptera-v3-rg`.

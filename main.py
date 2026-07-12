@@ -9,6 +9,7 @@ import requests
 import json
 import logging
 import os
+import threading
 import time
 import numpy as np
 from collections import OrderedDict
@@ -27,6 +28,7 @@ from config import (SCHEMA_VERSION, DATA_DIR, SNAPSHOTS_DIR, OI_HISTORY_PATH,
                     SNAPSHOT_RETENTION, HORIZON_HOURS, MARKET, TIMEFRAMES,
                     REQUIRED_TIMEFRAMES, LIMITS, WINDOW_SIZE, TF_MS, CHART_BARS,
                     OHLCV_CACHE_MAX, CACHE_TTL_SECONDS, EVENT_GUARD_WINDOW_HOURS,
+                    EVENT_CALENDAR_STALE_DAYS,
                     GEMINI_MODEL_NAME, GEMINI_THINKING_LEVEL,
                     GEMINI_KEY_COOLDOWN_SECONDS, GEMINI_TRANSIENT_RETRIES,
                     GEMINI_TRANSIENT_BACKOFF_SECONDS)
@@ -371,10 +373,14 @@ def _read_json_file(path, default):
 
 
 def _write_json_file(path, obj):
+    """Atomic write (FA-03): tmp file + os.replace so a crash/OOM mid-write can
+    never leave truncated JSON that the next load silently treats as empty."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     try:
-        with open(path, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(obj, f)
+        os.replace(tmp, path)
     except Exception as e:
         logger.warning(f"Failed to persist {os.path.basename(path)}: {e}")
 
@@ -406,12 +412,25 @@ def _load_oi_history():
 
 
 def _save_oi_history(hist):
+    """Atomic write (FA-03): same tmp+replace pattern as _write_json_file."""
     os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = OI_HISTORY_PATH + ".tmp"
     try:
-        with open(OI_HISTORY_PATH, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(hist, f)
+        os.replace(tmp, OI_HISTORY_PATH)
     except Exception as e:
         logger.warning(f"Failed to persist OI history: {e}")
+
+
+# FA-03: fetch_open_interest runs via asyncio.to_thread — one real OS thread per
+# symbol, concurrently (monitor.cycle gathers the whole watchlist). Without a
+# lock, two threads' load -> append -> save critical sections interleave and
+# lose each other's appends every cycle. apply_regime_hysteresis does NOT need
+# this lock: it's always called directly on the event-loop thread (never
+# to_thread'd) and contains no `await`, so asyncio's cooperative scheduling
+# already makes its read-modify-write atomic with respect to other coroutines.
+_OI_HISTORY_LOCK = threading.Lock()
 
 
 def fetch_open_interest(symbol):
@@ -465,13 +484,17 @@ def fetch_open_interest(symbol):
     except Exception as e:
         logger.warning(f"OI history fetch failed: {e}")
 
-    # Local fallback / augmentation
-    history = _load_oi_history()
-    sym_hist = history.get(symbol, [])
-    sym_hist.append({"ts": int(time.time()), "oi": oi_now})
-    sym_hist = sym_hist[-2000:]
-    history[symbol] = sym_hist
-    _save_oi_history(history)
+    # Local fallback / augmentation. FA-03: load -> append -> save is a
+    # read-modify-write on a file shared by every symbol; lock the whole
+    # critical section so concurrent per-symbol threads can't clobber each
+    # other's appends.
+    with _OI_HISTORY_LOCK:
+        history = _load_oi_history()
+        sym_hist = history.get(symbol, [])
+        sym_hist.append({"ts": int(time.time()), "oi": oi_now})
+        sym_hist = sym_hist[-2000:]
+        history[symbol] = sym_hist
+        _save_oi_history(history)
     if oi_percentile_20d is None and len(sym_hist) >= 10:
         vals_local = [x["oi"] for x in sym_hist]
         below = sum(1 for v in vals_local if v <= oi_now)
@@ -609,6 +632,40 @@ def fetch_event_window(now_ts: float = None, window_hours: int = EVENT_GUARD_WIN
                 "minutes_until": round((ev_ts - now_ts) / 60, 1),
             })
     return {"active": len(active) > 0, "events": active, "window_hours": window_hours}
+
+
+def _calendar_health(now_ts: float = None, horizon_days: int = EVENT_CALENDAR_STALE_DAYS) -> str:
+    """FA-11: `fetch_event_window` only reports whether an event is active RIGHT
+    NOW -- against the placeholder events.json (two `EXAMPLE` entries dated
+    2026-12-31) that reads as a healthy, empty calendar every cycle until New
+    Year's Eve, so the guard is silently blind. Flag EMPTY/PLACEHOLDER/STALE
+    explicitly for data_health_report instead of trusting an unpopulated file."""
+    if now_ts is None:
+        now_ts = time.time()
+    if not os.path.exists(EVENTS_PATH):
+        return "EMPTY -- data/events.json not found"
+    try:
+        with open(EVENTS_PATH) as f:
+            events = json.load(f)
+    except Exception:
+        return "EMPTY -- data/events.json unreadable"
+    if not isinstance(events, list) or not events:
+        return "EMPTY -- data/events.json has no entries"
+    if any("EXAMPLE" in (e.get("name") or "") for e in events):
+        return "PLACEHOLDER -- data/events.json still has EXAMPLE entries"
+
+    horizon_s = horizon_days * 86400
+    for e in events:
+        try:
+            dt_ = datetime.fromisoformat(e["datetime"])
+            if dt_.tzinfo is None:
+                dt_ = dt_.replace(tzinfo=timezone.utc)
+            ev_ts = dt_.timestamp()
+        except Exception:
+            continue
+        if 0 <= (ev_ts - now_ts) <= horizon_s:
+            return "OK"
+    return f"STALE -- no event within {horizon_days}d"
 
 
 # ---------------- Gemini ---------------- #
@@ -1477,7 +1534,10 @@ def _persist_snapshot(snapshot_native: dict, retention: int = None) -> str:
     snapshot_filename = f"snapshot_{symbol.replace('/', '_')}_{timestamp_str}.json"
     snapshot_path = os.path.join(SNAPSHOTS_DIR, snapshot_filename)
     with open(snapshot_path, "w") as f:
-        json.dump(snapshot_native, f, indent=2)
+        # FA-14: compact -- indented JSON is ~25-30% pure whitespace bloat on a
+        # machine-read corpus file (nothing renders this by hand at scale; the
+        # dashboard/labeller/eval/calibrate tooling all just parse it).
+        json.dump(snapshot_native, f, separators=(",", ":"))
     logger.info(f"Snapshot saved to snapshots/{snapshot_filename}")
     eff_retention = SNAPSHOT_RETENTION if retention is None else retention
     # _enforce_snapshot_retention keeps exactly `retention` files -- 0 would mean "keep
@@ -1504,7 +1564,11 @@ def data_health_report() -> list:
         names = ", ".join(e.get("name", "unknown") for e in ev.get("events") or [])
         lines.append(f"event guard: ACTIVE -- {names}")
     else:
-        lines.append("event guard: calendar OK")
+        cal = _calendar_health()
+        if cal == "OK":
+            lines.append("event guard: calendar OK")
+        else:
+            lines.append(f"event guard: calendar {cal} -- populate data/events.json")
     return lines
 
 

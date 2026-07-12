@@ -283,30 +283,30 @@ Scope — all findings that touch snapshot/label/calibration semantics:
 **Model: Sonnet 5, effort high.** Mechanical, well-specified hardening; no
 snapshot-shape changes (no schema bump, no relabel).
 
-- [ ] FA-03 — atomic writes (`.tmp` + `os.replace`, copy `alerts/budget.py`
+- [x] FA-03 — atomic writes (`.tmp` + `os.replace`, copy `alerts/budget.py`
       pattern) for `_save_oi_history`, `_write_json_file`, `web/app.py`
       `_save_index`; module-level `threading.Lock` around the OI-history
       read-modify-write in `fetch_open_interest`. Test: hammer
       `fetch_open_interest`'s history section from N threads with a mocked
       API; assert no lost appends and file always parses.
-- [ ] FA-06 — `eval_engine` engine-outcome universe as primary + existing LLM
+- [x] FA-06 — `eval_engine` engine-outcome universe as primary + existing LLM
       cuts retained; explicit counts per universe. Test with 3 synthetic
       snapshot files: engine-only, narrated, unlabelled.
-- [ ] FA-10 — logging.basicConfig in monitor `__main__`.
-- [ ] FA-11 — health-report placeholder/stale-calendar warning.
-- [ ] FA-12 — budget: charge retries (or document attempts≠spends) — pick one,
+- [x] FA-10 — logging.basicConfig in monitor `__main__`.
+- [x] FA-11 — health-report placeholder/stale-calendar warning.
+- [x] FA-12 — budget: charge retries (or document attempts≠spends) — pick one,
       one-line diff plus comment fix.
-- [ ] FA-13 — ab_thinking docstring/print path correction + monkey-patch
+- [x] FA-13 — ab_thinking docstring/print path correction + monkey-patch
       comment.
-- [ ] FA-14 — compact `json.dump` for snapshot persistence (both call sites).
-- [ ] FA-15 — `Environment=CRYPTERA_NO_CHART_SERIES=1` in the systemd unit.
-- [ ] FA-16 — AZURE_DEPLOYMENT.md §6: restart-after-recalibrate note.
+- [x] FA-14 — compact `json.dump` for snapshot persistence (both call sites).
+- [x] FA-15 — `Environment=CRYPTERA_NO_CHART_SERIES=1` in the systemd unit.
+- [x] FA-16 — AZURE_DEPLOYMENT.md §6: restart-after-recalibrate note.
       FA-18 — README one-liner re CLI runs sharing hysteresis state.
-- [ ] Verification: pytest PASS; `python monitor.py --once --collect-only`
+- [x] Verification: pytest PASS; `python monitor.py --once --collect-only`
       (live data, no keys needed) writes a compact snapshot, console shows
       health lines incl. the new calendar warning; corrupt `oi_history.json`
       by hand → next run recovers without wiping (atomic + lock in place).
-- [ ] Commit `v3.3.2: FA-03/06/10/11/12/13/14/15/16/18 — collector hardening`.
+- [x] Commit `v3.3.2: FA-03/06/10/11/12/13/14/15/16/18 — collector hardening`.
 
 ### Phase 3 — Pre-deploy prediction-quality improvements + deploy readiness
 
@@ -376,3 +376,34 @@ measurement-gated; the corpus doesn't exist yet). Don't over-engineer.
   raw breakdown present + canonical keys, OI sane, primary TP ∈ candidates,
   LLM view free of FA-01 keys at 8.1KB compact — ALL PASS, zero Gemini calls.
   Phase 2 (Sonnet 5) next.
+- 2026-07-12 — **Phase 2 complete (v3.3.2)**: FA-03/06/10/11/12/13/14/15/16/18
+  fixed. Atomic `.tmp`+`os.replace` writes (`_write_json_file`,
+  `_save_oi_history`, `web/app.py._save_index`) + a module-level
+  `threading.Lock` around `fetch_open_interest`'s OI-history critical section
+  (apply_regime_hysteresis documented as already-safe: event-loop-thread-only,
+  no `await`). `eval_engine` now treats `engine_trade_outcome` as the primary
+  universe (`by_mode` bucket added) with `trade_decision_outcome` kept as
+  secondary LLM-only cuts (`by_action`/`by_selected_from_engine`); both
+  universes' counts reported explicitly. `monitor.py` configures
+  `logging.basicConfig` in `__main__`. `data_health_report` gained
+  `_calendar_health` (EMPTY/PLACEHOLDER/STALE/OK,
+  `config.EVENT_CALENDAR_STALE_DAYS=14`). Budget attempts≠spends documented
+  in three places (monitor.py docstring, `_narrate_with_retry`,
+  `alerts/config.py`) rather than charging retries — avoids penalizing
+  transient network blips. `ab_thinking.py` corrected to point at
+  `config.py` for `GEMINI_THINKING_LEVEL` + explained the monkey-patch.
+  Snapshot persistence (`main.py._persist_snapshot`, monitor's narrated
+  re-write) switched to `separators=(",", ":")`. `deploy/setup_vm.sh`
+  systemd unit sets `CRYPTERA_NO_CHART_SERIES=1`. AZURE_DEPLOYMENT.md §6 +
+  README got the FA-16/FA-18 notes. No snapshot-shape change — schema stays
+  3.3.1, no relabel needed. 4 new unit tests (concurrent OI-history hammer:
+  8 threads × 15 calls, 0 lost updates; atomic-write no-leftover-tmp;
+  4-state calendar health; eval_engine 3-file dual-universe) — 53/53 pytest
+  PASS. Live smoke: `monitor.py --once --collect-only` twice against real
+  SOL/BTC/ETH data — compact snapshots written, health line showed the new
+  PLACEHOLDER calendar warning, OI history incremented by exactly +1/symbol
+  (no lost updates); hand-corrupted `oi_history.json` between runs — next
+  cycle recovered cleanly (valid JSON, no crash, no permanent wipe) — ALL
+  PASS, zero Gemini calls. Test artifacts (6 snapshot files, temp state)
+  cleaned up after; pre-existing `data/*.json` restored from backup.
+  Phase 3 (Opus 4.8) next.

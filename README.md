@@ -122,6 +122,11 @@ Defaults to `SOL/USDT`. Writes a timestamped `snapshots/snapshot_*.json`
 containing the deterministic snapshot, the parsed Gemini analysis and the chart
 series, then prints the analysis JSON to stdout.
 
+If `monitor.py` is also running against this same `data/` directory (e.g. a manual CLI
+run on the Azure box), be aware they share `data/regime_state.json` — a CLI run's score
+counts as one more hysteresis-gate run for that symbol, out of cadence with monitor's own
+15m cycle (FA-18). Harmless on a dev machine; avoid it on the monitor-only VM.
+
 ### Web terminal
 
 ```bash

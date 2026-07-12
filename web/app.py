@@ -129,10 +129,13 @@ def _load_index() -> dict:
 
 
 def _save_index(idx: dict):
+    """Atomic write (FA-03): tmp file + os.replace, same pattern as main.py."""
     os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = SNAPSHOT_INDEX_PATH + ".tmp"
     try:
-        with open(SNAPSHOT_INDEX_PATH, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(idx, f)
+        os.replace(tmp, SNAPSHOT_INDEX_PATH)
     except Exception as e:
         logger.warning(f"Failed to persist snapshot index: {e}")
 

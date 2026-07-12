@@ -19,6 +19,10 @@ class Cfg:
     conditional_threshold = int(os.getenv("CONDITIONAL_SCORE_THRESHOLD", str(CONDITIONAL_ENTRY_THRESHOLD)))
     material_delta = int(os.getenv("MATERIAL_DELTA", "10"))         # score jump that re-narrates an active setup
     min_realert_s = int(os.getenv("MIN_REALERT_SECONDS", "7200"))   # per-symbol cooldown (2h)
+    # FA-12: this bounds SUCCESSFUL narrations (State.spend() only fires on success), not
+    # raw Gemini API call attempts -- narrate() can internally retry across keys/schema
+    # tiers, and monitor._narrate_with_retry adds one more outer attempt, all before a
+    # single spend. On an error-heavy day, real calls can exceed this number.
     daily_budget = int(os.getenv("DAILY_BUDGET", "40"))             # usable 36 across 3 keys (12/key)
     budget_reserve = int(os.getenv("BUDGET_RESERVE", "4"))
     min_call_spacing_s = int(os.getenv("MIN_CALL_SPACING", "8"))    # serialize <=1 in flight, well under 5/min

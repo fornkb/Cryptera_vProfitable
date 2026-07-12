@@ -2,9 +2,22 @@
 Aggregate labelled snapshots into per-bucket performance stats.
 
 After running tools.label_snapshots, each snapshot file carries an `outcome`
-block. This script walks every labelled snapshot and reports:
+block with two independent universes (FA-06):
+  * `engine_trade_outcome` — the deterministic-geometry label, present on
+    ANY valid-engine-trade snapshot (the ~99% no-LLM cheap-pass collector
+    corpus included). This is the PRIMARY universe: overall hit rate,
+    expectancy, avg MFE/MAE, and every `by_*` bucket below are computed on it.
+  * `trade_decision_outcome` — the LLM's selected trade, present only on
+    narrated snapshots. Kept as secondary cuts (`by_action`,
+    `by_selected_from_engine`) so the LLM-vs-engine divergence question stays
+    answerable, but it is NOT the loop's primary universe (it used to be,
+    which reported `snapshots_labelled: 0` against a corpus that's almost
+    entirely no-LLM snapshots).
+
+Buckets (engine-primary universe):
   * overall hit rate, expectancy, average MFE/MAE
   * stats by score bucket (45-59 conditional, 60-74 active, 75+ high-conviction)
+  * stats by score_mode (trending / ranging rubric)
   * stats by trend bias (bullish / bearish)
   * stats by volatility regime
   * stats by event_guard.active state
@@ -130,53 +143,72 @@ def main():
     args = p.parse_args()
 
     buckets = {
+        # Engine-primary universe (FA-06) — the collector corpus.
         "overall": _accumulator(),
         "by_score": defaultdict(_accumulator),
+        "by_mode": defaultdict(_accumulator),
         "by_bias": defaultdict(_accumulator),
         "by_vol_regime_15m": defaultdict(_accumulator),
         "by_event_guard": defaultdict(_accumulator),
         "by_volume_gate": defaultdict(_accumulator),
+        # LLM secondary cuts — narrated snapshots only.
         "by_action": defaultdict(_accumulator),
         # Does the LLM's candidate-picking add or subtract alpha vs the engine
         # primary? Hit-rate split on trade_management.selected_from_engine.
         "by_selected_from_engine": defaultdict(_accumulator),
     }
 
-    labelled = 0
     seen = 0
+    engine_labelled = 0
+    llm_labelled = 0
     for snap in _iter_snapshots(args.symbol):
         seen += 1
-        outcome = (snap.get("outcome") or {}).get("trade_decision_outcome")
-        if outcome is None:
+        outcome_block = snap.get("outcome") or {}
+        engine_outcome = outcome_block.get("engine_trade_outcome")
+        llm_outcome = outcome_block.get("trade_decision_outcome")
+        if engine_outcome is None and llm_outcome is None:
             continue
-        labelled += 1
 
         strategies = snap.get("strategies") or {}
         analysis = snap.get("analysis") or {}
         header = analysis.get("header") or {}
 
+        # header.* is only populated on narrated snapshots; strategies.* always
+        # is (cheap pass writes it too), so every field below tolerates a
+        # no-LLM snapshot via the `or` fallback.
         score = int(header.get("score") or strategies.get("confluence_score") or 0)
+        mode = strategies.get("score_mode") or "unknown"
         bias = (header.get("bias") or (strategies.get("trend_bias") or "neutral").upper())
         gate = (header.get("volume_gate") or (strategies.get("volume_gate") or {}).get("state") or "CLEAR")
-        action = header.get("action") or "HOLD"
         vr_15m = (snap.get("volatility_regime") or {}).get("15m", {}).get("regime", "unknown")
         event_active = "active" if (snap.get("event_guard") or {}).get("active") else "clear"
-        tm = (analysis.get("trade_decision") or {}).get("trade_management") or {}
-        sel = tm.get("selected_from_engine")
-        sel_key = "engine_primary" if sel is True else ("llm_alternative" if sel is False else "unknown")
 
-        _record(buckets["overall"], outcome)
-        _record(buckets["by_score"][_bucket_score(score)], outcome)
-        _record(buckets["by_bias"][bias], outcome)
-        _record(buckets["by_vol_regime_15m"][vr_15m], outcome)
-        _record(buckets["by_event_guard"][event_active], outcome)
-        _record(buckets["by_volume_gate"][gate], outcome)
-        _record(buckets["by_action"][action], outcome)
-        _record(buckets["by_selected_from_engine"][sel_key], outcome)
+        if engine_outcome is not None:
+            engine_labelled += 1
+            _record(buckets["overall"], engine_outcome)
+            _record(buckets["by_score"][_bucket_score(score)], engine_outcome)
+            _record(buckets["by_mode"][mode], engine_outcome)
+            _record(buckets["by_bias"][bias], engine_outcome)
+            _record(buckets["by_vol_regime_15m"][vr_15m], engine_outcome)
+            _record(buckets["by_event_guard"][event_active], engine_outcome)
+            _record(buckets["by_volume_gate"][gate], engine_outcome)
+
+        if llm_outcome is not None:
+            llm_labelled += 1
+            action = header.get("action") or "HOLD"
+            tm = (analysis.get("trade_decision") or {}).get("trade_management") or {}
+            sel = tm.get("selected_from_engine")
+            sel_key = "engine_primary" if sel is True else ("llm_alternative" if sel is False else "unknown")
+            _record(buckets["by_action"][action], llm_outcome)
+            _record(buckets["by_selected_from_engine"][sel_key], llm_outcome)
 
     report = {
         "snapshots_scanned": seen,
-        "snapshots_labelled": labelled,
+        # FA-06: reported explicitly and separately — the engine universe is
+        # the whole collector corpus, the LLM universe is narrated-only and
+        # will be much smaller (budget-gated).
+        "engine_universe_labelled": engine_labelled,
+        "llm_universe_labelled": llm_labelled,
         "overall": _finalize(buckets["overall"]),
     }
     report["overall"]["expectancy_pct"] = _expectancy(report["overall"])

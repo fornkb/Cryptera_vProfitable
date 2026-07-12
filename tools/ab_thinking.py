@@ -12,7 +12,8 @@ whether that decision would have hit TP before SL. It reports, per level:
 
 Because it issues one live Gemini call per snapshot per level, it is a manual,
 opt-in tool — run it once a corpus of >= ~30 labelled snapshots exists to pick the
-GEMINI_THINKING_LEVEL winner, then update the constant + comment in main.py.
+GEMINI_THINKING_LEVEL winner, then update the constant + comment in config.py
+(FA-13: the constant lives there, not main.py — main.py just imports it).
 
 Usage:
     python -m tools.ab_thinking --levels high medium --horizon 24
@@ -51,7 +52,12 @@ def _score_decision(td: dict, df) -> dict | None:
 
 
 def _run_level(level: str, llm_view: dict) -> dict:
-    engine.GEMINI_THINKING_LEVEL = level  # patched per call; _build_generate_config reads it
+    # Patched on the `main` MODULE's re-bound name, not config.py's: main.py does
+    # `from config import ... GEMINI_THINKING_LEVEL`, which copies the value into
+    # main's own namespace at import time, and _build_generate_config reads that
+    # module-global (not config.GEMINI_THINKING_LEVEL) on every call -- so
+    # rebinding `engine.GEMINI_THINKING_LEVEL` here works without touching config.py.
+    engine.GEMINI_THINKING_LEVEL = level
     return engine.query_gemini(llm_view)
 
 
@@ -126,7 +132,7 @@ def main():
         print(f"{lvl:<8} {a['active']:>6} {a['triggered']:>5} {a['tp']:>4} {a['sl']:>4} "
               f"{a['timeout']:>4} {str(hit):>9} {str(fe):>12}")
     print("\nPick the higher hit_rate (tie-break: fewer tokens/latency -> lower level), "
-          "then set GEMINI_THINKING_LEVEL + its comment in main.py to the winner.")
+          "then set GEMINI_THINKING_LEVEL + its comment in config.py to the winner.")
 
 
 if __name__ == "__main__":
