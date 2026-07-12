@@ -195,7 +195,7 @@ def get_snapshot(filename):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     print("\n" + "=" * 50)
-    print("=== CRYPTERA v3.2 WEB TERMINAL RUNNING ===")
+    print("=== CRYPTERA v3.3 WEB TERMINAL RUNNING ===")
     print("Open http://127.0.0.1:5000 in your web browser.")
     print("=" * 50 + "\n")
     # debug=True (werkzeug debugger + auto-reloader) removed (BUG-23) — the

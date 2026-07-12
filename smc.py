@@ -380,8 +380,13 @@ def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002, curre
     Cluster swings within an ATR-scaled tolerance into BSL / SSL pools. Keep the
     3 pools NEAREST to current price on each side (BUG-11) — those are the ones
     that actually get swept and targeted — rather than the 3 most extreme, which
-    truncated away the actionable near-price levels. Falls back to the extremes
-    when current price is unknown.
+    truncated away the actionable near-price levels. Resting liquidity is
+    side-dependent: BSL only exists ABOVE price and SSL only BELOW it — a swing
+    high price has already closed beyond is swept, not a draw — so pools on the
+    wrong side are dropped instead of burning the 3 slots (they previously
+    crowded out actionable same-side pools from the target menu and could leave
+    the BUG-06 SL search empty). Falls back to the extremes when current price
+    is unknown.
     """
     tolerance = max(0.001, min(0.01, atr_pct * 0.5))
     high_prices = sorted([s[1] for s in swing_highs])
@@ -406,8 +411,8 @@ def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002, curre
     bsl = _cluster(high_prices, take_max=True)
     ssl = _cluster(low_prices, take_max=False)
     if current_price is not None:
-        buy = sorted(bsl, key=lambda p: abs(p - current_price))[:3]
-        sell = sorted(ssl, key=lambda p: abs(p - current_price))[:3]
+        buy = sorted((p for p in bsl if p > current_price))[:3]
+        sell = sorted((p for p in ssl if p < current_price), reverse=True)[:3]
         return {"buy_side": buy, "sell_side": sell}
     return {"buy_side": sorted(bsl, reverse=True)[:3], "sell_side": sorted(ssl)[:3]}
 

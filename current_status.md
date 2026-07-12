@@ -233,6 +233,34 @@ Scope = audit §5 + §6 items 19–20 + remaining P2/P3:
   pass. 48 synthetic checks + one mocked-LLM live-perp run ALL PASS. Corpus still
   empty → relabel/recalibrate/A/B-winner/per-regime-thresholds deferred to first
   v3.3 snapshots. Phase 3 (Sonnet 5) next.
+- 2026-07-12 — **Frontend catch-up pass** (same session, uncommitted): stale
+  C3/C7 breakdown maxes 10→15; 1D added to OB/FVG/pools/structure/CVD panels,
+  vol-regime dial, and a 1D chart tab; PWH/PWL/weekly-open + 1D naked-POC chart
+  overlays and magnet-panel rows; S/R panel now renders the touch-weighted
+  `sr_levels` it was titled after (pools kept below); volume-gate badge shows
+  kill zone + session rel-vol tooltip; win-rate shows `win_rate_source`;
+  trade-plan panel shows the AI-SELECTED plan when `selected_from_engine` is
+  false; BOS/CHoCH `bars_ago` + OTE leg direction + FVG STRADDLES tag;
+  magnitude-aware `fmtPrice` (sub-cent alts no longer render 0.00); version
+  strings v3.2→v3.3. Verified live in the browser against MR + trend snapshots,
+  zero console errors.
+- 2026-07-12 — **LLM-interface review session** (user-approved fixes, uncommitted):
+  daily/weekly candidate levels now tagged `tf:"1d"` ranking 4h>1d>1h>15m
+  (4h stays the intraday anchor); liquidity pools side-filtered (BSL above /
+  SSL below price — swept pools no longer burn the 3-per-side slots or blind
+  the BUG-06 SL search); `mtf_context` per-TF table moved from LLM output to
+  engine splice (`_finalize_analysis`/`_build_mtf_context`) — model now emits
+  only `cross_tf_momentum`+`htf_draw`; system instruction: distances/R:R may
+  be computed by the model (rr must be recomputed for non-primary selections),
+  ≥2R-for-ACTIVE_TRADE gate removed (honest sub-2R + confidence weighting),
+  field definitions added (bias/probability/confidence_pct/position_size/
+  counter_structure); LLM view trims (previous_day, dup atr_percentile,
+  session dups, raw_regime-when-equal, atr note, timestamps→bars_ago/age_hours,
+  float-noise rounding); Gemini call: 503 backoff retry
+  (GEMINI_TRANSIENT_RETRIES), schema-rejection match narrowed, plain-json
+  fallback now appends a schema skeleton. Tests 40/40 pass. Snapshot semantics
+  changed (pool side-filter) ⇒ invariant 5 applies; corpus still unlabeled/
+  empty so nothing to relabel.
 - 2026-07-11 — **Phase 3 complete**: `config.py` extraction, BUG-24 parallel
   external fetches, structured logging + web/app.py async-view/threaded fix
   (BUG-23), a real `tests/` pytest suite (26 tests), a self-healing

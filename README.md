@@ -100,7 +100,15 @@ cp .env.example .env        # then edit .env and add your key
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key
+GEMINI_API_KEY_2=your_second_gemini_api_key   # optional
+GEMINI_API_KEY_3=your_third_gemini_api_key    # optional
 ```
+
+`GEMINI_API_KEY` is required; `_2`/`_3` are optional. When set, the engine
+round-robins across all configured keys between runs. If a key's call errors
+(rate limit, auth, network) it's benched for `GEMINI_KEY_COOLDOWN_SECONDS`
+(config.py, default 120s) and the next key is tried immediately within the
+same call.
 
 ## Usage
 
@@ -132,6 +140,21 @@ python -m tools.calibrate                       # fit weights + score→win-rate
 ```
 
 See [tools/README.md](tools/README.md) for details.
+
+### Telegram monitor (24/7 collector + alerts)
+
+```bash
+python monitor.py                  # collect corpus + Telegram alerts (needs TELEGRAM_* + a GEMINI key)
+python monitor.py --collect-only   # corpus only, no Gemini/Telegram spend (keyless)
+python monitor.py --once           # one immediate cycle then exit (smoke check)
+```
+
+One process scores the whole `WATCHLIST` every 15m close, persists every snapshot (the
+calibration corpus grows automatically), and sends a schema-validated Telegram alert only
+when a setup crosses into an engine-gated ACTIVE state — budget-capped so it never spends
+more than `DAILY_BUDGET - BUDGET_RESERVE` Gemini calls/day. See `.env.example` for the
+`TELEGRAM_BOT_TOKEN`/`WATCHLIST`/budget knobs, and [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md)
+for running it 24/7 on a small Azure VM.
 
 ---
 
@@ -249,6 +272,10 @@ Top-level keys written to each `snapshots/snapshot_*.json`:
 | `tools/eval_engine.py`      | aggregate per-bucket performance metrics                                          |
 | `tools/calibrate.py`        | fit component weights + score→win-rate from labelled snapshots                    |
 | `tests/`                    | pytest unit tests for the pure engine functions (swings, structure, geometry, labeling) |
+| `monitor.py`                | unified 24/7 collector + Telegram monitor (corpus collection + budget-gated alerts on ACTIVE transitions) |
+| `alerts/`                   | monitor config, daily-budget/cooldown state, gate logic, Telegram formatting        |
+| `data/telegram_state.json`  | monitor.py's daily Gemini budget + per-symbol alert cooldown state (git-ignored)   |
+| `deploy/setup_vm.sh`, `AZURE_DEPLOYMENT.md` | provisioning a dedicated Azure VM to run `monitor.py` 24/7                |
 
 ---
 

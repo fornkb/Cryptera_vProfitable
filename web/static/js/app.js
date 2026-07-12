@@ -1,11 +1,13 @@
 /*
- * Cryptera v3.2 dashboard controller.
+ * Cryptera v3.3 dashboard controller.
  *
  * Consumes the structured Gemini JSON analysis AND the deterministic snapshot.
  * Regime-aware: renders the C1-C8 (trend) or M1-M6 (mean-revert) breakdown
- * depending on strategies.score_mode. Surfaces engine_trade geometry, the
- * order-flow modifier, empirical win-rate, BOS/CHoCH quality, untested POCs and
- * the real-vs-proxy CVD flag.
+ * depending on strategies.score_mode. Surfaces engine_trade geometry (plus the
+ * AI-selected candidate plan when it diverges from the engine primary), the
+ * order-flow modifier, empirical win-rate + source, session-aware volume gate
+ * (kill zone), 1D timeframe panels/overlays, weekly levels, BOS/CHoCH quality
+ * with bars-ago, untested POCs and the real-vs-proxy CVD flag.
  */
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -15,11 +17,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const TREND_COMPONENTS = [
         ["c1_trend_alignment", "C1 Trend", 25],
         ["c2_ob_proximity", "C2 OB Prox", 15],
-        ["c3_liquidity_sweep", "C3 Sweep", 10],
+        ["c3_liquidity_sweep", "C3 Sweep", 15],
         ["c4_momentum", "C4 Momentum", 15],
         ["c5_fvg_magnet", "C5 FVG Magnet", 15],
         ["c6_ote_bonus", "C6 OTE", 10],
-        ["c7_cvd_alignment", "C7 CVD", 10],
+        ["c7_cvd_alignment", "C7 CVD", 15],
         ["c8_stochrsi", "C8 StochRSI", 5],
     ];
     const MR_COMPONENTS = [
@@ -130,6 +132,14 @@ document.addEventListener("DOMContentLoaded", () => {
         const n = Number(v);
         return `${n > 0 ? "+" : ""}${n.toFixed(d)}`;
     };
+    // Magnitude-aware price formatting (BUG-14 parity): a fixed 2dp renders
+    // sub-cent alts (e.g. PEPE) as 0.00.
+    const fmtPrice = (v) => {
+        if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
+        const a = Math.abs(Number(v));
+        const d = a >= 100 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 6 : 8;
+        return Number(v).toFixed(d);
+    };
     const safeText = (el, v, fb = "—") => { if (el) el.textContent = (v === undefined || v === null || v === "") ? fb : String(v); };
     const setBadge = (el, label, bg) => { if (el) { el.textContent = label; el.className = `badge ${bg || "bg-neutral"}`; } };
 
@@ -227,7 +237,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const vr = snapshot.volatility_regime || {};
         const tag = (k) => (vr[k] && vr[k].regime) ? vr[k].regime.toUpperCase() : "—";
-        safeText(valVolRegime, `${tag("4h")} / ${tag("1h")} / ${tag("15m")}`);
+        safeText(valVolRegime, `${tag("1d")} / ${tag("4h")} / ${tag("1h")} / ${tag("15m")}`);
 
         const event = snapshot.event_guard || {};
         if (event.active && Array.isArray(event.events) && event.events.length) {
@@ -245,7 +255,7 @@ document.addEventListener("DOMContentLoaded", () => {
         confluenceScoreRing.style.strokeDashoffset = 439.8 - (439.8 * score / 100);
         confluenceScoreRing.style.stroke = score >= 60 ? "#10b981" : score >= 45 ? "#f59e0b" : "#ef4444";
 
-        safeText(valLivePrice, snapshot.live_price != null ? fmtNum(snapshot.live_price, 4) : "—");
+        safeText(valLivePrice, snapshot.live_price != null ? fmtPrice(snapshot.live_price) : "—");
 
         // -- score mode badge --
         setBadge(badgeScoreMode, scoreMode === "mean_revert" ? "MEAN-REVERT (fade)" : "TREND (continuation)",
@@ -263,10 +273,16 @@ document.addEventListener("DOMContentLoaded", () => {
         const actionClass = action === "ACTIVE_TRADE" ? "bg-bullish" : action === "CONDITIONAL_ENTRY" ? "bg-warning" : "bg-hold";
         setBadge(badgeAction, action.replace(/_/g, " "), actionClass);
 
-        // -- volume gate --
-        const gateState = (strategies.volume_gate && strategies.volume_gate.state) || header.volume_gate || "CLEAR";
+        // -- volume gate (session-aware since v3.3: session rel-vol + kill zone) --
+        const vg = strategies.volume_gate || {};
+        const gateState = vg.state || header.volume_gate || "CLEAR";
         const gateClass = gateState === "HARD_GATE" ? "bg-bearish" : gateState === "LOW_VOL_WARNING" ? "bg-warning" : "bg-bullish";
-        setBadge(badgeVolumeGate, gateState.replace(/_/g, " "), gateClass);
+        const kz = vg.kill_zone && vg.kill_zone !== "OFF" ? ` · ${vg.kill_zone}` : "";
+        setBadge(badgeVolumeGate, gateState.replace(/_/g, " ") + kz, gateClass);
+        badgeVolumeGate.title =
+            `rel vol: ${vg.rel_vol_15m != null ? vg.rel_vol_15m + "×" : "—"}` +
+            ` | session rel vol: ${vg.session_rel_vol_15m != null ? vg.session_rel_vol_15m + "×" : "—"}` +
+            ` | gate basis: ${vg.gate_basis || "raw"} | kill zone: ${vg.kill_zone || "—"}`;
 
         // -- score math: base ± order-flow = final --
         const base = strategies.base_score;
@@ -279,9 +295,10 @@ document.addEventListener("DOMContentLoaded", () => {
             valScoreMath.className = "metric-value font-mono";
         }
 
-        // -- empirical win-rate --
+        // -- empirical win-rate (source: logistic / bucket, calibration v2) --
         if (strategies.empirical_win_rate != null) {
-            valWinrate.textContent = `${(strategies.empirical_win_rate * 100).toFixed(0)}% (hist)`;
+            const wrSrc = strategies.win_rate_source || "hist";
+            valWinrate.textContent = `${(strategies.empirical_win_rate * 100).toFixed(0)}% (${wrSrc})`;
             valWinrate.className = "metric-value font-mono text-green";
         } else {
             valWinrate.textContent = "— (uncalibrated)";
@@ -304,9 +321,9 @@ document.addEventListener("DOMContentLoaded", () => {
         // -- value area --
         const pa = snapshot.price_action || {};
         const va = pa.value_area_1h || {};
-        vaValLabel.textContent = fmtNum(va.val || 0);
-        vaVahLabel.textContent = fmtNum(va.vah || 0);
-        vaPocVal.textContent = fmtNum(va.poc || 0);
+        vaValLabel.textContent = fmtPrice(va.val || 0);
+        vaVahLabel.textContent = fmtPrice(va.vah || 0);
+        vaPocVal.textContent = fmtPrice(va.poc || 0);
         const price = (snapshot.smc_context && snapshot.smc_context["15m"] && snapshot.smc_context["15m"].current_price)
             || snapshot.live_price || strategies.current_price || va.poc || 0;
         const span = (va.vah || 0) - (va.val || 0);
@@ -342,9 +359,9 @@ document.addEventListener("DOMContentLoaded", () => {
         hypoDirection.textContent = fwdDir;
         hypoDirection.className = `hypo-value ${fwdDir === "LONG" ? "text-green" : fwdDir === "SHORT" ? "text-red" : ""}`;
         safeText(hypoTrigger, forwardScenario.trigger, "Awaiting trigger.");
-        safeText(hypoEntry, forwardScenario.entry != null ? fmtNum(forwardScenario.entry) : "—");
-        safeText(hypoSl, forwardScenario.stop_loss != null ? fmtNum(forwardScenario.stop_loss) : "—");
-        safeText(hypoTp, forwardScenario.take_profit != null ? fmtNum(forwardScenario.take_profit) : "—");
+        safeText(hypoEntry, forwardScenario.entry != null ? fmtPrice(forwardScenario.entry) : "—");
+        safeText(hypoSl, forwardScenario.stop_loss != null ? fmtPrice(forwardScenario.stop_loss) : "—");
+        safeText(hypoTp, forwardScenario.take_profit != null ? fmtPrice(forwardScenario.take_profit) : "—");
         safeText(hypoRR, forwardScenario.rr != null ? `${Number(forwardScenario.rr).toFixed(2)}:1` : "—");
         safeText(hypoVolume, forwardScenario.volume_condition, "—");
         safeText(hypoEvidence, forwardScenario.supporting_confluence, "—");
@@ -355,14 +372,41 @@ document.addEventListener("DOMContentLoaded", () => {
         safeText(reasoningBook, reasoning.sentiment, "—");
     };
 
-    // ---- trade plan: engine geometry primary, LLM fallback ----
+    // ---- trade plan ----
+    // Since v3.3 the LLM SELECTS the plan from the engine candidate menu; when it
+    // picked levels other than the engine primary (selected_from_engine === false)
+    // the AI-selected plan IS the recommendation, so show it and keep the engine
+    // primary visible in the candidates/ladder panels. Otherwise show the
+    // deterministic engine plan, falling back to the LLM only when no valid
+    // geometry exists.
     const renderTradePlan = (engine, tradeDecision) => {
-        const useEngine = engine && engine.valid && engine.entry != null;
-        if (useEngine) {
+        const td = tradeDecision || {};
+        const tm = td.trade_management || {};
+        const llmSelected = td.entry != null && tm.selected_from_engine === false;
+        const useEngine = !llmSelected && engine && engine.valid && engine.entry != null;
+        if (planSourceLabel) planSourceLabel.title = "";
+        if (llmSelected) {
+            planSourceLabel.textContent = "AI-SELECTED PLAN (from engine candidates)";
+            planSourceLabel.title = tm.selection_rationale || "";
+            valEntry.textContent = fmtPrice(td.entry);
+            valStopLoss.textContent = fmtPrice(td.stop_loss);
+            valTakeProfit.textContent = fmtPrice(td.take_profit);
+            safeText(srcEntry, td.entry_source ? `· ${td.entry_source}` : "", "");
+            safeText(srcSl, td.stop_loss_source ? `· ${td.stop_loss_source}` : "", "");
+            safeText(srcTp, td.take_profit_source ? `· ${td.take_profit_source}` : "", "");
+            const rr = td.rr || {};
+            if (rr.ratio != null) {
+                valRR.textContent = `${Number(rr.ratio).toFixed(2)}:1 ${rr.passed ? "✓" : "✗"}`;
+                valRR.className = `metric-value font-mono ${rr.passed ? "text-green" : "text-red"}`;
+            } else {
+                valRR.textContent = "—";
+                valRR.className = "metric-value font-mono";
+            }
+        } else if (useEngine) {
             planSourceLabel.textContent = "ENGINE TRADE PLAN (deterministic)";
-            valEntry.textContent = fmtNum(engine.entry);
-            valStopLoss.textContent = fmtNum(engine.stop_loss);
-            valTakeProfit.textContent = fmtNum(engine.take_profit);
+            valEntry.textContent = fmtPrice(engine.entry);
+            valStopLoss.textContent = fmtPrice(engine.stop_loss);
+            valTakeProfit.textContent = fmtPrice(engine.take_profit);
             safeText(srcEntry, engine.entry_source ? `· ${engine.entry_source}` : "", "");
             safeText(srcSl, engine.stop_loss_source ? `· ${engine.stop_loss_source}` : "", "");
             safeText(srcTp, engine.take_profit_source ? `· ${engine.take_profit_source}` : "", "");
@@ -375,10 +419,9 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         } else {
             planSourceLabel.textContent = "AI TRADE PLAN";
-            const td = tradeDecision || {};
-            valEntry.textContent = td.entry != null ? fmtNum(td.entry) : "N/A";
-            valStopLoss.textContent = td.stop_loss != null ? fmtNum(td.stop_loss) : "N/A";
-            valTakeProfit.textContent = td.take_profit != null ? fmtNum(td.take_profit) : "N/A";
+            valEntry.textContent = td.entry != null ? fmtPrice(td.entry) : "N/A";
+            valStopLoss.textContent = td.stop_loss != null ? fmtPrice(td.stop_loss) : "N/A";
+            valTakeProfit.textContent = td.take_profit != null ? fmtPrice(td.take_profit) : "N/A";
             safeText(srcEntry, td.entry_source ? `· ${td.entry_source}` : "", "");
             safeText(srcSl, td.stop_loss_source ? `· ${td.stop_loss_source}` : "", "");
             safeText(srcTp, td.take_profit_source ? `· ${td.take_profit_source}` : "", "");
@@ -396,12 +439,12 @@ document.addEventListener("DOMContentLoaded", () => {
     // ---- trade management (LLM partials / BE / scale, selected from real candidates) ----
     const renderManagement = (tradeDecision) => {
         const tm = (tradeDecision && tradeDecision.trade_management) || {};
-        const tpTxt = (v, rr) => v == null ? "—" : `${fmtNum(v)}${rr != null ? ` (${Number(rr).toFixed(2)}R)` : ""}`;
+        const tpTxt = (v, rr) => v == null ? "—" : `${fmtPrice(v)}${rr != null ? ` (${Number(rr).toFixed(2)}R)` : ""}`;
         safeText(valTp1, tpTxt(tm.tp1, tm.tp1_rr), "—");
         safeText(valTp2, tpTxt(tm.tp2, tm.tp2_rr), "—");
         safeText(srcTp1, tm.tp1_source ? `· ${tm.tp1_source}` : "", "");
         safeText(srcTp2, tm.tp2_source ? `· ${tm.tp2_source}` : "", "");
-        safeText(valBe, tm.move_to_breakeven_at != null ? fmtNum(tm.move_to_breakeven_at) : "—", "—");
+        safeText(valBe, tm.move_to_breakeven_at != null ? fmtPrice(tm.move_to_breakeven_at) : "—", "—");
         safeText(valScaleOut, tm.scale_out, "—");
         if (valScaleOut) valScaleOut.title = tm.selection_rationale || "";
     };
@@ -425,7 +468,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 const cls = rr != null && rr >= 2 ? "text-green" : rr != null && rr >= 1 ? "text-amber" : "";
                 const srcs = (t.confluence && t.confluence.length) ? t.confluence.join(" + ") : (t.source || "");
                 ul.innerHTML += `<li class="level-li-item" title="${srcs}">
-                    <span class="font-mono">${fmtNum(t.price)}${tfBadge(t.tf)}${confBadge(t.confluence_count)} <span class="src-note">${srcs}</span></span>
+                    <span class="font-mono">${fmtPrice(t.price)}${tfBadge(t.tf)}${confBadge(t.confluence_count)} <span class="src-note">${srcs}</span></span>
                     <span class="font-mono ${cls}">${rr != null ? rr.toFixed(2) + "R" : "—"}</span></li>`;
             });
             valLadderContainer.appendChild(ul);
@@ -445,10 +488,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 const srcs = (e.confluence && e.confluence.length) ? e.confluence.join(" + ") : (e.source || "");
                 ul.innerHTML += `<li class="level-li-item" title="${srcs}">
                     <span class="text-green">ENTRY${tfBadge(e.tf)}${confBadge(e.confluence_count)}${hvn}</span>
-                    <span class="font-mono">${fmtNum(e.price)}${zone}</span></li>`;
+                    <span class="font-mono">${fmtPrice(e.price)}${zone}</span></li>`;
             });
             stops.forEach(s => {
-                ul.innerHTML += `<li class="level-li-item"><span class="text-red">STOP${tfBadge(s.tf)}</span><span class="font-mono">${fmtNum(s.price)} <span class="src-note">${s.source}</span></span></li>`;
+                ul.innerHTML += `<li class="level-li-item"><span class="text-red">STOP${tfBadge(s.tf)}</span><span class="font-mono">${fmtPrice(s.price)} <span class="src-note">${s.source}</span></span></li>`;
             });
             valEntryStopContainer.appendChild(ul);
         }
@@ -486,18 +529,18 @@ document.addEventListener("DOMContentLoaded", () => {
         const ul = document.createElement("ul");
         ul.className = "levels-ul";
         let any = false;
-        ["4h", "1h", "15m"].forEach(tf => {
+        ["1d", "4h", "1h", "15m"].forEach(tf => {
             const obs = (snapshot.smc_context || {})[tf] && (snapshot.smc_context[tf].order_blocks || {});
             if (!obs) return;
             (obs.bullish || []).forEach(ob => {
                 any = true;
                 const hvn = ob.high_volume_node ? ' <span class="hvn-tag">HVN</span>' : "";
-                ul.innerHTML += `<li class="level-li-item"><span class="text-green">${tf.toUpperCase()} BULL OB${hvn}</span><span class="level-lbl-sub">[${fmtNum(ob.bottom)} - ${fmtNum(ob.top)}]</span></li>`;
+                ul.innerHTML += `<li class="level-li-item"><span class="text-green">${tf.toUpperCase()} BULL OB${hvn}</span><span class="level-lbl-sub">[${fmtPrice(ob.bottom)} - ${fmtPrice(ob.top)}]</span></li>`;
             });
             (obs.bearish || []).forEach(ob => {
                 any = true;
                 const hvn = ob.high_volume_node ? ' <span class="hvn-tag">HVN</span>' : "";
-                ul.innerHTML += `<li class="level-li-item"><span class="text-red">${tf.toUpperCase()} BEAR OB${hvn}</span><span class="level-lbl-sub">[${fmtNum(ob.bottom)} - ${fmtNum(ob.top)}]</span></li>`;
+                ul.innerHTML += `<li class="level-li-item"><span class="text-red">${tf.toUpperCase()} BEAR OB${hvn}</span><span class="level-lbl-sub">[${fmtPrice(ob.bottom)} - ${fmtPrice(ob.top)}]</span></li>`;
             });
         });
         if (!any) container.innerHTML = `<div class="box-message">No active unmitigated OBs in lookback.</div>`;
@@ -509,27 +552,42 @@ document.addEventListener("DOMContentLoaded", () => {
         const ul = document.createElement("ul");
         ul.className = "levels-ul";
         let any = false;
-        ["4h", "1h", "15m"].forEach(tf => {
+        ["1d", "4h", "1h", "15m"].forEach(tf => {
             const fvgs = (snapshot.smc_context || {})[tf] && (snapshot.smc_context[tf].fvg || {});
             if (!fvgs) return;
             const b = fvgs.nearest_bullish_fvg, r = fvgs.nearest_bearish_fvg;
-            if (b) { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-green">${tf.toUpperCase()} BULL FVG</span><span class="level-lbl-sub">[${fmtNum(b.bottom)} - ${fmtNum(b.top)}]</span></li>`; }
-            if (r) { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-red">${tf.toUpperCase()} BEAR FVG</span><span class="level-lbl-sub">[${fmtNum(r.bottom)} - ${fmtNum(r.top)}]</span></li>`; }
+            const straddle = (g) => g && g.straddles_price ? ' <span class="fresh-tag">STRADDLES</span>' : "";
+            if (b) { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-green">${tf.toUpperCase()} BULL FVG${straddle(b)}</span><span class="level-lbl-sub">[${fmtPrice(b.bottom)} - ${fmtPrice(b.top)}]</span></li>`; }
+            if (r) { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-red">${tf.toUpperCase()} BEAR FVG${straddle(r)}</span><span class="level-lbl-sub">[${fmtPrice(r.bottom)} - ${fmtPrice(r.top)}]</span></li>`; }
         });
         if (!any) container.innerHTML = `<div class="box-message">No active unfilled FVGs in range.</div>`;
         else container.appendChild(ul);
     };
 
+    // Touch-weighted S/R (price_action.sr_levels — this is what the panel title
+    // promises; it previously rendered only liquidity pools) followed by the
+    // BSL/SSL pools per TF (1d included since v3.3).
     const renderSR = (snapshot, container) => {
         container.innerHTML = "";
         const ul = document.createElement("ul");
         ul.className = "levels-ul";
         let any = false;
-        ["4h", "1h", "15m"].forEach(tf => {
+        const sr = (snapshot.price_action || {}).sr_levels || {};
+        (sr.resistance || []).forEach(l => {
+            any = true;
+            const hc = l.high_confidence ? ' <span class="hvn-tag">HC</span>' : "";
+            ul.innerHTML += `<li class="level-li-item"><span class="text-red">RES ×${l.touches != null ? l.touches : "?"}${hc}</span><span class="font-mono">${fmtPrice(l.price)}</span></li>`;
+        });
+        (sr.support || []).forEach(l => {
+            any = true;
+            const hc = l.high_confidence ? ' <span class="hvn-tag">HC</span>' : "";
+            ul.innerHTML += `<li class="level-li-item"><span class="text-green">SUP ×${l.touches != null ? l.touches : "?"}${hc}</span><span class="font-mono">${fmtPrice(l.price)}</span></li>`;
+        });
+        ["1d", "4h", "1h", "15m"].forEach(tf => {
             const liq = (snapshot.smc_context || {})[tf] && (snapshot.smc_context[tf].liquidity_levels || {});
             if (!liq) return;
-            (liq.sell_side || []).forEach(lvl => { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-green">${tf.toUpperCase()} SSL</span><span class="font-mono">${fmtNum(lvl)}</span></li>`; });
-            (liq.buy_side || []).forEach(lvl => { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-red">${tf.toUpperCase()} BSL</span><span class="font-mono">${fmtNum(lvl)}</span></li>`; });
+            (liq.buy_side || []).forEach(lvl => { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-red">${tf.toUpperCase()} BSL</span><span class="font-mono">${fmtPrice(lvl)}</span></li>`; });
+            (liq.sell_side || []).forEach(lvl => { any = true; ul.innerHTML += `<li class="level-li-item"><span class="text-green">${tf.toUpperCase()} SSL</span><span class="font-mono">${fmtPrice(lvl)}</span></li>`; });
         });
         if (!any) container.innerHTML = `<div class="box-message">No historical S/R cluster zones.</div>`;
         else container.appendChild(ul);
@@ -551,6 +609,7 @@ document.addEventListener("DOMContentLoaded", () => {
             : '<span class="cvd-proxy-badge">proxy (candle-pos)</span>';
         div.innerHTML = `
             <div style="margin-bottom:6px;">${badge}</div>
+            <div>1D Δ: <span class="font-mono">${fmtDelta(wi["1d"] && wi["1d"].cvd_window_delta)}</span></div>
             <div>4H Δ: <span class="font-mono">${fmtDelta(wi["4h"] && wi["4h"].cvd_window_delta)}</span></div>
             <div>1H Δ: <span class="font-mono">${fmtDelta(wi["1h"] && wi["1h"].cvd_window_delta)}</span></div>
             <div>15M Δ: <span class="font-mono">${fmtDelta(wi["15m"] && wi["15m"].cvd_window_delta)}</span></div>
@@ -612,7 +671,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const ul = document.createElement("ul");
         ul.className = "levels-ul";
         let any = false;
-        ["4h", "1h", "15m"].forEach(tf => {
+        ["1d", "4h", "1h", "15m"].forEach(tf => {
             const ctx = (snapshot.smc_context || {})[tf];
             if (!ctx) return;
             any = true;
@@ -620,6 +679,7 @@ document.addEventListener("DOMContentLoaded", () => {
             const choch = ctx.choch || {};
             const pd = ctx.premium_discount || {};
             const dirClass = (d) => d === "BULLISH" ? "text-green" : d === "BEARISH" ? "text-red" : "";
+            const agoTag = (n) => n != null ? ` <span class="src-note">${n} bars ago</span>` : "";
 
             let structHtml = `<span class="font-mono">${ctx.structure || "—"}</span>`;
             ul.innerHTML += `<li class="level-li-item"><span class="text-muted-lbl">${tf.toUpperCase()} structure</span>${structHtml}</li>`;
@@ -627,15 +687,15 @@ document.addEventListener("DOMContentLoaded", () => {
             if (bos.level != null) {
                 const fresh = bos.fresh ? '<span class="fresh-tag">FRESH</span>' : "";
                 const disp = bos.displacement ? '<span class="disp-tag">DISP</span>' : "";
-                ul.innerHTML += `<li class="level-li-item"><span class="${dirClass(bos.direction)}">${tf.toUpperCase()} BOS ${bos.direction || ""}${fresh}${disp}</span><span class="font-mono">${fmtNum(bos.level)}</span></li>`;
+                ul.innerHTML += `<li class="level-li-item"><span class="${dirClass(bos.direction)}">${tf.toUpperCase()} BOS ${bos.direction || ""}${fresh}${disp}${agoTag(bos.bars_ago)}</span><span class="font-mono">${fmtPrice(bos.level)}</span></li>`;
             }
             if (choch.detected) {
                 const fresh = choch.fresh ? '<span class="fresh-tag">FRESH</span>' : "";
-                ul.innerHTML += `<li class="level-li-item"><span class="${dirClass(choch.direction)}">${tf.toUpperCase()} CHoCH ${choch.direction || ""}${fresh}</span><span class="font-mono">${fmtNum(choch.level)}</span></li>`;
+                ul.innerHTML += `<li class="level-li-item"><span class="${dirClass(choch.direction)}">${tf.toUpperCase()} CHoCH ${choch.direction || ""}${fresh}${agoTag(choch.bars_ago)}</span><span class="font-mono">${fmtPrice(choch.level)}</span></li>`;
             }
             if (pd.in_ote) {
                 const ote = pd.ote_zone || {};
-                ul.innerHTML += `<li class="level-li-item"><span class="text-amber">${tf.toUpperCase()} IN OTE (${pd.zone})</span><span class="level-lbl-sub">[${fmtNum(ote.low)} - ${fmtNum(ote.high)}]</span></li>`;
+                ul.innerHTML += `<li class="level-li-item"><span class="text-amber">${tf.toUpperCase()} IN OTE (${pd.zone}, ${pd.leg_direction || "?"} leg)</span><span class="level-lbl-sub">[${fmtPrice(ote.low)} - ${fmtPrice(ote.high)}]</span></li>`;
             }
         });
         if (!any) container.innerHTML = `<div class="box-message">No structure data.</div>`;
@@ -645,12 +705,25 @@ document.addEventListener("DOMContentLoaded", () => {
     // ---- NEW: untested POC magnet targets ----
     const renderTargets = (snapshot, container) => {
         container.innerHTML = "";
-        const pocs = (snapshot.price_action || {}).untested_pocs_4h || [];
-        if (!pocs.length) { container.innerHTML = `<div class="box-message">No untested magnet levels.</div>`; return; }
+        const pa = snapshot.price_action || {};
+        const pocs4h = pa.untested_pocs_4h || [];
+        const pocs1d = pa.untested_pocs_1d || [];
+        const weekly = [["PWH", pa.pwh], ["PWL", pa.pwl], ["W-OPEN", pa.weekly_open]]
+            .filter(([, v]) => v != null);
+        if (!pocs4h.length && !pocs1d.length && !weekly.length) {
+            container.innerHTML = `<div class="box-message">No untested magnet levels.</div>`;
+            return;
+        }
         const ul = document.createElement("ul");
         ul.className = "levels-ul";
-        pocs.forEach(p => {
-            ul.innerHTML += `<li class="level-li-item"><span class="text-amber">4H untested POC</span><span class="font-mono">${fmtNum(p.poc)} <span class="src-note">(${p.distance_pct != null ? p.distance_pct + "%" : "—"})</span></span></li>`;
+        pocs1d.forEach(p => {
+            ul.innerHTML += `<li class="level-li-item"><span class="text-amber">1D untested POC</span><span class="font-mono">${fmtPrice(p.poc)} <span class="src-note">(${p.distance_pct != null ? p.distance_pct + "%" : "—"})</span></span></li>`;
+        });
+        pocs4h.forEach(p => {
+            ul.innerHTML += `<li class="level-li-item"><span class="text-amber">4H untested POC</span><span class="font-mono">${fmtPrice(p.poc)} <span class="src-note">(${p.distance_pct != null ? p.distance_pct + "%" : "—"})</span></span></li>`;
+        });
+        weekly.forEach(([lbl, v]) => {
+            ul.innerHTML += `<li class="level-li-item"><span class="text-muted-lbl">${lbl}</span><span class="font-mono">${fmtPrice(v)}</span></li>`;
         });
         container.appendChild(ul);
     };
@@ -729,10 +802,13 @@ document.addEventListener("DOMContentLoaded", () => {
         addLine(va.vah, "rgba(168,85,247,0.5)", "VAH", LS.Dotted, false);
         addLine(va.val, "rgba(168,85,247,0.5)", "VAL", LS.Dotted, false);
 
-        // 3) Previous day
+        // 3) Previous day + previous week / weekly open (HTF draws, v3.3)
         const pday = snapshot.previous_day || {};
         addLine(pday.pdh, "rgba(148,163,184,0.55)", "PDH", LS.Dotted, false);
         addLine(pday.pdl, "rgba(148,163,184,0.55)", "PDL", LS.Dotted, false);
+        addLine(pa.pwh, "rgba(148,163,184,0.85)", "PWH", LS.Dotted, false);
+        addLine(pa.pwl, "rgba(148,163,184,0.85)", "PWL", LS.Dotted, false);
+        addLine(pa.weekly_open, "rgba(148,163,184,0.6)", "wOPEN", LS.Dotted, false);
 
         // 4) Liquidity pools (nearest BSL/SSL on this TF)
         const ctx = (snapshot.smc_context || {})[chartTf] || {};
@@ -758,8 +834,9 @@ document.addEventListener("DOMContentLoaded", () => {
             addLine(f.bottom, "rgba(59,130,246,0.45)", "FVG", LS.Dotted, false);
         }
 
-        // 7) Untested 4H POC magnets
+        // 7) Untested 4H + 1D POC magnets
         (pa.untested_pocs_4h || []).slice(0, 2).forEach(p => addLine(p.poc, "rgba(245,158,11,0.85)", "naked POC", LS.LargeDashed, false));
+        (pa.untested_pocs_1d || []).slice(0, 2).forEach(p => addLine(p.poc, "rgba(245,158,11,1)", "naked dPOC", LS.LargeDashed, false));
 
         // 8) Anchored VWAP (dynamic S/R from last swing high/low) for this TF
         const avwapTf = (pa.avwap || {})[chartTf] || (pa.avwap || {})["1h"] || {};

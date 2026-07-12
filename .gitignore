@@ -34,6 +34,8 @@ data/regime_state.json
 data/calibration.json
 # cached /api/history header index (regenerated, self-healing)
 data/snapshot_index.json
+# monitor.py per-symbol alert state + daily Gemini budget counter (regenerated)
+data/telegram_state.json
 
 # ---- tooling / IDE / OS ----
 .vscode/

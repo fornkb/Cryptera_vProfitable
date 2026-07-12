@@ -117,3 +117,26 @@ def test_get_premium_discount_bearish_leg_not_in_ote_when_deep_discount():
                                   leg_direction="bearish")
     assert result["in_ote"] is False
     assert result["zone"] == "discount"
+
+
+# ---------------- find_liquidity_levels (side filtering) ---------------- #
+
+def test_liquidity_pools_are_side_filtered():
+    """BSL only exists ABOVE price, SSL only BELOW — swept pools must not appear."""
+    from smc import find_liquidity_levels
+    highs = [(i, p) for i, p in enumerate([95.0, 102.0, 105.0, 110.0])]
+    lows = [(i, p) for i, p in enumerate([90.0, 96.0, 103.0, 85.0])]
+    pools = find_liquidity_levels(highs, lows, current_price=100.0)
+    assert all(p > 100.0 for p in pools["buy_side"])
+    assert all(p < 100.0 for p in pools["sell_side"])
+    assert 95.0 not in pools["buy_side"]   # swept swing high below price
+    assert 103.0 not in pools["sell_side"]  # swing low above price
+
+
+def test_liquidity_pools_keep_three_nearest_on_correct_side():
+    from smc import find_liquidity_levels
+    highs = [(i, p) for i, p in enumerate([101.0, 104.0, 120.0, 140.0, 160.0])]
+    lows = [(i, p) for i, p in enumerate([99.0, 96.0, 80.0, 60.0, 40.0])]
+    pools = find_liquidity_levels(highs, lows, current_price=100.0)
+    assert pools["buy_side"] == [101.0, 104.0, 120.0]
+    assert pools["sell_side"] == [99.0, 96.0, 80.0]
