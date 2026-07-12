@@ -214,7 +214,12 @@ def main():
     score_rows = []                   # (score, y_soft, w)
     for name, snap, outcome in collected:
         strat = snap.get("strategies") or {}
-        bd = strat.get("confluence_breakdown") or {}
+        # FA-02: fit on the RAW (pre-weight, pre-cap) components — fitting on the
+        # weighted breakdown feeds each refit its own previous output (compounding
+        # drift) and mismatches _logistic_winrate's raw-feature inference. The
+        # plain-breakdown fallback covers legacy (< 3.3.1) snapshots only, where
+        # the two are identical as long as no calibration weights were active.
+        bd = strat.get("confluence_breakdown_raw") or strat.get("confluence_breakdown") or {}
         y = _soft_label(snap, outcome)
         w = 1.0 / cluster_counts[_snap_hour_key(name, snap)]
         score = int(strat.get("confluence_score") or 0)

@@ -16,7 +16,7 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
 REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
 SNAPSHOT_INDEX_PATH = os.path.join(DATA_DIR, "snapshot_index.json")
 
-SCHEMA_VERSION = "3.3.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5)
+SCHEMA_VERSION = "3.3.1"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5)
 
 # ---------------- market / timeframes ---------------- #
 MARKET = "binance-usdm"          # single namespace (BUG-01) — never mix spot/futures
@@ -55,6 +55,10 @@ VOLUME_LOW_VOL_WARNING = 0.3
 LOCATION_CAP = 25                 # C2+C5+C6 "location" composite cap (rubric decorrelation)
 LOCATION_KEYS = ("c2_ob_proximity", "c5_fvg_magnet", "c6_ote_bonus")
 SL_ATR_CAP = 3.0                  # max structural SL width in 15m-ATR multiples (BUG-06)
+MAX_TARGET_ATR_1H_MULTIPLE = 10   # drop target candidates beyond this many 1h-ATR from
+                                   # price -- mirrors the system prompt's own "reject a
+                                   # target more than a few x atr_1h away" rule as an
+                                   # engine gate instead of an LLM judgment call
 EVENT_GUARD_WINDOW_HOURS = 2
 
 # ---------------- retention / horizon ---------------- #
@@ -71,3 +75,13 @@ GEMINI_MODEL_NAME = "gemini-3.5-flash"
 # labeled snapshots; switch to the measured winner once enough labeled
 # snapshots exist (empty corpus as of Phase 2/3 — current_status.md).
 GEMINI_THINKING_LEVEL = "high"
+# Round-robin across GEMINI_API_KEY / GEMINI_API_KEY_2 / GEMINI_API_KEY_3 (.env).
+# On any call error the failing key is benched for this many seconds and the
+# next configured key is tried; keeps the engine running through per-key rate
+# limits without operator intervention.
+GEMINI_KEY_COOLDOWN_SECONDS = 120
+# 503 UNAVAILABLE ("model overloaded") is transient and model-wide — rotating
+# keys doesn't help, but a short in-call backoff usually does, and by call time
+# the snapshot is already fully computed so a lost call wastes the whole run.
+GEMINI_TRANSIENT_RETRIES = 2
+GEMINI_TRANSIENT_BACKOFF_SECONDS = 6

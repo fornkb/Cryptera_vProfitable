@@ -71,11 +71,26 @@ def _symbol_from_filename(filename: str) -> str | None:
     return f"{parts[1]}/{parts[2]}"
 
 
+def _floor_to_15m(ms: int) -> int:
+    """
+    Floor an epoch-ms timestamp to its 15m bar-open boundary (FA-09). Binance
+    returns klines with openTime >= startTime, so an unfloored snapshot time
+    would exclude the bar forming AT snapshot time — up to 14.5 min of price
+    action the engine's levels were quoted against. Snapshots are taken ~30s
+    after the close (POLL_SECOND_OFFSET), so flooring admits only that
+    negligible pre-snapshot movement; the same-bar SL-first conservatism in
+    _label_one covers the snapshot bar itself.
+    """
+    return ms - ms % 900_000
+
+
 def _fetch_future_candles(symbol: str, since_ms: int, horizon_hours: int):
     """
     Fetch up to `horizon_hours` of 15m USDT-perp candles starting from
-    `since_ms`. Same market namespace as the engine (fapi, BUG-01) — outcomes
-    are replayed on the prices the geometry was built from.
+    `since_ms` (expected pre-floored to the 15m boundary, see _floor_to_15m —
+    the snapshot bar is the first replay bar). Same market namespace as the
+    engine (fapi, BUG-01) — outcomes are replayed on the prices the geometry
+    was built from.
     """
     needed = max(4, int(horizon_hours * 4))
     try:
@@ -213,7 +228,7 @@ def label_snapshot_file(path: str, horizon_hours: int, force: bool):
     if snap_time + pd.Timedelta(hours=horizon_hours) > datetime.now(timezone.utc):
         return False
 
-    since_ms = int(snap_time.timestamp() * 1000)
+    since_ms = _floor_to_15m(int(snap_time.timestamp() * 1000))
     df = _fetch_future_candles(symbol, since_ms, horizon_hours)
     if df is None or df.empty:
         print(f"[WARN] no future data for {filename}")

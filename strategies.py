@@ -19,7 +19,8 @@ import math
 import pandas as pd
 
 from config import (LOCATION_CAP, LOCATION_KEYS, SL_ATR_CAP,
-                    VOLUME_HARD_GATE, VOLUME_LOW_VOL_WARNING)
+                    VOLUME_HARD_GATE, VOLUME_LOW_VOL_WARNING,
+                    MAX_TARGET_ATR_1H_MULTIPLE)
 
 _CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "calibration.json")
 _CALIBRATION_CACHE = None
@@ -56,6 +57,10 @@ def _logistic_winrate(breakdown: dict, score_mode: str, calib: dict):
     Calibration v2 (BUG-12): win probability from a standardized logistic model
     fitted per rubric over the confluence_breakdown components. Returns None when
     no logistic model is present (engine then falls back to the score bucket).
+
+    `breakdown` must be the RAW (pre-weight, pre-cap) component dict (FA-02):
+    the model is fitted on `confluence_breakdown_raw`, so feeding the weighted
+    breakdown here would bias every probability as soon as weights exist.
     """
     model = (calib.get("logistic") or {}).get(score_mode)
     if not model:
@@ -632,7 +637,9 @@ def _select_structural_tp(cands, entry, risk, direction):
     return beyond[-1], "farthest structural level (<2R, honest)"
 
 
-_TF_RANK = {"4h": 3, "1h": 2, "15m": 1}
+# 4h stays the most significant anchor (intraday system); daily/weekly levels
+# rank above 1h but below 4h so HTF draws don't dominate intraday geometry.
+_TF_RANK = {"4h": 4, "1d": 3, "1h": 2, "15m": 1}
 
 
 def _tf_of_source(src):
@@ -644,6 +651,8 @@ def _tf_of_source(src):
         return "15m"
     if "1h" in s:
         return "1h"
+    if "1d" in s or "daily" in s or "pw" in s or "weekly" in s:
+        return "1d"
     return "1h"
 
 
@@ -699,13 +708,20 @@ def _rank_entries(labeled, ref_price, dealing_range, atr_abs=None):
     return merged
 
 
-def _rank_targets(labeled, entry, risk, direction, ref_price=None, atr_abs=None):
+def _rank_targets(labeled, entry, risk, direction, ref_price=None, atr_abs=None, atr_1h=None):
     """
     labeled: [(price, source)] -> confluence-merged targets strictly beyond entry,
     nearest first, each with R:R, tf, confluence stack, and ATR distance from
     current price (reachability within the horizon). HVN is not meaningful for
     targets so it is dropped.
+
+    Targets beyond MAX_TARGET_ATR_1H_MULTIPLE x atr_1h from ref_price are dropped --
+    real structural levels (e.g. a 1d liquidity pool) can still be absurdly far from
+    price and unreachable within the horizon; this is an engine gate instead of
+    relying on the LLM to reject them per-call. Fails open (no filtering) if atr_1h
+    isn't available.
     """
+    ref = ref_price if ref_price is not None else entry
     rows = []
     for p, s in labeled:
         if p is None:
@@ -714,18 +730,20 @@ def _rank_targets(labeled, entry, risk, direction, ref_price=None, atr_abs=None)
             continue
         if direction == "bearish" and p >= entry:
             continue
+        if atr_1h and abs(float(p) - ref) > atr_1h * MAX_TARGET_ATR_1H_MULTIPLE:
+            continue
         rows.append({"price": round(float(p), 6), "source": s, "hvn": False})
     rows.sort(key=lambda x: abs(x["price"] - entry))
     merged = _merge_confluent(rows)
     for m in merged:
         m.pop("hvn", None)
         m["rr"] = round(abs(m["price"] - entry) / risk, 2) if risk > 0 else None
-        m["dist_from_price_atr"] = _dist_atr(m["price"], ref_price if ref_price is not None else entry, atr_abs)
+        m["dist_from_price_atr"] = _dist_atr(m["price"], ref, atr_abs)
     return merged
 
 
 def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
-                           regime, score_mode, mr_edge=None):
+                           regime, score_mode, mr_edge=None, atr_1h=None):
     """
     Deterministic trade geometry. Emits a single reproducible PRIMARY entry/SL/TP
     (for backtesting/calibration) PLUS a ranked set of REAL candidate levels
@@ -752,14 +770,17 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     untested_1d = [u["poc"] for u in pa.get("untested_pocs_1d", []) or []]
     pwh, pwl = pa.get("pwh"), pa.get("pwl")  # previous-week high/low (HTF draws)
 
-    # Anchored VWAP levels are real dynamic S/R — valid structural targets (P4)
+    # Anchored VWAP levels are real dynamic S/R — valid structural targets (P4).
+    # swing-high/swing-low anchors get distinct labels -- sharing one label let two
+    # merged-by-price-tolerance anchors count as duplicate confluence (e.g.
+    # ["15m AVWAP","15m AVWAP"] inflating confluence_count for what's one source).
     avwap = pa.get("avwap", {}) or {}
     avwap_pairs = []
     for tfk in ("15m", "1h"):
-        for kk in ("from_swing_high", "from_swing_low"):
+        for kk, label_suffix in (("from_swing_high", "swing-high"), ("from_swing_low", "swing-low")):
             v = (avwap.get(tfk) or {}).get(kk)
             if v:
-                avwap_pairs.append((v, f"{tfk} AVWAP"))
+                avwap_pairs.append((v, f"{tfk} AVWAP ({label_suffix})"))
 
     entry_labeled, stop_labeled, target_labeled = [], [], []
 
@@ -850,7 +871,14 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
         return out
 
     # PRIMARY target — real structural levels only, never invented (P1 fix).
-    tp_prices = [p for p, _ in target_labeled]
+    # FA-04: the primary honours the same reachability gate as the ranked
+    # candidates menu (_rank_targets), else _select_structural_tp's honest-<2R
+    # branch can pick a 1d pool / PWH unreachable within the horizon — exactly
+    # what the labeler scores. Fail open when atr_1h is unavailable.
+    tp_prices = [p for p, _ in target_labeled if p is not None]
+    if atr_1h:
+        tp_prices = [p for p in tp_prices
+                     if abs(float(p) - price) <= atr_1h * MAX_TARGET_ATR_1H_MULTIPLE]
     if score_mode == "mean_revert":
         tp = _nearest_level(tp_prices, entry, direction)
         tp_note = "nearest fade target"
@@ -881,7 +909,7 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                        "dist_from_price_atr": _dist_atr(p, price, atr_abs)}
                       for p, s in stop_labeled if p is not None],
             "targets": _rank_targets(target_labeled, entry, risk, direction,
-                                     ref_price=price, atr_abs=atr_abs),
+                                     ref_price=price, atr_abs=atr_abs, atr_1h=atr_1h),
         },
     })
     return out
@@ -917,8 +945,12 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         mr_dir, mr_edge, va = _mr_setup(price, pa_context, smc_context)
         direction = mr_dir or "neutral"
         if mr_dir is None:
-            breakdown = {f"m{i}": 0 for i in range(1, 7)}
-            notes = {"m1": "price mid-range - no fade setup"}
+            # Canonical component keys even with no fade setup (FA-07) — short
+            # m1..m6 keys broke the dashboard breakdown panel and by-component cuts.
+            raw = {"m1_edge_distance": 0, "m2_edge_sweep": 0, "m3_cvd_absorption": 0,
+                   "m4_stoch_extreme": 0, "m5_rejection": 0, "m6_range_intact": 0}
+            breakdown = dict(raw)
+            notes = {"m1_edge_distance": "price mid-range - no fade setup"}
             base = 0
             absorption = False
         else:
@@ -975,9 +1007,13 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
     # deterministic trade geometry
     geometry = compute_trade_geometry(geo_bias, price, smc_context, pa_context, atr_abs,
                                       market_regime, score_mode,
-                                      mr_edge=(mr_edge if is_ranging else None))
+                                      mr_edge=(mr_edge if is_ranging else None),
+                                      atr_1h=atr_map.get("1h"))
 
-    win_rate = _logistic_winrate(breakdown, score_mode, calib)
+    # FA-02: the logistic model is fitted on RAW features (calibrate.py), so
+    # inference must consume raw too — the weighted breakdown would drift the
+    # probabilities the moment a calibration file with non-1.0 weights exists.
+    win_rate = _logistic_winrate(raw, score_mode, calib)
     win_rate_source = "logistic"
     if win_rate is None:
         win_rate = _empirical_winrate(final, calib)
@@ -995,6 +1031,9 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         "order_flow_notes": of_notes,
         "confluence_score": final,
         "confluence_breakdown": breakdown,
+        # Pre-weight, pre-cap components (FA-02): the ONLY breakdown calibration
+        # may fit on — fitting on the weighted one feeds each refit its own output.
+        "confluence_breakdown_raw": raw,
         "confluence_notes": notes,
         "engine_trade": geometry,
         "empirical_win_rate": win_rate,

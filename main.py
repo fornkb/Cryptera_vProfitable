@@ -27,7 +27,9 @@ from config import (SCHEMA_VERSION, DATA_DIR, SNAPSHOTS_DIR, OI_HISTORY_PATH,
                     SNAPSHOT_RETENTION, HORIZON_HOURS, MARKET, TIMEFRAMES,
                     REQUIRED_TIMEFRAMES, LIMITS, WINDOW_SIZE, TF_MS, CHART_BARS,
                     OHLCV_CACHE_MAX, CACHE_TTL_SECONDS, EVENT_GUARD_WINDOW_HOURS,
-                    GEMINI_MODEL_NAME, GEMINI_THINKING_LEVEL)
+                    GEMINI_MODEL_NAME, GEMINI_THINKING_LEVEL,
+                    GEMINI_KEY_COOLDOWN_SECONDS, GEMINI_TRANSIENT_RETRIES,
+                    GEMINI_TRANSIENT_BACKOFF_SECONDS)
 
 logger = logging.getLogger("cryptera")
 
@@ -415,16 +417,23 @@ def _save_oi_history(hist):
 def fetch_open_interest(symbol):
     """OI now + 1h / 4h deltas + ~20-day percentile (history endpoint with local fallback)."""
     sym_clean = symbol.replace("/", "")
-    oi_now = 0.0
+    oi_now = None
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/openInterest",
             params={"symbol": sym_clean},
             timeout=5,
         ).json()
-        oi_now = float(r.get("openInterest", 0.0))
+        oi_now = float(r["openInterest"])  # missing key raises -> stays None
     except Exception as e:
         logger.warning(f"OI fetch failed: {e}")
+
+    # FA-05: on failure return nulls instead of fabricating an OI collapse —
+    # a 0.0 oi_now would compute -100% deltas, a rank-of-zero percentile, and
+    # permanently poison the local history file with {"oi": 0.0} rows.
+    if oi_now is None:
+        return {"value": None, "change_1h_pct": None,
+                "change_4h_pct": None, "percentile_20d": None}
 
     oi_change_1h = None
     oi_change_4h = None
@@ -546,9 +555,16 @@ def fetch_btc_dominance_proxy(symbol):
         ).json()
         if not isinstance(r, list) or len(r) < 2:
             return None
+        # FA-08: closed-candle discipline — drop the still-forming 4H bar so
+        # change_4h/24h are full-bar deltas, not "0-to-4h so far".
+        now_ms = int(time.time() * 1000)
+        if int(r[-1][0]) + TF_MS["4h"] > now_ms:
+            r = r[:-1]
+        if len(r) < 2:
+            return None
         closes = [float(x[4]) for x in r]
         change_4h = (closes[-1] - closes[-2]) / closes[-2] * 100
-        ref_idx = -6 if len(closes) >= 6 else 0
+        ref_idx = -7 if len(closes) >= 7 else 0  # 6 closed 4H intervals = 24h
         change_24h = (closes[-1] - closes[ref_idx]) / closes[ref_idx] * 100
         return {
             "btcdom_close": round(closes[-1], 4),
@@ -601,7 +617,7 @@ GEMINI_SYSTEM_INSTRUCTION = """
 ICT/SMC institutional trade engine. Return a JSON object matching the enforced schema. Signals are computed on CLOSED candles; `live_price` is the current price for distance/trigger context only.
 
 Rules
-1. Use only numbers present in the snapshot. Never invent levels. Every candidate/level already carries `dist_from_price_atr` (distance from live price in 15m-ATR units) — use it, do not compute distances yourself. `atr_context` gives atr_15m/1h/4h and the horizon_hours: reject any target more than a few x atr_1h away as unreachable in-window. `live_vs_close_pct` is how far the forming bar has drifted from the last closed 15m close — if it exceeds ~1 ATR, phrase entry triggers relative to live_price.
+1. Use only PRICES present in the snapshot. Never invent levels. Distances/R:R you may compute yourself: every `engine_trade` candidate already carries `dist_from_price_atr` (distance from live price in 15m-ATR units) — prefer it; for other snapshot levels compute the distance when you need it. `atr_context` gives atr_15m/1h/4h and the horizon_hours: reject any target more than a few x atr_1h away as unreachable in-window. `live_vs_close_pct` is how far the forming bar has drifted from the last closed 15m close — if it exceeds ~1 ATR, phrase entry triggers relative to live_price.
 2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier). Echo it into `header.score`; only set `header.score_override` on a specific factual error. `header.action` is decided from the FINAL score in `header.score` (the overridden value when you set `score_override`, else `confluence_score`) — apply the thresholds to THAT number.
 3. TRADE PLAN = SELECT THE BEST REAL CANDIDATE, NEVER INVENT. This is the highest-stakes decision in the output — the score only says *whether*; the candidate you pick decides the actual outcome. Choose deliberately.
    `strategies.engine_trade` gives a deterministic primary (entry/stop_loss/take_profit/rr) AND a candidate menu in `engine_trade.candidates`. Each candidate carries quality metadata — USE IT to rank, do not just take the nearest:
@@ -610,18 +626,17 @@ Rules
      - `candidates.targets[]` {price, source, rr, tf, confluence, confluence_count} — choose targets; `rr` is from the primary entry/SL
    RANKING RULES (apply in this order):
      a. Higher `confluence_count` wins — a level where multiple sources stack (e.g. VAH+BSL+POC) is far stronger than an isolated one.
-     b. `hvn: true` order blocks > plain OBs; higher `tf` (4h > 1h > 15m) levels are more significant.
+     b. `hvn: true` order blocks > plain OBs; higher `tf` (4h > 1d > 1h > 15m) levels are more significant — 4h is the anchor of this intraday system; daily/weekly levels (`tf: "1d"`) rank just below it.
      c. ENTRIES: prefer `zone` matching the trade — `discount` for longs, `premium` for shorts.
      d. TARGETS: a target sitting just BEFORE a higher-TF level/resistance is safer than one at/through it.
      e. `rr` is the TIE-BREAKER between otherwise-equal candidates, not the primary filter.
    Every price you output (entry / stop_loss / take_profit / tp1 / tp2 / move_to_breakeven_at) MUST be a value from these candidate lists or the engine primary. Never output a price not in the snapshot.
    Default to the engine primary UNLESS a candidate is clearly higher-quality by the rules above. Set `trade_management.selected_from_engine` = true if you echo the primary, false otherwise, and in `selection_rationale` COMPARE your pick against the primary and the next-best candidate ("chose X (confluence 3, HVN) over primary Y because …").
-   `engine_trade.rr` / `rr_passed` is the HONEST structural R:R — the engine never inflates TP to hit 2R. If the chosen final TP gives < 2R, do NOT move it further out; downgrade the action (CONDITIONAL_ENTRY / HOLD). If `engine_trade.valid` is false there is no sound structural trade → HOLD.
+   `engine_trade.rr` / `rr_passed` is the HONEST structural R:R — the engine never inflates TP to hit 2R. Never move a TP farther out to manufacture R:R: report the honest (possibly sub-2R) number and weigh it in `confidence_pct` instead. Candidate `rr` values are relative to the ENGINE PRIMARY entry/SL — if you select a different entry or stop, recompute `rr.*`, `tp1_rr`/`tp2_rr` and `sl_width_pct` from YOUR chosen levels. If `engine_trade.valid` is false there is no sound structural trade → HOLD.
    TRADE MANAGEMENT: `tp1` = nearest HIGH-CONFLUENCE target (the first strong stacked level), `tp2` = a farther runner (>= 2R if available); set `tp1_rr`/`tp2_rr` from the candidate's `rr`; `move_to_breakeven_at` = tp1 or a candidate level between entry and tp1; `scale_out` describes the split (e.g. "50% at TP1, move SL to BE, 50% runner to TP2").
 
-Regime-conditional scoring — read `strategies.score_mode`:
- header.score_breakdown = copy `strategies.confluence_breakdown` VERBATIM, only the keys of
- the active mode (trend → c1_...c8_ keys; mean_revert → m1_...m6_ keys). Never fill both sets.
+Regime-conditional scoring — read `strategies.score_mode` (context for narrative/reasoning;
+header.score_breakdown is filled by the engine, not by you):
  score_mode == "trend" (trending regime): components C1-C8 measure trend continuation.
    C1 trend(25) ADX-tiered on 4H/1H agreement · C2 ob_prox + C5 fvg_magnet + C6 ote share ONE
    LOCATION composite capped at 25 total (a single good location can no longer bank 40)
@@ -657,11 +672,17 @@ Gates
 Action-specific filling
  HOLD               → trade_decision entry/stop_loss/take_profit/rr.* and all trade_management price fields = null; selected_from_engine=true, scale_out="n/a". Forward scenario filled.
  CONDITIONAL_ENTRY  → select levels from engine_trade.candidates; entry_trigger states the exact required condition; fill trade_management.
- ACTIVE_TRADE       → select levels from engine_trade.candidates; final R:R must be >= 2 (never invent a 2R TP); fill trade_management with tp1/tp2 + BE + scale_out.
+ ACTIVE_TRADE       → select levels from engine_trade.candidates (never invent a TP); fill trade_management with tp1/tp2 + BE + scale_out.
+
+Field definitions
+ header.bias : the engine's directional read — `setup_direction` uppercased when not neutral, else `trend_bias`; NEUTRAL only when both are neutral.
+ primary.probability : when `strategies.empirical_win_rate` is non-null, anchor to it; otherwise your calibrated estimate from score + confluence quality (0-100).
+ confidence_pct : conviction in the overall read. Start near primary.probability, then apply the gate reductions above (event −15, cvd_absorption −10) and reduce for sub-2R geometry or counter-structure trades.
+ position_size : "100%" default · "50% low-vol" on LOW_VOL_WARNING · "25% cascade" when two or more risk reducers stack (e.g. low-vol + event guard, or sub-2R + counter-structure) · "reduced - conflict" when order flow contradicts the setup direction. On HOLD emit "100%" (unused).
+ counter_structure : true when the trade direction opposes the 4H structure.
 
 Field formats
- mtf_context.<tf>.nearest_ob / nearest_fvg : "<low>-<high>" or "NONE".
- mtf_context.d1 : daily structure/bos + `htf_draw` = the dominant daily target and side (e.g. "PWH 152.4 — draw above").
+ mtf_context : ONLY two fields — `cross_tf_momentum` (one-line 1D/4H/1H/15M momentum read) and `htf_draw` = the dominant daily-level target and side (e.g. "PWH 152.4 — draw above"). The per-timeframe table is filled by the engine after your call.
  forward_scenario.key_levels.<tf> : ["<price> — <label>", ...] sourced from snapshot.
  narrative.summary : ≤ 2 sentences.
 """.strip()
@@ -671,33 +692,11 @@ Field formats
 # truth for the model name + thinking-level, imported at module top).
 
 _INT = {"type": "integer"}
-_INT_NULL = {"type": "integer", "nullable": True}
 _NUM = {"type": "number"}
 _STR = {"type": "string"}
 _BOOL = {"type": "boolean"}
 _NUM_NULL = {"type": "number", "nullable": True}
 _STR_ARR = {"type": "array", "items": _STR}
-
-
-def _tf_schema(extra_props: dict, extra_required: list) -> dict:
-    """Common per-timeframe schema with optional extras stacked on top."""
-    base_props = {
-        "structure": _STR,
-        "bos": _STR,
-        "cvd_delta": _NUM,
-        "price_change_pct": _NUM,
-        "pd_zone": {"type": "string", "enum": ["premium", "discount", "neutral"]},
-        "in_ote": _BOOL,
-        "nearest_ob": _STR,
-        "nearest_fvg": _STR,
-    }
-    base_required = ["structure", "cvd_delta", "price_change_pct", "pd_zone",
-                     "in_ote", "nearest_ob", "nearest_fvg"]
-    return {
-        "type": "object",
-        "properties": {**base_props, **extra_props},
-        "required": base_required + extra_required,
-    }
 
 
 GEMINI_RESPONSE_SCHEMA = {
@@ -713,24 +712,11 @@ GEMINI_RESPONSE_SCHEMA = {
                 "score": _INT,
                 "action": {"type": "string", "enum": ["ACTIVE_TRADE", "CONDITIONAL_ENTRY", "HOLD"]},
                 "volume_gate": {"type": "string", "enum": ["HARD_GATE", "LOW_VOL_WARNING", "CLEAR"]},
-                # Regime-conditional (BUG-07): keys mirror the engine's
-                # confluence_breakdown exactly; only the active mode's keys are
-                # filled (trend -> c1..c8, mean_revert -> m1..m6), never both.
-                "score_breakdown": {
-                    "type": "object",
-                    "description": ("Echo strategies.confluence_breakdown verbatim. "
-                                    "Include ONLY the keys of the active score_mode: "
-                                    "c1..c8 when trend, m1..m6 when mean_revert."),
-                    "properties": {
-                        "c1_trend_alignment": _INT_NULL, "c2_ob_proximity": _INT_NULL,
-                        "c3_liquidity_sweep": _INT_NULL, "c4_momentum": _INT_NULL,
-                        "c5_fvg_magnet": _INT_NULL, "c6_ote_bonus": _INT_NULL,
-                        "c7_cvd_alignment": _INT_NULL, "c8_stochrsi": _INT_NULL,
-                        "m1_edge_distance": _INT_NULL, "m2_edge_sweep": _INT_NULL,
-                        "m3_cvd_absorption": _INT_NULL, "m4_stoch_extreme": _INT_NULL,
-                        "m5_rejection": _INT_NULL, "m6_range_intact": _INT_NULL,
-                    },
-                },
+                # score_breakdown is NOT LLM output -- strategies.confluence_breakdown is
+                # spliced into header.score_breakdown after the call (_splice_score_breakdown)
+                # since it's already in the input snapshot verbatim with no override
+                # mechanism; asking the model to retype it wasted output tokens and was a
+                # pure transcription-error surface.
                 "score_override": {
                     "type": "object",
                     "nullable": True,
@@ -742,31 +728,20 @@ GEMINI_RESPONSE_SCHEMA = {
                 },
             },
             "required": ["pair", "price", "bias", "regime", "score", "action",
-                         "volume_gate", "score_breakdown"],
+                         "volume_gate"],
         },
+        # The per-timeframe table (structure/bos/cvd/pd_zone/OB/FVG/indicators) is
+        # engine data spliced in after the call (_splice_mtf_context) — asking the
+        # model to retype it wasted output tokens and was a transcription-error
+        # surface, exactly like score_breakdown. Only the two judgment fields
+        # remain LLM output.
         "mtf_context": {
             "type": "object",
             "properties": {
-                "d1": _tf_schema(
-                    {"htf_draw": _STR},
-                    ["bos", "htf_draw"],
-                ),
-                "h4": _tf_schema(
-                    {"adx": _NUM,
-                     "adx_tier": {"type": "string", "enum": ["WEAK", "MEDIUM", "STRONG", "VERY_STRONG"]}},
-                    ["adx", "adx_tier", "bos"],
-                ),
-                "h1": _tf_schema(
-                    {"adx": _NUM, "rsi": _NUM, "rsi_slope": _NUM, "stochrsi_k": _NUM},
-                    ["adx", "rsi", "rsi_slope", "stochrsi_k", "bos"],
-                ),
-                "m15": _tf_schema(
-                    {"rel_volume": _NUM, "candle_pattern": _STR},
-                    ["rel_volume", "candle_pattern"],
-                ),
                 "cross_tf_momentum": _STR,
+                "htf_draw": _STR,
             },
-            "required": ["d1", "h4", "h1", "m15", "cross_tf_momentum"],
+            "required": ["cross_tf_momentum", "htf_draw"],
         },
         "narrative": {
             "type": "object",
@@ -881,21 +856,68 @@ GEMINI_RESPONSE_SCHEMA = {
 }
 
 
-# Module-level lazy client. `google-genai` clients are reusable across calls,
-# so we build one on first use and keep it.
-_GENAI_CLIENT: "genai.Client | None" = None
+# Module-level lazy client pool. Round-robins across up to 3 API keys
+# (GEMINI_API_KEY / GEMINI_API_KEY_2 / GEMINI_API_KEY_3 in .env). A key that
+# raises on a call is benched for GEMINI_KEY_COOLDOWN_SECONDS so subsequent
+# rotations skip it while it's likely still rate-limited; `google-genai`
+# clients are reusable across calls, so one is built per key on first use and
+# cached.
+_GEMINI_KEYS: "list[str] | None" = None
+_GEMINI_CLIENTS: "dict[str, genai.Client]" = {}
+_GEMINI_COOLDOWN_UNTIL: "dict[str, float]" = {}
+_GEMINI_RR_INDEX = 0
 
 
-def _get_genai_client() -> "genai.Client":
-    global _GENAI_CLIENT
-    if _GENAI_CLIENT is not None:
-        return _GENAI_CLIENT
+def _load_gemini_keys() -> "list[str]":
+    global _GEMINI_KEYS
+    if _GEMINI_KEYS is not None:
+        return _GEMINI_KEYS
     load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-    _GENAI_CLIENT = genai.Client(api_key=api_key)
-    return _GENAI_CLIENT
+    _GEMINI_KEYS = [v for v in (
+        os.getenv("GEMINI_API_KEY"),
+        os.getenv("GEMINI_API_KEY_2"),
+        os.getenv("GEMINI_API_KEY_3"),
+    ) if v]
+    return _GEMINI_KEYS
+
+
+def _gemini_client_for_key(api_key: str) -> "genai.Client":
+    client = _GEMINI_CLIENTS.get(api_key)
+    if client is None:
+        client = genai.Client(api_key=api_key)
+        _GEMINI_CLIENTS[api_key] = client
+    return client
+
+
+def _iter_gemini_keys():
+    """
+    Yield (index, api_key) for every configured key, starting at the current
+    round-robin position and wrapping once. Keys still on cooldown from a
+    recent failure are tried last rather than skipped outright, so a run
+    still proceeds (degraded) if every key is currently benched.
+    """
+    keys = _load_gemini_keys()
+    n = len(keys)
+    if n == 0:
+        return
+    now = time.monotonic()
+    order = [(_GEMINI_RR_INDEX + i) % n for i in range(n)]
+    ready = [i for i in order if _GEMINI_COOLDOWN_UNTIL.get(keys[i], 0.0) <= now]
+    benched = [i for i in order if i not in ready]
+    for i in ready + benched:
+        yield i, keys[i]
+
+
+def _mark_gemini_key_failed(index: int, api_key: str):
+    _GEMINI_COOLDOWN_UNTIL[api_key] = time.monotonic() + GEMINI_KEY_COOLDOWN_SECONDS
+
+
+def _advance_gemini_rotation(last_used_index: int):
+    """Point the next top-level call at the following key (true round robin)."""
+    global _GEMINI_RR_INDEX
+    n = len(_load_gemini_keys())
+    if n:
+        _GEMINI_RR_INDEX = (last_used_index + 1) % n
 
 
 def _build_generate_config(include_schema: bool = True) -> "genai_types.GenerateContentConfig":
@@ -953,6 +975,28 @@ def _extract_response_dict(response) -> dict | None:
             return {"error": "JSON parse failed", "raw_text": raw}
 
 
+def _ts_to_bars_ago(ts_str, tf: str, now_utc: datetime):
+    """Closed-bar age of a naive-UTC bar timestamp in whole `tf` bars (None on parse failure)."""
+    try:
+        dt = datetime.fromisoformat(str(ts_str))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, int((now_utc - dt).total_seconds() * 1000 // TF_MS[tf]))
+    except Exception:
+        return None
+
+
+def _round_floats(node, ndigits: int = 6):
+    """Recursively round floats — strips 1e-14 repr noise (e.g. 78.03540000000001)."""
+    if isinstance(node, float):
+        return round(node, ndigits)
+    if isinstance(node, dict):
+        return {k: _round_floats(v, ndigits) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_round_floats(v, ndigits) for v in node]
+    return node
+
+
 def _build_llm_view(snapshot: dict) -> dict:
     """
     Token-lean copy of the snapshot for the LLM prompt (audit §4). The full
@@ -963,11 +1007,46 @@ def _build_llm_view(snapshot: dict) -> dict:
       * drop the raw FVG lists (the actionable `nearest_*` gaps are retained),
       * drop developing-swing arrays (early-warning channel, not rubric input),
       * drop `supertrend.level` (dead field; the pill only needs direction).
+      * collapse `bos`/`choch` to `null` when nothing was detected (the common
+        case) instead of an always-5-key all-null object,
+      * drop `windowed_indicators.<tf>.current_price` (exact duplicate of
+        `smc_context.<tf>.current_price`).
+      * drop post-call / replay-only fields entirely (FA-01): `chart_series`,
+        `analysis`, `outcome`, and `strategies.confluence_breakdown_raw`.
+      * drop exact duplicates: `previous_day` (= price_action pdh/pdl/pdc),
+        `volatility_regime.<tf>.atr_percentile` (= windowed_indicators'),
+        the 15m session fields already carried by `strategies.volume_gate`,
+        and `raw_regime` when hysteresis isn't diverging it from `market_regime`,
+      * drop `atr_context.note` (constant sentence; the system instruction
+        already states the rule),
+      * OB/FVG timestamps -> `bars_ago`, untested-POC session_end_ts ->
+        `age_hours` (ints beat ISO strings for both tokens and model date math),
+      * round float repr noise (78.03540000000001 -> 78.0354).
     """
     view = copy.deepcopy(snapshot)
+    now_utc = datetime.now(timezone.utc)
     view.pop("engine_trade", None)
+    # FA-01 (defense in depth): fields attached around/after the LLM call must
+    # never reach the prompt — `chart_series` (72% of the snapshot) is attached
+    # by monitor.cycle before its alert path narrates the same dict, and
+    # tools/ab_thinking replays SAVED snapshots that carry `analysis` (the
+    # previous answer) and `outcome` (the realized result — answer leakage).
+    view.pop("chart_series", None)
+    view.pop("analysis", None)
+    view.pop("outcome", None)
+    if isinstance(view.get("strategies"), dict):
+        view["strategies"].pop("confluence_breakdown_raw", None)  # calibration-only (FA-02)
+    view.pop("previous_day", None)
+    if view.get("raw_regime") == view.get("market_regime"):
+        view.pop("raw_regime", None)
+    if isinstance(view.get("atr_context"), dict):
+        view["atr_context"].pop("note", None)
+    for vr in (view.get("volatility_regime") or {}).values():
+        if isinstance(vr, dict):
+            vr.pop("atr_percentile", None)
     smc = view.get("smc_context") or {}
-    for ctx in smc.values():
+    windowed = view.get("windowed_indicators") or {}
+    for tf, ctx in smc.items():
         if not isinstance(ctx, dict):
             continue
         obs = ctx.get("order_blocks")
@@ -975,15 +1054,113 @@ def _build_llm_view(snapshot: dict) -> dict:
             for side in ("bullish", "bearish"):
                 if isinstance(obs.get(side), list):
                     obs[side] = obs[side][-2:]
+                    for ob in obs[side]:
+                        if isinstance(ob, dict) and "timestamp" in ob:
+                            ob["bars_ago"] = _ts_to_bars_ago(ob.pop("timestamp"), tf, now_utc)
         fvg = ctx.get("fvg")
         if isinstance(fvg, dict):
             fvg.pop("bullish_fvgs", None)
             fvg.pop("bearish_fvgs", None)
+            for key in ("nearest_bullish_fvg", "nearest_bearish_fvg"):
+                gap = fvg.get(key)
+                if isinstance(gap, dict) and "timestamp" in gap:
+                    gap["bars_ago"] = _ts_to_bars_ago(gap.pop("timestamp"), tf, now_utc)
         ctx.pop("developing_swings", None)
+        if (ctx.get("bos") or {}).get("level") is None:
+            ctx["bos"] = None
+        if not (ctx.get("choch") or {}).get("detected"):
+            ctx["choch"] = None
+        wtf = windowed.get(tf)
+        if isinstance(wtf, dict):
+            wtf.pop("current_price", None)
+    w15 = windowed.get("15m")
+    if isinstance(w15, dict):
+        for key in ("session_relative_volume", "kill_zone", "hour_utc", "slot_samples"):
+            w15.pop(key, None)  # already on strategies.volume_gate (or sample-count meta)
+    pa = view.get("price_action") or {}
+    for key in ("untested_pocs_4h", "untested_pocs_1d"):
+        for poc in pa.get(key) or []:
+            if isinstance(poc, dict) and "session_end_ts" in poc:
+                bars = _ts_to_bars_ago(poc.pop("session_end_ts"),
+                                       "4h" if key.endswith("4h") else "1d", now_utc)
+                poc["age_hours"] = bars * (4 if key.endswith("4h") else 24) if bars is not None else None
     st = view.get("supertrend")
     if isinstance(st, dict):
         st.pop("level", None)
-    return view
+    return _round_floats(view)
+
+
+def _schema_skeleton(node: dict):
+    """
+    Compact shape skeleton derived from GEMINI_RESPONSE_SCHEMA, appended to the
+    prompt on the plain-json fallback tier: without `response_schema` the model
+    otherwise has no view of the required output fields (the system instruction
+    describes rules, not the full field list) and would return an
+    unparseable-downstream shape.
+    """
+    t = node.get("type")
+    if t == "object":
+        return {k: _schema_skeleton(v) for k, v in (node.get("properties") or {}).items()}
+    if t == "array":
+        return [_schema_skeleton(node.get("items") or {})]
+    if "enum" in node:
+        return "|".join(node["enum"])
+    base = {"integer": "<int>", "number": "<number>", "string": "<string>",
+            "boolean": "<bool>"}.get(t, "<value>")
+    return f"{base}|null" if node.get("nullable") else base
+
+
+_TRANSIENT_MARKERS = ("503", "unavailable", "overloaded", "high demand")
+
+
+def _call_gemini_with_key(client: "genai.Client", prompt: str) -> "tuple[dict | None, str | None, bool]":
+    """
+    Try schema then plain-json config tiers on a single client. Returns
+    (result, error, is_key_error): `is_key_error` is True only when the SDK
+    call itself raised (rate limit, auth, network, ...) -- the caller should
+    bench that key and fail over. A parsed-but-empty response is not a key
+    problem, so it's surfaced immediately instead of triggering rotation.
+
+    Transient model-wide errors (503 UNAVAILABLE / overloaded) get a short
+    in-call backoff retry before failing over: key rotation can't fix an
+    overloaded model, and the snapshot is already computed by call time, so
+    losing the call wastes the whole run.
+    """
+    for label, include_schema in (("schema", True), ("plain-json", False)):
+        contents = prompt if include_schema else (
+            prompt + "\n\nOUTPUT JSON SHAPE (every field required unless |null):\n"
+            + json.dumps(_schema_skeleton(GEMINI_RESPONSE_SCHEMA), separators=(",", ":"))
+        )
+        error = None
+        for attempt in range(1 + GEMINI_TRANSIENT_RETRIES):
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL_NAME,
+                    contents=contents,
+                    config=_build_generate_config(include_schema=include_schema),
+                )
+            except Exception as e:
+                msg = str(e).lower()
+                if include_schema and ("schema" in msg or "unknown field" in msg):
+                    logger.warning(f"Gemini schema rejected ({e}); retrying without schema.")
+                    error = "schema rejected"
+                    break  # drop to the plain-json tier
+                if (any(m in msg for m in _TRANSIENT_MARKERS)
+                        and attempt < GEMINI_TRANSIENT_RETRIES):
+                    delay = GEMINI_TRANSIENT_BACKOFF_SECONDS * (attempt + 1)
+                    logger.warning(f"Gemini transient error ({e}); retrying in {delay}s.")
+                    time.sleep(delay)
+                    continue
+                return None, f"{label}: {e}", True
+
+            result = _extract_response_dict(response)
+            if result is None:
+                return None, "empty response", False
+            return result, None, False
+        if error != "schema rejected":
+            break
+
+    return None, "all config tiers failed", False
 
 
 def query_gemini(snapshot: dict) -> dict:
@@ -992,39 +1169,156 @@ def query_gemini(snapshot: dict) -> dict:
     output and a thinking level. Soft-falls-back to plain JSON-mode (no
     schema) if the SDK rejects our dict-form schema — keeps the engine
     running while a schema-shape issue is diagnosed.
+
+    Rotates across up to 3 API keys (round robin between calls). If a key's
+    call raises, that key is benched for GEMINI_KEY_COOLDOWN_SECONDS and the
+    next configured key is tried immediately within the same call.
     """
-    try:
-        client = _get_genai_client()
-    except RuntimeError as e:
-        return {"error": str(e)}
+    keys = _load_gemini_keys()
+    if not keys:
+        return {"error": "GEMINI_API_KEY not set"}
 
     # Compact separators (no indentation): indentation alone is ~15-20% of prompt
     # tokens on a snapshot this size (audit §4).
     prompt = f"DATA SNAPSHOT:\n{json.dumps(snapshot, separators=(',', ':'))}"
 
-    for label, include_schema in (("schema", True), ("plain-json", False)):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL_NAME,
-                contents=prompt,
-                config=_build_generate_config(include_schema=include_schema),
-            )
-        except Exception as e:
-            msg = str(e).lower()
-            schema_rejection = include_schema and any(
-                s in msg for s in ("schema", "unknown field", "invalid_argument")
-            )
-            if schema_rejection:
-                logger.warning(f"Gemini schema rejected ({e}); retrying without schema.")
-                continue
-            return {"error": f"Gemini call failed ({label}): {e}"}
+    last_error = "no keys available"
+    for index, api_key in _iter_gemini_keys():
+        client = _gemini_client_for_key(api_key)
+        result, error, is_key_error = _call_gemini_with_key(client, prompt)
+        if result is not None:
+            _advance_gemini_rotation(index)
+            return result
 
-        result = _extract_response_dict(response)
-        if result is None:
-            return {"error": "empty response"}
-        return result
+        last_error = error
+        if not is_key_error:
+            break  # parsing/response issue, not a key issue -- rotating won't help
 
-    return {"error": "All Gemini config tiers failed"}
+        logger.warning(
+            f"Gemini key #{index + 1}/{len(keys)} failed ({error}); cooling down "
+            f"{GEMINI_KEY_COOLDOWN_SECONDS}s and trying next key."
+        )
+        _mark_gemini_key_failed(index, api_key)
+
+    return {"error": f"Gemini call failed: {last_error}"}
+
+
+def _splice_score_breakdown(analysis: dict, strategies: dict) -> dict:
+    """
+    header.score_breakdown is engine data (strategies.confluence_breakdown), not an
+    LLM judgment -- spliced in here instead of round-tripping it through generation
+    (see GEMINI_RESPONSE_SCHEMA comment). No-ops on an error/empty response (no
+    `header` key).
+    """
+    if not isinstance(analysis, dict) or "header" not in analysis:
+        return analysis
+    analysis["header"]["score_breakdown"] = strategies.get("confluence_breakdown")
+    return analysis
+
+
+def _adx_tier(adx) -> str:
+    """Same tiering as the C1 rubric (strategies._score_trend)."""
+    if adx is None:
+        return "WEAK"
+    if adx < 25:
+        return "WEAK"
+    if adx < 41:
+        return "MEDIUM"
+    if adx < 56:
+        return "STRONG"
+    return "VERY_STRONG"
+
+
+def _fmt_bos(bos) -> str:
+    if not isinstance(bos, dict) or bos.get("level") is None:
+        return "NONE"
+    ago = bos.get("bars_ago")
+    ago_txt = f" ({ago} bars ago)" if ago is not None else ""
+    return f"{bos.get('direction')} BOS @ {bos.get('level')}{ago_txt}"
+
+
+def _fmt_nearest_zone(zones, price) -> str:
+    """Nearest-to-price '<low>-<high>' among [(bottom, top), ...] or 'NONE'."""
+    zones = [z for z in zones if z and z[0] is not None and z[1] is not None]
+    if not zones or price is None:
+        return "NONE"
+    bottom, top = min(zones, key=lambda z: abs((z[0] + z[1]) / 2 - price))
+    return f"{bottom}-{top}"
+
+
+def _build_mtf_context(snapshot: dict) -> dict:
+    """
+    Deterministic per-timeframe context table (structure / BOS / CVD / pd_zone /
+    nearest OB+FVG / indicators) built from the snapshot. This used to be LLM
+    output; it was pure transcription of the input, so it is now engine data and
+    only `cross_tf_momentum` + `htf_draw` come from the model.
+    """
+    smc = snapshot.get("smc_context") or {}
+    win = snapshot.get("windowed_indicators") or {}
+    pa = snapshot.get("price_action") or {}
+
+    def tf_block(tf):
+        ctx = smc.get(tf) or {}
+        w = win.get(tf) or {}
+        price = ctx.get("current_price") or snapshot.get("live_price")
+        obs = ctx.get("order_blocks") or {}
+        ob_zones = [(ob.get("bottom"), ob.get("top"))
+                    for side in ("bullish", "bearish")
+                    for ob in (obs.get(side) or [])]
+        fvg = ctx.get("fvg") or {}
+        fvg_zones = [(g.get("bottom"), g.get("top"))
+                     for g in (fvg.get("nearest_bullish_fvg"), fvg.get("nearest_bearish_fvg"))
+                     if isinstance(g, dict)]
+        pd_ctx = ctx.get("premium_discount") or {}
+        return {
+            "structure": ctx.get("structure", "NEUTRAL"),
+            "bos": _fmt_bos(ctx.get("bos")),
+            "cvd_delta": w.get("cvd_window_delta"),
+            "price_change_pct": w.get("window_price_change_pct"),
+            "pd_zone": pd_ctx.get("zone", "neutral"),
+            "in_ote": bool(pd_ctx.get("in_ote")),
+            "nearest_ob": _fmt_nearest_zone(ob_zones, price),
+            "nearest_fvg": _fmt_nearest_zone(fvg_zones, price),
+        }
+
+    d1 = tf_block("1d")
+    h4 = tf_block("4h")
+    h4["adx"] = (win.get("4h") or {}).get("adx")
+    h4["adx_tier"] = _adx_tier(h4["adx"])
+    h1 = tf_block("1h")
+    w1h = win.get("1h") or {}
+    h1["adx"] = w1h.get("adx")
+    h1["rsi"] = w1h.get("rsi")
+    rsi_series = w1h.get("rsi_series_last_5") or []
+    h1["rsi_slope"] = (round(rsi_series[-1] - rsi_series[-2], 2)
+                       if len(rsi_series) >= 2 else None)
+    h1["stochrsi_k"] = w1h.get("stochrsi_k")
+    m15 = tf_block("15m")
+    m15["rel_volume"] = (win.get("15m") or {}).get("relative_volume")
+    m15["candle_pattern"] = pa.get("last_candle_pattern_15m", "none")
+    return {"d1": d1, "h4": h4, "h1": h1, "m15": m15}
+
+
+def _splice_mtf_context(analysis: dict, snapshot: dict) -> dict:
+    """
+    Replace the LLM's two-field mtf_context with the full engine-built table,
+    keeping the model's `cross_tf_momentum` and `htf_draw` judgments (htf_draw
+    lives on the d1 block, where the old schema carried it).
+    """
+    if not isinstance(analysis, dict) or "header" not in analysis:
+        return analysis
+    llm_mtf = analysis.get("mtf_context") or {}
+    mtf = _build_mtf_context(snapshot)
+    mtf["d1"]["htf_draw"] = llm_mtf.get("htf_draw", "NONE")
+    mtf["cross_tf_momentum"] = llm_mtf.get("cross_tf_momentum", "n/a")
+    analysis["mtf_context"] = mtf
+    return analysis
+
+
+def _finalize_analysis(analysis: dict, snapshot: dict) -> dict:
+    """Post-call engine splices: score_breakdown + per-TF mtf_context table."""
+    analysis = _splice_score_breakdown(analysis, snapshot.get("strategies") or {})
+    return _splice_mtf_context(analysis, snapshot)
 
 
 # ---------------- snapshot retention ---------------- #
@@ -1056,8 +1350,10 @@ def _enforce_snapshot_retention(symbol: str, retention: int = SNAPSHOT_RETENTION
 
 # ---------------- core pipeline ---------------- #
 
-async def run_analysis(symbol: str) -> tuple[dict, dict]:
-    """End-to-end pipeline. Returns (snapshot_dict, analysis_dict)."""
+async def compute_snapshot_no_llm(symbol: str) -> tuple[dict, dict]:
+    """Cheap pass: fetch + indicators + SMC/PA + evaluate_strategies + assemble the
+    snapshot -- NO Gemini call, no persistence. Returns (snapshot_native, data) so the
+    caller can build chart_series later. Used by the Telegram monitor and run_analysis."""
     logger.info(f"Analyzing market data for {symbol}...")
 
     data, live_price = await fetch_ohlcv(symbol)
@@ -1153,14 +1449,28 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
         "windowed_indicators": windowed_indicators,
     }
     snapshot_native = to_native(snapshot)
+    return snapshot_native, data
 
+
+def narrate(snapshot_native: dict) -> dict:
+    """The single Gemini call (expensive pass). Returns the raw analysis dict
+    (an {"error": ...} dict on failure -- see query_gemini)."""
     logger.info("Generating structured trade plan from Gemini...")
-    analysis = query_gemini(_build_llm_view(snapshot_native))
-    snapshot_native["analysis"] = analysis
+    return query_gemini(_build_llm_view(snapshot_native))
 
-    # Attach chart OHLC AFTER the LLM call so it never inflates the prompt.
-    snapshot_native["chart_series"] = build_chart_series(data)
 
+def finalize_analysis(snapshot_native: dict, analysis: dict) -> dict:
+    """Post-call engine splices: score_breakdown + per-TF mtf_context table. Thin
+    public wrapper around _finalize_analysis so the monitor can call it after a
+    Gemini call it made itself (run_analysis uses it the same way)."""
+    return _finalize_analysis(analysis, snapshot_native)
+
+
+def _persist_snapshot(snapshot_native: dict, retention: int = None) -> str:
+    """Write a completed snapshot to snapshots/ and enforce per-symbol retention.
+
+    retention: None -> engine default (SNAPSHOT_RETENTION); <=0 -> unlimited (collector mode)."""
+    symbol = snapshot_native.get("symbol", "UNKNOWN")
     os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
     # UTC filename so the labeler's timestamp parse is timezone-safe (BUG-03)
     timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1169,8 +1479,46 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     with open(snapshot_path, "w") as f:
         json.dump(snapshot_native, f, indent=2)
     logger.info(f"Snapshot saved to snapshots/{snapshot_filename}")
+    eff_retention = SNAPSHOT_RETENTION if retention is None else retention
+    # _enforce_snapshot_retention keeps exactly `retention` files -- 0 would mean "keep
+    # none" (delete every file just written). <=0 here means "unlimited" instead (collector
+    # mode, --retention 0), so skip the prune entirely rather than reinterpreting the value.
+    if eff_retention > 0:
+        _enforce_snapshot_retention(symbol, eff_retention)
+    return snapshot_path
 
-    _enforce_snapshot_retention(symbol)
+
+def data_health_report() -> list:
+    """One-line-per-input health banner, printed at CLI/monitor startup so a silently
+    degraded config (no calibration.json -> equal weights; placeholder events.json ->
+    guard blind) is visible instead of discovered weeks later."""
+    lines = []
+    calib_path = os.path.join(DATA_DIR, "calibration.json")
+    if os.path.exists(calib_path):
+        lines.append("calibration: loaded")
+    else:
+        lines.append("calibration: ABSENT -- equal weights, score-bucket win-rate only "
+                     "(label snapshots + run tools.calibrate once a corpus exists)")
+    ev = fetch_event_window()
+    if ev.get("active"):
+        names = ", ".join(e.get("name", "unknown") for e in ev.get("events") or [])
+        lines.append(f"event guard: ACTIVE -- {names}")
+    else:
+        lines.append("event guard: calendar OK")
+    return lines
+
+
+async def run_analysis(symbol: str) -> tuple[dict, dict]:
+    """End-to-end pipeline (CLI/web). Returns (snapshot_dict, analysis_dict)."""
+    snapshot_native, data = await compute_snapshot_no_llm(symbol)
+
+    analysis = narrate(snapshot_native)
+    analysis = finalize_analysis(snapshot_native, analysis)
+    snapshot_native["analysis"] = analysis
+
+    # Attach chart OHLC AFTER the LLM call so it never inflates the prompt.
+    snapshot_native["chart_series"] = build_chart_series(data)
+    _persist_snapshot(snapshot_native)
     return snapshot_native, analysis
 
 

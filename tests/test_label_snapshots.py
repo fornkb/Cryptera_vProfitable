@@ -6,7 +6,17 @@ and timeout handling.
 
 import pandas as pd
 
-from tools.label_snapshots import _label_one
+from tools.label_snapshots import _label_one, _floor_to_15m
+
+
+# ---------------- FA-09: replay starts at the snapshot bar's open ---------------- #
+
+def test_floor_to_15m_boundary():
+    boundary = 1760000000000 - (1760000000000 % 900_000)  # an exact 15m open
+    assert _floor_to_15m(boundary) == boundary
+    assert _floor_to_15m(boundary + 30_000) == boundary    # snapshot ~30s after close
+    assert _floor_to_15m(boundary + 899_999) == boundary   # anywhere inside the bar
+    assert _floor_to_15m(boundary + 900_000) == boundary + 900_000
 
 
 def _candles(rows):
