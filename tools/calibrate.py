@@ -20,9 +20,12 @@ Calibration v2 upgrades (BUG-12):
   * Timeouts are no longer discarded — a trade that timed out gets partial MFE
     credit (how far toward its target it travelled), so rubrics that produce slow
     winners are not penalised as losses.
-  * Overlapping snapshots (same symbol within the same hour) share nearly identical
-    forward windows, so each is weighted by 1/(cluster size) — one market outcome
-    is counted once, not many times.
+  * Pseudo-replication fix (tools.episodes): one persisting setup produces many
+    near-identical 15m snapshot rows. `_load_labelled_episodes` collapses same-symbol
+    same-geometry runs into ONE representative (the earliest) before anything is
+    fitted — one market outcome is counted once, not N times. Ported from the
+    sibling v4.x engine's identical fix; ONLY on the triggered-trade universe below
+    (untriggered setups never became live trades, so they're excluded, not collapsed).
 
 The engine loads this file when present and otherwise runs at equal weights. Safe
 with few samples: it refuses to emit weights/logistic below a minimum support and
@@ -39,9 +42,13 @@ import argparse
 import json
 import os
 from collections import defaultdict
-from datetime import datetime, timezone
 
 import numpy as np
+
+try:
+    from tools.episodes import collapse_to_episodes
+except ImportError:  # allow running as `python tools/calibrate.py` (no package context)
+    from episodes import collapse_to_episodes
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
@@ -72,6 +79,18 @@ def _iter_labelled():
             yield name, snap, outcome
 
 
+def _load_labelled_episodes():
+    """Load labelled engine trades and COLLAPSE overlapping 15m snapshots of one persisting
+    setup into a single EPISODE (pseudo-replication fix, tools.episodes). A multi-hour setup
+    otherwise yields many near-duplicate rows that calibration would treat as that many
+    independent Bernoulli trials -- inflating sample size cluster-fold. Returns
+    (episodes, n_raw_rows): `episodes` is a list of (name, snap, outcome) -- one EARLIEST
+    representative per trade-episode -- and `n_raw_rows` is the pre-collapse row count so the
+    caller can report episodes-vs-rows (the honesty metric)."""
+    raw = list(_iter_labelled())
+    return collapse_to_episodes(raw), len(raw)
+
+
 def _soft_label(snap: dict, outcome: dict) -> float:
     """
     Win-ness in [0,1]. Clean fills are 1/0; a timeout gets MFE-based partial credit
@@ -90,23 +109,6 @@ def _soft_label(snap: dict, outcome: dict) -> float:
     if rrr is None:
         return 0.0
     return max(0.0, min(1.0, float(rrr) / target_rr))
-
-
-def _snap_hour_key(name: str, snap: dict):
-    """(symbol, UTC-hour) key for de-dup weighting of overlapping forward windows."""
-    symbol = snap.get("symbol") or "?"
-    gen = snap.get("generated_at")
-    hour = None
-    if gen:
-        try:
-            dt = datetime.fromisoformat(gen.replace("Z", "+00:00")).astimezone(timezone.utc)
-            hour = dt.strftime("%Y%m%d%H")
-        except ValueError:
-            hour = None
-    if hour is None:
-        parts = name.replace(".json", "").split("_")
-        hour = (parts[-2] + parts[-1][:2]) if len(parts) >= 5 else name
-    return (symbol, hour)
 
 
 def _component_weights(rows, keys):
@@ -204,15 +206,13 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
-    # First pass: collect, then compute de-dup weights per (symbol, hour) cluster.
-    collected = list(_iter_labelled())
-    cluster_counts = defaultdict(int)
-    for name, snap, _ in collected:
-        cluster_counts[_snap_hour_key(name, snap)] += 1
+    # Collapse overlapping 15m snapshots of one persisting setup into single episodes
+    # (tools.episodes -- pseudo-replication fix) BEFORE anything is fitted.
+    episodes, n_raw_rows = _load_labelled_episodes()
 
     trend_rows, mr_rows = [], []      # (breakdown, y_soft, w)
     score_rows = []                   # (score, y_soft, w)
-    for name, snap, outcome in collected:
+    for name, snap, outcome in episodes:
         strat = snap.get("strategies") or {}
         # FA-02: fit on the RAW (pre-weight, pre-cap) components — fitting on the
         # weighted breakdown feeds each refit its own previous output (compounding
@@ -221,7 +221,9 @@ def main():
         # the two are identical as long as no calibration weights were active.
         bd = strat.get("confluence_breakdown_raw") or strat.get("confluence_breakdown") or {}
         y = _soft_label(snap, outcome)
-        w = 1.0 / cluster_counts[_snap_hour_key(name, snap)]
+        # w=1.0: episode collapsing already reduced this to one row per physical trade,
+        # so no further de-dup weighting is needed (was 1/cluster_size pre-episodes).
+        w = 1.0
         score = int(strat.get("confluence_score") or 0)
         score_rows.append((score, y, w))
         if strat.get("score_mode") == "mean_revert":
@@ -230,7 +232,8 @@ def main():
             trend_rows.append((bd, y, w))
 
     n_total = len(score_rows)
-    print(f"Labelled engine trades found: {n_total}  (trend={len(trend_rows)}, mean_revert={len(mr_rows)})")
+    dup = f"  [collapsed from {n_raw_rows} snapshot rows = {n_raw_rows / n_total:.1f}x dedup]" if n_total else ""
+    print(f"Labelled trade-EPISODES found: {n_total}  (trend={len(trend_rows)}, mean_revert={len(mr_rows)}){dup}")
 
     calib = {"weights": {}, "mr_weights": {}, "score_to_winrate": [], "logistic": {}}
     if len(trend_rows) >= args.min_samples:

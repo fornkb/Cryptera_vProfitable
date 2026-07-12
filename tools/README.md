@@ -2,6 +2,17 @@
 
 Offline analytics on the saved snapshots.
 
+## `episodes.py`
+
+Not run directly. The cheap pass scores every watchlist symbol every 15m, so one
+persisting setup (same entry/SL/TP unchanged for hours) produces many near-identical
+snapshot rows. `episode_id()` fingerprints a physical trade by
+`symbol + side + rounded(entry, SL, TP)`; `collapse_to_episodes()` keeps only the
+earliest row of each contiguous run (a 24h silence starts a new episode). Both
+`eval_engine.py` and `calibrate.py` collapse the engine-primary universe through this
+before counting anything — without it, a single 4-hour setup would be counted as
+~16 separate trades.
+
 ## `label_snapshots.py`
 
 Walks `snapshots/` and re-fetches the 15-minute candles that followed each
@@ -39,7 +50,10 @@ python -m tools.eval_engine --symbol BTC/USDT --out reports/eval_btc.json
 ```
 
 Use this output to retune the C1-C8 weights and confluence thresholds against
-ground truth instead of intuition.
+ground truth instead of intuition. `engine_universe_labelled` is the
+episode-collapsed trade count; `engine_universe_raw_rows` is the pre-collapse
+snapshot-row count, so the ratio between them is the dedup factor a persisting
+corpus produced.
 
 ## `calibrate.py`
 

@@ -14,6 +14,15 @@ block with two independent universes (FA-06):
     which reported `snapshots_labelled: 0` against a corpus that's almost
     entirely no-LLM snapshots).
 
+Pseudo-replication fix (tools.episodes): the cheap pass scores every watched symbol
+every 15m, so ONE persisting setup (same entry/SL/TP unchanged for hours) produces many
+near-identical `engine_trade_outcome` rows. Before bucketing, these are collapsed to one
+representative episode per `tools.episodes.episode_id` (symbol+side+rounded geometry) --
+otherwise a single setup's outcome gets counted N times and every hit-rate/expectancy
+number below is biased toward whatever that one setup happened to do. `engine_universe_raw_rows`
+reports the pre-collapse count so the dedup ratio is visible. The LLM-secondary cuts are
+NOT collapsed -- see the note at their loop below.
+
 Buckets (engine-primary universe):
   * overall hit rate, expectancy, average MFE/MAE
   * stats by score bucket (45-59 conditional, 60-74 active, 75+ high-conviction)
@@ -37,11 +46,16 @@ import os
 from collections import defaultdict
 from typing import Iterable
 
+try:
+    from tools.episodes import collapse_to_episodes
+except ImportError:  # allow running as `python tools/eval_engine.py` (no package context)
+    from episodes import collapse_to_episodes
+
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
 
 
-def _iter_snapshots(symbol: str | None) -> Iterable[dict]:
+def _iter_snapshots(symbol: str | None) -> Iterable[tuple[str, dict]]:
     for name in sorted(os.listdir(SNAPSHOTS_DIR)):
         if not name.startswith("snapshot_") or not name.endswith(".json"):
             continue
@@ -52,7 +66,7 @@ def _iter_snapshots(symbol: str | None) -> Iterable[dict]:
         path = os.path.join(SNAPSHOTS_DIR, name)
         try:
             with open(path) as f:
-                yield json.load(f)
+                yield name, json.load(f)
         except Exception:
             continue
 
@@ -159,16 +173,25 @@ def main():
     }
 
     seen = 0
-    engine_labelled = 0
-    llm_labelled = 0
-    for snap in _iter_snapshots(args.symbol):
+    raw_engine_rows = []   # (name, snap, outcome) -- collapsed to episodes below
+    llm_rows = []          # (name, snap, outcome) -- NOT collapsed, see note below
+    for name, snap in _iter_snapshots(args.symbol):
         seen += 1
         outcome_block = snap.get("outcome") or {}
         engine_outcome = outcome_block.get("engine_trade_outcome")
         llm_outcome = outcome_block.get("trade_decision_outcome")
-        if engine_outcome is None and llm_outcome is None:
-            continue
+        if engine_outcome is not None:
+            raw_engine_rows.append((name, snap, engine_outcome))
+        if llm_outcome is not None:
+            llm_rows.append((name, snap, llm_outcome))
 
+    # Pseudo-replication fix: one persisting setup scored every 15m yields many
+    # near-identical rows here -- collapse to one representative per episode BEFORE
+    # any bucket counts them (see module docstring).
+    episodes = collapse_to_episodes(raw_engine_rows)
+    n_raw_rows = len(raw_engine_rows)
+
+    for name, snap, engine_outcome in episodes:
         strategies = snap.get("strategies") or {}
         analysis = snap.get("analysis") or {}
         header = analysis.get("header") or {}
@@ -183,32 +206,39 @@ def main():
         vr_15m = (snap.get("volatility_regime") or {}).get("15m", {}).get("regime", "unknown")
         event_active = "active" if (snap.get("event_guard") or {}).get("active") else "clear"
 
-        if engine_outcome is not None:
-            engine_labelled += 1
-            _record(buckets["overall"], engine_outcome)
-            _record(buckets["by_score"][_bucket_score(score)], engine_outcome)
-            _record(buckets["by_mode"][mode], engine_outcome)
-            _record(buckets["by_bias"][bias], engine_outcome)
-            _record(buckets["by_vol_regime_15m"][vr_15m], engine_outcome)
-            _record(buckets["by_event_guard"][event_active], engine_outcome)
-            _record(buckets["by_volume_gate"][gate], engine_outcome)
+        _record(buckets["overall"], engine_outcome)
+        _record(buckets["by_score"][_bucket_score(score)], engine_outcome)
+        _record(buckets["by_mode"][mode], engine_outcome)
+        _record(buckets["by_bias"][bias], engine_outcome)
+        _record(buckets["by_vol_regime_15m"][vr_15m], engine_outcome)
+        _record(buckets["by_event_guard"][event_active], engine_outcome)
+        _record(buckets["by_volume_gate"][gate], engine_outcome)
 
-        if llm_outcome is not None:
-            llm_labelled += 1
-            action = header.get("action") or "HOLD"
-            tm = (analysis.get("trade_decision") or {}).get("trade_management") or {}
-            sel = tm.get("selected_from_engine")
-            sel_key = "engine_primary" if sel is True else ("llm_alternative" if sel is False else "unknown")
-            _record(buckets["by_action"][action], llm_outcome)
-            _record(buckets["by_selected_from_engine"][sel_key], llm_outcome)
+    # LLM-secondary cuts: NOT episode-collapsed. tools.episodes.episode_id fingerprints
+    # the ENGINE's primary geometry; when selected_from_engine is False the LLM chose a
+    # DIFFERENT candidate (different entry/SL/TP), so collapsing on the engine's id would
+    # wrongly merge distinct LLM decisions. This universe is also naturally far less
+    # duplicated already: narration only fires on a gated ACTIVE transition plus a
+    # per-symbol cooldown (alerts.controller / Cfg.min_realert_s, default 2h), not every
+    # 15m cycle like the engine-primary universe.
+    for name, snap, llm_outcome in llm_rows:
+        analysis = snap.get("analysis") or {}
+        header = analysis.get("header") or {}
+        action = header.get("action") or "HOLD"
+        tm = (analysis.get("trade_decision") or {}).get("trade_management") or {}
+        sel = tm.get("selected_from_engine")
+        sel_key = "engine_primary" if sel is True else ("llm_alternative" if sel is False else "unknown")
+        _record(buckets["by_action"][action], llm_outcome)
+        _record(buckets["by_selected_from_engine"][sel_key], llm_outcome)
 
     report = {
         "snapshots_scanned": seen,
         # FA-06: reported explicitly and separately — the engine universe is
         # the whole collector corpus, the LLM universe is narrated-only and
         # will be much smaller (budget-gated).
-        "engine_universe_labelled": engine_labelled,
-        "llm_universe_labelled": llm_labelled,
+        "engine_universe_labelled": len(episodes),      # collapsed episode count
+        "engine_universe_raw_rows": n_raw_rows,         # pre-collapse snapshot rows (dedup honesty metric)
+        "llm_universe_labelled": len(llm_rows),
         "overall": _finalize(buckets["overall"]),
     }
     report["overall"]["expectancy_pct"] = _expectancy(report["overall"])

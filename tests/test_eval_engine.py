@@ -80,3 +80,42 @@ def test_engine_only_narrated_and_unlabelled_snapshots(monkeypatch, tmp_path):
     assert set(report["by_mode"]) == {"trending", "ranging"}  # engine universe, both snaps
     assert report["by_action"]["ACTIVE_TRADE"]["snapshots"] == 1   # LLM cut, narrated only
     assert report["by_selected_from_engine"]["engine_primary"]["snapshots"] == 1
+
+
+def test_persisting_setup_collapses_to_one_episode(monkeypatch, tmp_path):
+    """Pseudo-replication fix: a BTC setup scored every 15m for 2h (same entry/SL/TP each
+    cycle) must count as ONE trade in the engine-primary universe, not 8."""
+    for i in range(8):
+        hh, mm = divmod(i * 15, 60)
+        _write(tmp_path, f"snapshot_BTC_USDT_20260101_{hh:02d}{mm:02d}00.json", {
+            "symbol": "BTC/USDT",
+            "generated_at": f"2026-01-01T{hh:02d}:{mm:02d}:00Z",
+            "engine_trade": {"direction": "BUY", "entry": 100.0, "stop_loss": 95.0, "take_profit": 110.0},
+            "strategies": {"confluence_score": 65, "score_mode": "trending", "trend_bias": "bullish",
+                            "volume_gate": {"state": "CLEAR"}},
+            "volatility_regime": {"15m": {"regime": "normal"}},
+            "event_guard": {"active": False},
+            "outcome": {"engine_trade_outcome": {"triggered": True, "outcome": "tp_first",
+                                                  "mfe_pct": 3.0, "mae_pct": -0.2, "realized_rr": 2.0}},
+        })
+    # a genuinely distinct SOL setup, one snapshot only
+    _write(tmp_path, "snapshot_SOL_USDT_20260101_000000.json", {
+        "symbol": "SOL/USDT",
+        "generated_at": "2026-01-01T00:00:00Z",
+        "engine_trade": {"direction": "SELL", "entry": 80.0, "stop_loss": 84.0, "take_profit": 72.0},
+        "strategies": {"confluence_score": 60, "score_mode": "trending", "trend_bias": "bearish",
+                        "volume_gate": {"state": "CLEAR"}},
+        "volatility_regime": {"15m": {"regime": "normal"}},
+        "event_guard": {"active": False},
+        "outcome": {"engine_trade_outcome": {"triggered": True, "outcome": "sl_first",
+                                              "mfe_pct": 0.1, "mae_pct": -1.0, "realized_rr": None}},
+    })
+
+    report = _run(monkeypatch, tmp_path)
+
+    assert report["snapshots_scanned"] == 9
+    assert report["engine_universe_raw_rows"] == 9      # pre-collapse count
+    assert report["engine_universe_labelled"] == 2       # 1 BTC episode + 1 SOL episode
+    assert report["overall"]["snapshots"] == 2
+    assert report["overall"]["tp_first"] == 1             # the BTC episode's single outcome
+    assert report["overall"]["sl_first"] == 1

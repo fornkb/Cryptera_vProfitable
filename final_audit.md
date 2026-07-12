@@ -428,3 +428,33 @@ measurement-gated; the corpus doesn't exist yet). Don't over-engineer.
   `systemd-run` timer dry-test and the on-VM deploy-readiness checklist (FA-17
   parity, events.json, .env, empty `snapshots/`, `enable --now`) remain operator
   tasks on the actual Azure box.
+- 2026-07-12 — **Post-audit hardening, pre-deploy**: pseudo-replication fix
+  (not FA/BUG-numbered — found during Azure-deploy prep, not the audit). The
+  cheap pass scores every watchlist symbol every 15m, so ONE persisting setup
+  (same entry/SL/TP for hours) produced many near-identical `engine_trade_outcome`
+  rows that `tools/calibrate.py` only partially de-duplicated (a `(symbol,
+  UTC-hour)` cluster weight — under-corrects a setup spanning an hour boundary)
+  and `tools/eval_engine.py` didn't de-duplicate AT ALL (every hit-rate/expectancy/
+  by-bucket number in the human-facing report was inflated by however many 15m
+  cycles a setup persisted). The sibling v4.x engine (`Desktop\cryptera\new`) had
+  already solved this exact problem (its own "M1 pseudo-replication fix") —
+  ported `tools/episodes.py` verbatim (`episode_id` = symbol+side+rounded
+  entry/SL/TP, `collapse_to_episodes` keeps the earliest row per contiguous run,
+  24h silence = new episode; already field-compatible with this repo's snapshot
+  shape, zero adaptation needed). Wired into `tools/calibrate.py`
+  (`_load_labelled_episodes` replaces the old hour-bucket dedup entirely — cleaner
+  code, and correct across hour boundaries) and `tools/eval_engine.py` (the
+  engine-primary universe is now episode-collapsed before bucketing; new
+  `engine_universe_raw_rows` field reports the pre-collapse count as an honesty/
+  dedup-ratio metric). The LLM-secondary cuts (`by_action`/`by_selected_from_engine`)
+  are deliberately left uncollapsed — `episode_id` fingerprints the ENGINE's
+  geometry, which is wrong for an LLM-selected alternative candidate, and that
+  universe is already naturally sparse (narration is cooldown-gated, not
+  15m-cyclic). No snapshot-shape change ⇒ schema stays 3.3.1, no relabel — this
+  is a pure read-time aggregation fix, safe whether the corpus is empty or
+  already collecting. 10 new unit tests (`tests/test_episodes.py` ported from
+  v4.x's `episode_id`/`collapse_to_episodes` coverage + a v3 BUY/SELL direction
+  case; `tests/test_calibrate.py`; a persisting-setup collapse case added to
+  `tests/test_eval_engine.py`) — 67/67 pytest PASS. Verified fully offline with
+  synthetic snapshots (8 near-identical 15m rows → 1 episode); no live/Gemini
+  run needed for this aggregation-layer change.
