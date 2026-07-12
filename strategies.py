@@ -126,19 +126,21 @@ def _sign(x) -> int:
 # ---------------- multi-timeframe liquidity sweep (T1-7) ---------------- #
 
 def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: float,
-                     trend_bias: str) -> tuple[int, str, str]:
+                     trend_bias: str, pwh: float = None, pwl: float = None) -> tuple[int, str, str]:
     """
     Scan the last 5 closed 15m candles for a sweep + reclaim of a liquidity pool
-    drawn from ALL timeframes (4H/1H/15M pools + PDH/PDL). HTF sweeps score the
-    full 10; a 15m-only sweep scores 6. Returns (points, note, tier).
+    drawn from ALL timeframes (1D/4H/1H/15M pools + PDH/PDL + PWH/PWL). HTF sweeps
+    score the full 10; a 15m-only sweep scores 6. Returns (points, note, tier).
+    The 1D pools and previous-week high/low are the highest-conviction draws added
+    by v3.3 (IMP-2) — the exact levels whose sweeps matter most.
     """
     if df_15m is None or df_15m.empty or len(df_15m) < 6 or trend_bias not in ("bullish", "bearish"):
         return 0, "no sweep", "none"
 
     # Build candidate pools with tier weights (higher tier = more significant).
     pools = []  # (price, side, tier_name, tier_rank)
-    tier_rank = {"4h": 3, "1h": 2, "pd": 2, "15m": 1}
-    for tf in ("4h", "1h", "15m"):
+    tier_rank = {"1d": 4, "4h": 3, "1h": 2, "pd": 2, "pw": 2, "15m": 1}
+    for tf in ("1d", "4h", "1h", "15m"):
         liq = smc_context.get(tf, {}).get("liquidity_levels", {}) or {}
         for lvl in liq.get("buy_side", []) or []:
             pools.append((lvl, "buy", tf, tier_rank[tf]))
@@ -148,6 +150,10 @@ def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: f
         pools.append((pdh, "buy", "pd", tier_rank["pd"]))
     if pdl:
         pools.append((pdl, "sell", "pd", tier_rank["pd"]))
+    if pwh:
+        pools.append((pwh, "buy", "pw", tier_rank["pw"]))
+    if pwl:
+        pools.append((pwl, "sell", "pw", tier_rank["pw"]))
 
     if not pools:
         return 0, "no pools", "none"
@@ -371,8 +377,8 @@ def _m1_edge_distance(price, edge, va):
     return 0, "mid-range"
 
 
-def _m2_edge_sweep(df_15m, smc_context, pdh, pdl, mr_dir):
-    pts, note, _ = detect_mtf_sweep(df_15m, smc_context, pdh, pdl, mr_dir)
+def _m2_edge_sweep(df_15m, smc_context, pdh, pdl, mr_dir, pwh=None, pwl=None):
+    pts, note, _ = detect_mtf_sweep(df_15m, smc_context, pdh, pdl, mr_dir, pwh, pwl)
     return (15 if pts >= 10 else (10 if pts >= 6 else 0)), f"edge sweep: {note}"
 
 
@@ -936,6 +942,8 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
     atr_map = {"4h": _atr_abs(df_4h), "1h": _atr_abs(df_1h), "15m": atr_abs}
     pdh = (pa_context or {}).get("pdh")
     pdl = (pa_context or {}).get("pdl")
+    pwh = (pa_context or {}).get("pwh")  # previous-week high/low — HTF sweep draws (IMP-2)
+    pwl = (pa_context or {}).get("pwl")
 
     is_ranging = "Ranging" in (market_regime or "") or "Sideways" in (market_regime or "")
     trend_bias = derive_trend_bias(smc_context, df_4h)
@@ -955,7 +963,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
             absorption = False
         else:
             m1, n1 = _m1_edge_distance(price, mr_edge, va)
-            m2, n2 = _m2_edge_sweep(df_15m, smc_context, pdh, pdl, mr_dir)
+            m2, n2 = _m2_edge_sweep(df_15m, smc_context, pdh, pdl, mr_dir, pwh, pwl)
             m3, n3 = _m3_cvd_absorption(windowed_indicators, mr_dir)
             m4, n4 = _m4_stoch_extreme(windowed_indicators, mr_dir)
             m5, n5 = _m5_rejection(pa_context, mr_dir)
@@ -974,7 +982,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         direction = trend_bias
         c1, n1 = _c1_trend(smc_context, windowed_indicators)
         c2, n2 = _c2_ob_prox(price, smc_context, trend_bias, atr_abs)
-        c3, n3, c3_tier = detect_mtf_sweep(df_15m, smc_context, pdh, pdl, trend_bias)
+        c3, n3, c3_tier = detect_mtf_sweep(df_15m, smc_context, pdh, pdl, trend_bias, pwh, pwl)
         c4, n4 = _c4_momentum(df_1h, windowed_indicators, trend_bias)
         c5, n5 = _c5_fvg_magnet(price, smc_context, trend_bias, atr_map)
         c6, n6 = _c6_ote(smc_context, trend_bias)

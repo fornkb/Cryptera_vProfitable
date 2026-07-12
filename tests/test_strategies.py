@@ -303,3 +303,57 @@ def test_tf_rank_keeps_4h_as_intraday_anchor():
     """4h stays most significant; 1d ranks above 1h but below 4h."""
     from strategies import _TF_RANK
     assert _TF_RANK["4h"] > _TF_RANK["1d"] > _TF_RANK["1h"] > _TF_RANK["15m"]
+
+
+# ---------------- IMP-2: 1D pools + PWH/PWL in sweep detection ---------------- #
+
+from strategies import detect_mtf_sweep, _rebudget_sweep
+
+
+def _sweep_df():
+    """5 flat bars + a final aggressive bullish sweep candle (dominant lower wick
+    spiking to 97, closing back at 101)."""
+    flat = {"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0}
+    sweep = {"open": 100.0, "high": 101.5, "low": 97.0, "close": 101.0}
+    rows = [flat] * 5 + [sweep]
+    return pd.DataFrame(rows)
+
+
+def _empty_liq_ctx(**tf_pools):
+    """smc_context skeleton; tf_pools like _empty_liq_ctx(**{'1d': {'sell_side':[98]}})."""
+    ctx = {tf: {"liquidity_levels": {"buy_side": [], "sell_side": []}}
+           for tf in ("1d", "4h", "1h", "15m")}
+    for tf, pools in tf_pools.items():
+        ctx[tf]["liquidity_levels"].update(pools)
+    return ctx
+
+
+def test_1d_pool_sweep_scores_htf():
+    """IMP-2: a swept 1D liquidity pool is the highest tier (rank 4) → HTF 10 pts,
+    which the trend rubric rebudgets to the 15-pt sweep slot."""
+    ctx = _empty_liq_ctx(**{"1d": {"sell_side": [98.0]}})
+    pts, note, tier = detect_mtf_sweep(_sweep_df(), ctx, None, None, "bullish")
+    assert pts == 10 and tier == "1d" and "1d" in note
+    assert _rebudget_sweep(pts) == 15
+
+
+def test_1d_pool_ignored_before_fix_now_detected():
+    """The same sweep with the pool ONLY on 1D must be caught (regression guard:
+    pre-IMP-2 the loop skipped 1d entirely and this returned 'no aggressive sweep')."""
+    ctx = _empty_liq_ctx(**{"1d": {"sell_side": [98.0]}})
+    pts, _, tier = detect_mtf_sweep(_sweep_df(), ctx, None, None, "bullish")
+    assert pts > 0 and tier == "1d"
+
+
+def test_pwl_sweep_scores_htf_tier():
+    """IMP-2: previous-week low, passed via the new pwl param, is an HTF draw
+    (tier 'pw', rank 2 → 10 pts) even with no smc pools present."""
+    ctx = _empty_liq_ctx()
+    pts, note, tier = detect_mtf_sweep(_sweep_df(), ctx, None, None, "bullish", pwl=98.0)
+    assert pts == 10 and tier == "pw" and "pw" in note
+
+
+def test_pwl_ignored_when_not_passed():
+    """No pools and no PWL → no sweep (confirms PWL is the source of the signal above)."""
+    pts, _, tier = detect_mtf_sweep(_sweep_df(), _empty_liq_ctx(), None, None, "bullish")
+    assert pts == 0 and tier == "none"

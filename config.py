@@ -22,8 +22,11 @@ SCHEMA_VERSION = "3.3.1"  # bump on any snapshot-SHAPE change (CLAUDE.md invaria
 MARKET = "binance-usdm"          # single namespace (BUG-01) — never mix spot/futures
 TIMEFRAMES = ["1d", "4h", "1h", "15m"]
 REQUIRED_TIMEFRAMES = {"4h", "1h", "15m"}  # 1D is a best-effort HTF overlay (BUG-15)
-# >= 260 closed bars so EMA_200 / ATR_Pct(100) are live after the forming candle drops (BUG-02)
-LIMITS = {"1d": 300, "4h": 300, "1h": 300, "15m": 300}
+# >= 260 closed bars so EMA_200 / ATR_Pct(100) are live after the forming candle drops (BUG-02).
+# 15m raised to 1000 (~10 days) so the session-volume gate (indicators.session_volume_context)
+# has ~40 same-hour samples/slot instead of ~12 (IMP-1); all other 15m consumers use tail()
+# windows or last-5-swings, so only EMA/ATR warmup and that baseline see the extra bars.
+LIMITS = {"1d": 300, "4h": 300, "1h": 300, "15m": 1000}
 WINDOW_SIZE = {"1d": 14, "4h": 10, "1h": 20, "15m": 30}
 TF_MS = {"1d": 24 * 3600_000, "4h": 4 * 3600_000, "1h": 3600_000, "15m": 15 * 60_000}
 CHART_BARS = {"1d": 90, "4h": 120, "1h": 150, "15m": 180}

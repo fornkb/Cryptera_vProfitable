@@ -108,6 +108,40 @@ StandardError=journal
 WantedBy=multi-user.target
 SERVICEEOF
 
+echo "==> Installing the daily labelling timer (IMP-3)"
+# Labels accrue automatically so the corpus is calibration-ready without operator
+# discipline. label_snapshots only touches snapshots whose 24h horizon is fully in
+# the past, so a once-daily off-peak pass is exactly right (nothing to gain from
+# running it more often). calibrate stays MANUAL on purpose (FA-16): a refit is a
+# reviewed decision that must be followed by `systemctl restart cryptera-monitor`.
+sudo tee /etc/systemd/system/cryptera-label.service > /dev/null << LABELSVCEOF
+[Unit]
+Description=Cryptera daily snapshot labeller (realised TP/SL outcomes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${REPO_DIR}
+ExecStart=${REPO_DIR}/venv/bin/python -m tools.label_snapshots --horizon 24
+User=${CURRENT_USER}
+StandardOutput=journal
+StandardError=journal
+LABELSVCEOF
+
+sudo tee /etc/systemd/system/cryptera-label.timer > /dev/null << LABELTIMEREOF
+[Unit]
+Description=Run the Cryptera snapshot labeller daily (off-peak UTC)
+
+[Timer]
+# 03:10 UTC daily — off-peak, after the day's snapshots have aged past their 24h horizon.
+OnCalendar=*-*-* 03:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+LABELTIMEREOF
+
 sudo systemctl daemon-reload
 
 echo ""
@@ -116,6 +150,9 @@ echo ""
 echo "Next, run a one-off smoke test BEFORE going 24/7:"
 echo "    source venv/bin/activate && python monitor.py --once"
 echo ""
-echo "Once that looks right (check Telegram + 'ls snapshots/'), start the always-on service:"
+echo "Once that looks right (check Telegram + 'ls snapshots/'), start the always-on service"
+echo "and the daily labelling timer:"
 echo "    sudo systemctl enable --now cryptera-monitor"
+echo "    sudo systemctl enable --now cryptera-label.timer"
 echo "    sudo journalctl -u cryptera-monitor -f     # watch it live, Ctrl+C to stop watching"
+echo "    systemctl list-timers cryptera-label.timer # confirm the next labelling run is scheduled"

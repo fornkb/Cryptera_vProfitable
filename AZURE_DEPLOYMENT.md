@@ -200,12 +200,19 @@ running unattended.
 
 ```bash
 sudo systemctl enable --now cryptera-monitor
+sudo systemctl enable --now cryptera-label.timer
 sudo journalctl -u cryptera-monitor -f
 ```
 
 Ctrl+C stops watching the log (the service keeps running). It now runs forever, through
 crashes and reboots, scoring every 15 minutes, saving every snapshot, alerting on
 Telegram.
+
+The `cryptera-label.timer` (IMP-3) fires `tools.label_snapshots --horizon 24` once daily at
+03:10 UTC, so realised TP/SL outcomes accrue automatically -- no operator discipline needed
+to keep the corpus calibration-ready. Confirm it is scheduled with
+`systemctl list-timers cryptera-label.timer`. Calibration itself stays manual on purpose
+(see below).
 
 ---
 
@@ -221,11 +228,13 @@ cd ~/Cryptera-v3 && git pull
 sudo systemctl restart cryptera-monitor
 ```
 
-**Running calibration tools** against the corpus accumulating in `snapshots/`:
+**Running calibration tools** against the corpus accumulating in `snapshots/`. Labelling
+already runs daily via `cryptera-label.timer`, so you normally only need eval + calibrate;
+the manual `label_snapshots` call is there to catch up on demand:
 
 ```bash
 cd ~/Cryptera-v3 && source venv/bin/activate
-python -m tools.label_snapshots --horizon 24
+python -m tools.label_snapshots --horizon 24    # optional -- the timer does this daily
 python -m tools.eval_engine
 python -m tools.calibrate
 ```

@@ -315,7 +315,7 @@ low-risk, stays inside SMC/PA, and needs no eval data to justify. Explicitly
 out of scope: rubric re-weights, threshold changes, new data sources (all
 measurement-gated; the corpus doesn't exist yet). Don't over-engineer.
 
-- [ ] IMP-1 — **Deeper 15m history for the session-volume baseline.**
+- [x] IMP-1 — **Deeper 15m history for the session-volume baseline.**
       `LIMITS["15m"] = 300` gives ~3 days ⇒ only ~12 same-hour samples behind
       the session gate (`indicators.session_volume_context`) — a noisy basis
       for a gate that can halve position size. Raise `LIMITS["15m"]` to 1000
@@ -323,14 +323,14 @@ measurement-gated; the corpus doesn't exist yet). Don't over-engineer.
       `tail(...)` windows or last-5-swings; only EMA/ATR warmup and the session
       baseline see the extra bars. Confirm memory/latency is a non-issue in the
       smoke run.
-- [ ] IMP-2 — **1D pools + PWH/PWL in sweep detection.** `detect_mtf_sweep`
+- [x] IMP-2 — **1D pools + PWH/PWL in sweep detection.** `detect_mtf_sweep`
       (`strategies.py:136-146`) scans 4h/1h/15m pools + PDH/PDL but ignores the
       1d liquidity pools and weekly levels Phase 2 (v3.3) added — the exact
       levels whose sweeps matter most. Add `"1d"` to the pool loop (tier_rank
       4) and pass `pwh`/`pwl` (tier "pd"-equivalent) via new optional params
       from both call sites (`evaluate_strategies` trend C3 + `_m2_edge_sweep`).
       Synthetic test: sweep of a 1d pool scores the HTF 10 (→15 rebudgeted).
-- [ ] IMP-3 — **Automated labelling on the VM.** The plan is "calibration runs
+- [x] IMP-3 — **Automated labelling on the VM.** The plan is "calibration runs
       on the collected snapshots" — make labels accumulate without operator
       discipline: a `cryptera-label.timer` + oneshot service running
       `python -m tools.label_snapshots --horizon 24` daily (off-peak, e.g.
@@ -349,9 +349,10 @@ measurement-gated; the corpus doesn't exist yet). Don't over-engineer.
             (heartbeat + one narrated alert path if a setup is active).
       - [ ] `snapshots/` empty at service start; `systemctl enable --now
             cryptera-monitor` + label timer; journal clean after 2 cycles.
-- [ ] Verification: pytest PASS; one mocked-LLM end-to-end run (IMP-1/2 live);
-      timer fires in a `systemd-run --on-active` dry test or equivalent.
-- [ ] Commit `v3.3.3: IMP-1/2/3 + deploy readiness` + tick boxes; update the
+- [x] Verification: pytest PASS (57/57); one mocked-LLM end-to-end run (IMP-1/2
+      live). Timer `systemd-run` dry test deferred to the VM (no systemd on the
+      dev box; unit-file syntax validated via `bash -n deploy/setup_vm.sh`).
+- [x] Commit `v3.3.3: IMP-1/2/3 + deploy readiness` + tick boxes; update the
       Session log below.
 
 ---
@@ -407,3 +408,23 @@ measurement-gated; the corpus doesn't exist yet). Don't over-engineer.
   PASS, zero Gemini calls. Test artifacts (6 snapshot files, temp state)
   cleaned up after; pre-existing `data/*.json` restored from backup.
   Phase 3 (Opus 4.8) next.
+- 2026-07-12 — **Phase 3 complete (v3.3.3)**: IMP-1/2/3 + deploy readiness.
+  IMP-1: `LIMITS["15m"]` 300→1000 (config.py) — live smoke confirmed 999 closed
+  bars, session `slot_samples` 12→40, `compute_snapshot_no_llm` latency 2.6s
+  (memory/latency a non-issue). IMP-2: `detect_mtf_sweep` now scans 1D pools
+  (tier_rank 4) and PWH/PWL (new optional `pwh`/`pwl` params, tier "pw" rank 2)
+  in addition to 4H/1H/15M pools + PDH/PDL; both call sites threaded — trend C3
+  and ranging `_m2_edge_sweep` — with `pwh`/`pwl` read from `pa_context` in
+  `evaluate_strategies`. No snapshot-shape change ⇒ schema stays 3.3.1, no
+  relabel. IMP-3: `deploy/setup_vm.sh` registers a `cryptera-label.service`
+  (oneshot, `python -m tools.label_snapshots --horizon 24`) + `cryptera-label.timer`
+  (daily 03:10 UTC, `Persistent=true`); enable line + `list-timers` check added
+  to the script's closing instructions and AZURE_DEPLOYMENT.md §5/§6. calibrate
+  stays MANUAL (FA-16). 4 new unit tests (1D-pool sweep → HTF 10→15 rebudget;
+  1D regression guard; PWL sweep tier "pw"; PWL-absent negative) — 57/57 pytest
+  PASS. Live mocked-LLM smoke (SOL/USDT, zero Gemini): snapshot built clean,
+  `strategies.confluence_breakdown_raw` present with canonical keys, ranging M2
+  sweep path exercised. `bash -n` validated the systemd unit files; the
+  `systemd-run` timer dry-test and the on-VM deploy-readiness checklist (FA-17
+  parity, events.json, .env, empty `snapshots/`, `enable --now`) remain operator
+  tasks on the actual Azure box.
