@@ -12,6 +12,13 @@ and record:
   * mfe / mae (pct):     max favourable / adverse excursion vs. entry
   * realized_rr:         (price extreme towards TP - entry) / (entry - sl)
 
+A 15m bar that touches BOTH sl and tp is ambiguous at 15m resolution. Rather than
+blindly assuming the loss, we DRILL into that one bar's 1m candles and replay them
+to see which side was actually hit first (`_resolve_1m`). The pessimistic sl_first
+assumption survives only as the final tiebreak — when 1m data is unavailable or a
+1m bar itself still straddles both. `ambiguous_15m` on the outcome flags that the
+drill happened, so its frequency/impact is auditable.
+
 Forward-scenario contingent setups are labelled the same way under
 `forward_outcome` when their entry/SL/TP are present.
 
@@ -113,14 +120,61 @@ def _fetch_future_candles(symbol: str, since_ms: int, horizon_hours: int):
     return df[df["timestamp"] <= cutoff].reset_index(drop=True)
 
 
-def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame) -> dict:
+def _fetch_1m_window(symbol: str, start_ms: int, minutes: int = 15):
+    """Fetch the `minutes` one-minute candles of a single 15m bar (its open at
+    `start_ms`) so an ambiguous bar that straddled both SL and TP can be resolved
+    at 1m resolution instead of assuming the worst case. Same fapi namespace as
+    everything else (BUG-01). Returns a high/low DataFrame, or None on failure."""
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/klines",
+            params={"symbol": symbol.replace("/", ""), "interval": "1m",
+                    "startTime": start_ms, "limit": minutes + 1},
+            timeout=10,
+        ).json()
+    except Exception as e:
+        print(f"[WARN] 1m drill fetch failed for {symbol} @ {start_ms}: {e}")
+        return None
+    if not isinstance(r, list) or not r:
+        return None
+    # k[2]=high, k[3]=low
+    return pd.DataFrame([[float(k[2]), float(k[3])] for k in r], columns=["high", "low"])
+
+
+def _resolve_1m(df1m, side: str, sl: float, tp: float) -> str:
+    """Given the 1m candles of a 15m bar that straddled BOTH sl and tp, walk them
+    in order and return which was touched first ('tp_first' | 'sl_first'). Falls
+    back to the pessimistic 'sl_first' when 1m data is missing or a single 1m bar
+    itself straddles both (still unknowable — keep the conservative tiebreak)."""
+    if df1m is None or getattr(df1m, "empty", True):
+        return "sl_first"
+    for _, r in df1m.iterrows():
+        hi, lo = float(r["high"]), float(r["low"])
+        if side == "long":
+            sl_hit, tp_hit = lo <= sl, hi >= tp
+        else:
+            sl_hit, tp_hit = hi >= sl, lo <= tp
+        if sl_hit and tp_hit:
+            return "sl_first"   # still ambiguous even at 1m -> worst case
+        if tp_hit:
+            return "tp_first"
+        if sl_hit:
+            return "sl_first"
+    return "sl_first"           # both were seen at 15m, so this is unreachable; be safe
+
+
+def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame,
+               intrabar_resolver=None) -> dict:
     """
     side: 'long' or 'short'.
-    Walk forward bar by bar. A bar that touches BOTH SL and TP is conservatively
-    counted as `sl_first` (assume worst case — pessimistic estimator). A resting
-    limit order also counts as triggered if price gapped THROUGH the entry level
-    between two consecutive closed bars, even though no single bar's [low, high]
-    range contains it (BUG-18 — previously silently under-counted as not-triggered).
+    Walk forward bar by bar. A bar that touches BOTH SL and TP is ambiguous at 15m
+    resolution: if `intrabar_resolver` is supplied (a callable bar_open_ms -> 1m
+    DataFrame) we drill into that bar's 1m candles to decide which was hit first
+    (`_resolve_1m`); otherwise, or if 1m data is unavailable, we fall back to the
+    pessimistic `sl_first`. A resting limit order also counts as triggered if price
+    gapped THROUGH the entry level between two consecutive closed bars, even though
+    no single bar's [low, high] range contains it (BUG-18 — previously silently
+    under-counted as not-triggered).
     """
     if df is None or df.empty:
         return {"triggered": False, "outcome": "no_data"}
@@ -149,6 +203,7 @@ def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame) 
     mae = 0.0
     outcome = "timeout"
     bars_to_close = None
+    ambiguous = False
 
     for i, row in post.iterrows():
         if side == "long":
@@ -167,7 +222,14 @@ def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame) 
             tp_hit = row["low"] <= tp
 
         if sl_hit and tp_hit:
-            outcome = "sl_first"
+            # Both hit in one 15m bar -> order unknowable at 15m. Drill to 1m if we
+            # have a resolver + this bar's open time; else keep the worst-case sl_first.
+            ambiguous = True
+            if intrabar_resolver is not None and "timestamp" in row:
+                bar_open_ms = int(pd.Timestamp(row["timestamp"]).timestamp() * 1000)
+                outcome = _resolve_1m(intrabar_resolver(bar_open_ms), side, sl, tp)
+            else:
+                outcome = "sl_first"
             bars_to_close = i
             break
         if sl_hit:
@@ -192,6 +254,7 @@ def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame) 
         "triggered": True,
         "outcome": outcome,
         "bars_to_close": bars_to_close,
+        "ambiguous_15m": ambiguous,
         "mfe_pct": round(mfe, 3),
         "mae_pct": round(mae, 3),
         "realized_rr": realized_rr,
@@ -240,24 +303,27 @@ def label_snapshot_file(path: str, horizon_hours: int, force: bool):
     # engine_trade is the deterministic geometry — this is what calibration scores
     eng = snapshot.get("engine_trade") or (snapshot.get("strategies") or {}).get("engine_trade") or {}
 
+    # Resolver that drills an ambiguous 15m bar down to its 1m candles (bound to this symbol).
+    resolver = lambda bar_open_ms: _fetch_1m_window(symbol, bar_open_ms)  # noqa: E731
+
     trade_outcome = None
     side = _direction_to_side(td.get("primary", {}).get("direction"))
     if side and td.get("entry") is not None and td.get("stop_loss") is not None and td.get("take_profit") is not None:
         trade_outcome = _label_one(side, float(td["entry"]), float(td["stop_loss"]),
-                                   float(td["take_profit"]), df)
+                                   float(td["take_profit"]), df, resolver)
 
     forward_outcome = None
     fwd_side = _direction_to_side(fwd.get("direction"))
     if fwd_side and fwd.get("entry") is not None and fwd.get("stop_loss") is not None and fwd.get("take_profit") is not None:
         forward_outcome = _label_one(fwd_side, float(fwd["entry"]), float(fwd["stop_loss"]),
-                                     float(fwd["take_profit"]), df)
+                                     float(fwd["take_profit"]), df, resolver)
 
     engine_outcome = None
     eng_side = _direction_to_side(eng.get("direction"))
     if eng.get("valid") and eng_side and eng.get("entry") is not None \
             and eng.get("stop_loss") is not None and eng.get("take_profit") is not None:
         engine_outcome = _label_one(eng_side, float(eng["entry"]), float(eng["stop_loss"]),
-                                    float(eng["take_profit"]), df)
+                                    float(eng["take_profit"]), df, resolver)
 
     snapshot["outcome"] = {
         "labeled_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
