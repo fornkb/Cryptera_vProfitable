@@ -97,6 +97,10 @@ WorkingDirectory=${REPO_DIR}
 # CRYPTERA_NO_CHART_SERIES=1 (FA-15): this headless corpus VM never reads chart_series
 # (only the web dashboard does) -- skipping it drops each snapshot from ~340KB to ~45KB.
 Environment=CRYPTERA_NO_CHART_SERIES=1
+# CRYPTERA_RETENTION=0 (B14.0/I15.0): never prune on the corpus box. The monitor already
+# passes --retention 0; this also protects the process env. Manual CLI/web runs by the
+# operator run OUTSIDE this unit, so put CRYPTERA_RETENTION=0 in the box's .env too.
+Environment=CRYPTERA_RETENTION=0
 ExecStart=${REPO_DIR}/venv/bin/python monitor.py --retention 0 --no-color
 Restart=always
 RestartSec=15

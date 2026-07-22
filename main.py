@@ -1523,10 +1523,39 @@ def finalize_analysis(snapshot_native: dict, analysis: dict) -> dict:
     return _finalize_analysis(analysis, snapshot_native)
 
 
+def _effective_retention(retention: int = None) -> int:
+    """Resolve the per-symbol retention actually applied by a persist.
+
+    Precedence: explicit caller arg (monitor `--retention`, tests) always wins;
+    else a box-level `CRYPTERA_RETENTION` env var; else the engine default.
+
+    B14.0/I15.0: the collector VM must NEVER prune -- but only the monitor passes
+    `--retention 0`. A manual `python main.py` or dashboard `/api/run` on that same
+    box goes through `run_analysis` with `retention=None`, falls to the 1000/symbol
+    default, and silently deletes the corpus. Setting `CRYPTERA_RETENTION=0` in the
+    box environment (.env / systemd unit) makes every entry point on it unlimited.
+    `load_dotenv()` is called lazily (Gemini path only), so consult .env here too so
+    the rail holds on the no-LLM / collect-only paths regardless of call order."""
+    if retention is not None:
+        return retention
+    env = os.environ.get("CRYPTERA_RETENTION")
+    if env is None:
+        load_dotenv()  # idempotent; honors .env on the collector box even if narrate() never ran
+        env = os.environ.get("CRYPTERA_RETENTION")
+    if env is not None and env.strip():
+        try:
+            return int(env)
+        except ValueError:
+            logger.warning("CRYPTERA_RETENTION=%r is not an int; using default %d",
+                           env, SNAPSHOT_RETENTION)
+    return SNAPSHOT_RETENTION
+
+
 def _persist_snapshot(snapshot_native: dict, retention: int = None) -> str:
     """Write a completed snapshot to snapshots/ and enforce per-symbol retention.
 
-    retention: None -> engine default (SNAPSHOT_RETENTION); <=0 -> unlimited (collector mode)."""
+    retention: None -> box env (CRYPTERA_RETENTION) else engine default
+    (SNAPSHOT_RETENTION); <=0 -> unlimited (collector mode). See _effective_retention."""
     symbol = snapshot_native.get("symbol", "UNKNOWN")
     os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
     # UTC filename so the labeler's timestamp parse is timezone-safe (BUG-03)
@@ -1539,7 +1568,7 @@ def _persist_snapshot(snapshot_native: dict, retention: int = None) -> str:
         # dashboard/labeller/eval/calibrate tooling all just parse it).
         json.dump(snapshot_native, f, separators=(",", ":"))
     logger.info(f"Snapshot saved to snapshots/{snapshot_filename}")
-    eff_retention = SNAPSHOT_RETENTION if retention is None else retention
+    eff_retention = _effective_retention(retention)
     # _enforce_snapshot_retention keeps exactly `retention` files -- 0 would mean "keep
     # none" (delete every file just written). <=0 here means "unlimited" instead (collector
     # mode, --retention 0), so skip the prune entirely rather than reinterpreting the value.

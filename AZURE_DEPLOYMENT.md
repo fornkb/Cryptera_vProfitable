@@ -271,6 +271,22 @@ cryptera-v3-rg --name cryptera-v3-vm --size Standard_B2s` (no longer free, ~$30/
 watchlist (~1GB/month). A 32GB disk gives two-plus years of runway; nothing gets silently
 deleted (`--retention 0`, as the service runs, keeps everything).
 
+**Protecting the corpus from manual runs (B14.0/I15.0 — do this on the collector VM).**
+The monitor service keeps everything, but a manual `python main.py SOL/USDT` or a manually
+started web dashboard on the *same box* goes through a different code path that defaults to
+keeping only **1000 snapshots/symbol** — one such run silently deletes every older snapshot
+beyond the newest 1000, irreversibly. To make every entry point on the box unlimited, add
+this line to the VM's `.env` (the engine calls `load_dotenv()`, so all of CLI/web/monitor
+honor it):
+
+```bash
+echo "CRYPTERA_RETENTION=0" >> ~/Cryptera-v3/.env
+```
+
+The systemd unit already sets `CRYPTERA_RETENTION=0` for the service itself, but that env
+does not reach an interactive shell — the `.env` line is what protects operator-run
+commands. (Leave this unset on your dev laptop so local runs still self-prune to 1000.)
+
 **Do I need to expose the Flask web dashboard too?** Not for this (calibration + Telegram
 alerts) -- this plan opens no web port. That's a separate step if you want it later.
 
