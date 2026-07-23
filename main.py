@@ -694,26 +694,18 @@ def _calendar_health(now_ts: float = None, horizon_days: int = EVENT_CALENDAR_ST
 # ---------------- Gemini ---------------- #
 
 GEMINI_SYSTEM_INSTRUCTION = """
-ICT/SMC institutional trade engine. Return a JSON object matching the enforced schema. Signals are computed on CLOSED candles; `live_price` is the current price for distance/trigger context only.
+ICT/SMC institutional trade ADJUDICATOR. The engine has ALREADY computed the setup, its deterministic trade geometry, and its own argument (`engine_case`: thesis / for[] / against[] / vetoes_or_caps / uncertainty). Your job is to ADJUDICATE that setup — agree, improve, or reject it — NOT to invent one. Return a JSON object matching the enforced schema. Signals are computed on CLOSED candles; `live_price` is the current price for distance/trigger context only.
 
 Rules
-1. Use only PRICES present in the snapshot. Never invent levels. Distances/R:R you may compute yourself: every `engine_trade` candidate already carries `dist_from_price_atr` (distance from live price in 15m-ATR units) — prefer it; for other snapshot levels compute the distance when you need it. `atr_context` gives atr_15m/1h/4h and the horizon_hours: reject any target more than a few x atr_1h away as unreachable in-window. `live_vs_close_pct` is how far the forming bar has drifted from the last closed 15m close — if it exceeds ~1 ATR, phrase entry triggers relative to live_price.
-2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier). Echo it into `header.score`; only set `header.score_override` on a specific factual error. `header.action` is decided from the FINAL score in `header.score` (the overridden value when you set `score_override`, else `confluence_score`) — apply the thresholds to THAT number.
-3. TRADE PLAN = SELECT THE BEST REAL CANDIDATE, NEVER INVENT. This is the highest-stakes decision in the output — the score only says *whether*; the candidate you pick decides the actual outcome. Choose deliberately.
-   `strategies.engine_trade` gives a deterministic primary (entry/stop_loss/take_profit/rr) AND a candidate menu in `engine_trade.candidates`. Each candidate carries quality metadata — USE IT to rank, do not just take the nearest:
-     - `candidates.entries[]` {price, source, tf, hvn, zone, confluence, confluence_count} — choose ONE as `trade_decision.entry`
-     - `candidates.stops[]`   {price, source, tf} — choose ONE as `trade_decision.stop_loss`
-     - `candidates.targets[]` {price, source, rr, tf, confluence, confluence_count} — choose targets; `rr` is from the primary entry/SL
-   RANKING RULES (apply in this order):
-     a. Higher `confluence_count` wins — a level where multiple sources stack (e.g. VAH+BSL+POC) is far stronger than an isolated one.
-     b. `hvn: true` order blocks > plain OBs; higher `tf` (4h > 1d > 1h > 15m) levels are more significant — 4h is the anchor of this intraday system; daily/weekly levels (`tf: "1d"`) rank just below it.
-     c. ENTRIES: prefer `zone` matching the trade — `discount` for longs, `premium` for shorts.
-     d. TARGETS: a target sitting just BEFORE a higher-TF level/resistance is safer than one at/through it.
-     e. `rr` is the TIE-BREAKER between otherwise-equal candidates, not the primary filter.
-   Every price you output (entry / stop_loss / take_profit / tp1 / tp2 / move_to_breakeven_at) MUST be a value from these candidate lists or the engine primary. Never output a price not in the snapshot.
-   Default to the engine primary UNLESS a candidate is clearly higher-quality by the rules above. Set `trade_management.selected_from_engine` = true if you echo the primary, false otherwise, and in `selection_rationale` COMPARE your pick against the primary and the next-best candidate ("chose X (confluence 3, HVN) over primary Y because …").
-   `engine_trade.rr` / `rr_passed` is the HONEST structural R:R — the engine never inflates TP to hit 2R. Never move a TP farther out to manufacture R:R: report the honest (possibly sub-2R) number and weigh it in `confidence_pct` instead. Candidate `rr` values are relative to the ENGINE PRIMARY entry/SL — if you select a different entry or stop, recompute `rr.*`, `tp1_rr`/`tp2_rr` and `sl_width_pct` from YOUR chosen levels. If `engine_trade.valid` is false there is no sound structural trade → HOLD.
-   TRADE MANAGEMENT: `tp1` = nearest HIGH-CONFLUENCE target (the first strong stacked level), `tp2` = a farther runner (>= 2R if available); set `tp1_rr`/`tp2_rr` from the candidate's `rr`; `move_to_breakeven_at` = tp1 or a candidate level between entry and tp1; `scale_out` describes the split (e.g. "50% at TP1, move SL to BE, 50% runner to TP2").
+1. Reason from the snapshot only; never invent levels or prices. Every `engine_trade` candidate carries `dist_from_price_atr` (distance from live price in 15m-ATR units) — prefer it. `atr_context` gives atr_15m/1h/4h and horizon_hours: a target more than a few x atr_1h away is unreachable in-window. `live_vs_close_pct` is the forming bar's drift from the last closed 15m close — if it exceeds ~1 ATR, phrase entry triggers relative to live_price.
+2. `strategies.confluence_score` is authoritative (already includes the order-flow modifier); `header.score` and `header.action` are ENGINE-DERIVED after your call — do not try to set them. Only set `header.score_override` on a specific factual error, with a reason.
+3. VERDICT — adjudicate the engine's setup by setting `verdict` to exactly one of AGREE / UPDATE / REJECT. Read `engine_case` first: its `for`/`against` weigh the setup, `vetoes_or_caps` are bounds already applied, `uncertainty` says how much to trust it (win_rate, sample_support, data_degraded).
+   • AGREE — the engine primary IS the trade. Leave entry_id / stop_loss_id / take_profit_id = null (the engine primary is used as-is). You may still set primary.probability / confidence_pct / position_size and trade_management (tp1_id / tp2_id / move_to_breakeven_at_id + scale_out). Use AGREE when the case is sound and no candidate is clearly better.
+   • UPDATE — the highest-VALUE verdict. KEEP the engine's direction (`setup_direction`), but re-select a better level from the candidate MENU by its `level_id`. The menu is `engine_trade.candidates`: entries[] (ids E*), stops[] (S*), targets[] (T*), each with {level_id, price, source, tf, hvn, zone, confluence, confluence_count, dist_from_price_atr, rr}. Put the chosen id in entry_id / stop_loss_id / take_profit_id (and tp1_id / tp2_id / move_to_breakeven_at_id); leave any field you keep from the primary null. Add ONE `update_rationale[]` line per field you change ("stop_loss->S2: beyond the protected 15m swing, tighter than the ATR cap"). You output IDs, NEVER prices — the engine resolves each id to its exact level and re-checks ordering / dead-on-arrival / R:R.
+   • REJECT — decline the setup (→ HOLD) when the case is unsound despite the score: set `reject_reason.code` (breakout_risk | counter_htf_structure | crowding | data_quality | event_risk | poor_rr | other) + a one-line note. Use it when `against`/`vetoes_or_caps` outweigh a thin `for`, or `uncertainty` is high on degraded data.
+   RANK candidates when choosing an UPDATE (in order): higher `confluence_count` wins (VAH+BSL+POC stacked beats an isolated level); `hvn:true` OBs > plain; higher `tf` (4h > 1d > 1h > 15m, 4h is this system's anchor); ENTRIES prefer `zone` matching the trade (discount longs / premium shorts); a TARGET just BEFORE a higher-TF level is safer than one at/through it; candidate `rr` is only the tie-breaker. Default to AGREE unless a candidate is clearly higher-quality or `engine_case` reveals a reason to REJECT — free-price invention is structurally impossible, every level you can pick is a real id in the menu.
+   `engine_trade.rr`/`rr_passed` is the HONEST structural R:R — the engine never inflates TP to hit 2R, and neither do you; weigh a sub-2R number in `confidence_pct` instead. If `engine_trade.valid` is false there is no sound trade → REJECT/HOLD.
+   TRADE MANAGEMENT: `tp1_id` = nearest HIGH-CONFLUENCE target, `tp2_id` = a farther runner (>= 2R if available); `move_to_breakeven_at_id` = tp1 or a target between entry and tp1; `scale_out` describes the split ("50% at TP1, SL to BE, 50% runner to TP2"). `selected_from_engine` is derived by the engine; `selection_rationale` should COMPARE your pick against the primary.
 
 Regime-conditional scoring — read `strategies.score_mode` (context for narrative/reasoning;
 header.score_breakdown is filled by the engine, not by you):
@@ -749,12 +741,13 @@ Gates
  cvd_absorption_warning       → reduce confidence by 10; cite explicitly
  setup_direction == "neutral" → HOLD (no clean setup)
 
-Action-specific filling
- HOLD               → trade_decision entry/stop_loss/take_profit/rr.* and all trade_management price fields = null; selected_from_engine=true, scale_out="n/a". Forward scenario filled.
- CONDITIONAL_ENTRY  → select levels from engine_trade.candidates; entry_trigger states the exact required condition; fill trade_management.
- ACTIVE_TRADE       → select levels from engine_trade.candidates (never invent a TP); fill trade_management with tp1/tp2 + BE + scale_out.
+Verdict-specific filling (the engine gate/action are applied AFTER your call)
+ REJECT             → set reject_reason; leave all *_id null and entry_trigger="n/a". The engine nulls trade fields → HOLD.
+ AGREE              → *_id null (engine primary used); fill trade_management ids + scale_out; entry_trigger states the exact required condition when the engine action is CONDITIONAL_ENTRY.
+ UPDATE             → set the *_id fields you are changing + one update_rationale[] line each; fill trade_management ids + BE + scale_out.
 
 Field definitions
+ verdict : AGREE (engine primary is the trade) · UPDATE (keep direction, re-select levels by id) · REJECT (decline → HOLD).
  header.bias : the engine's directional read — `setup_direction` uppercased when not neutral, else `trend_bias`; NEUTRAL only when both are neutral.
  primary.probability : when `strategies.empirical_win_rate` is non-null, anchor to it; otherwise your calibrated estimate from score + confluence quality (0-100).
  confidence_pct : conviction in the overall read. Start near primary.probability, then apply the gate reductions above (event −15, cvd_absorption −10) and reduce for sub-2R geometry or counter-structure trades.
@@ -782,6 +775,19 @@ _STR_ARR = {"type": "array", "items": _STR}
 GEMINI_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
+        # I1.0 adjudicator verdict. UPDATE is the valued path (keep the engine's direction,
+        # re-select levels by candidate level_id); REJECT declines -> HOLD.
+        "verdict": {"type": "string", "enum": ["AGREE", "UPDATE", "REJECT"]},
+        "reject_reason": {
+            "type": "object",
+            "nullable": True,
+            "properties": {
+                "code": {"type": "string",
+                         "enum": ["breakout_risk", "counter_htf_structure", "crowding",
+                                  "data_quality", "event_risk", "poor_rr", "other"]},
+                "note": _STR,
+            },
+        },
         "header": {
             "type": "object",
             "properties": {
@@ -851,6 +857,14 @@ GEMINI_RESPONSE_SCHEMA = {
                     },
                     "required": ["direction", "probability", "trigger"],
                 },
+                # I1.0 selection is BY level_id (E*/S*/T* from engine_trade.candidates); the
+                # engine resolves each id -> its exact price. Numeric entry/stop/tp are
+                # engine-owned OUTPUT (the validator overwrites them from the resolved id or
+                # the primary) -- leave them null under UPDATE/AGREE.
+                "entry_id": {"type": "string", "nullable": True},
+                "stop_loss_id": {"type": "string", "nullable": True},
+                "take_profit_id": {"type": "string", "nullable": True},
+                "update_rationale": _STR_ARR,   # one line per level changed under UPDATE
                 "entry": _NUM_NULL,
                 "entry_source": _STR,
                 "stop_loss": _NUM_NULL,
@@ -881,6 +895,10 @@ GEMINI_RESPONSE_SCHEMA = {
                     "properties": {
                         "selected_from_engine": _BOOL,
                         "selection_rationale": _STR,
+                        # id-based tp selection (E*/S*/T*); numeric tp1/tp2 are engine output.
+                        "tp1_id": {"type": "string", "nullable": True},
+                        "tp2_id": {"type": "string", "nullable": True},
+                        "move_to_breakeven_at_id": {"type": "string", "nullable": True},
                         "tp1": _NUM_NULL,
                         "tp1_source": _STR,
                         "tp1_rr": _NUM_NULL,
@@ -891,6 +909,7 @@ GEMINI_RESPONSE_SCHEMA = {
                         "scale_out": _STR,
                     },
                     "required": ["selected_from_engine", "selection_rationale",
+                                 "tp1_id", "tp2_id", "move_to_breakeven_at_id",
                                  "tp1", "tp1_source", "tp1_rr", "tp2", "tp2_source", "tp2_rr",
                                  "move_to_breakeven_at", "scale_out"],
                 },
@@ -905,7 +924,9 @@ GEMINI_RESPONSE_SCHEMA = {
                     "required": ["structure", "liquidity", "momentum", "sentiment"],
                 },
             },
-            "required": ["primary", "alternative", "entry", "entry_source",
+            "required": ["primary", "alternative",
+                         "entry_id", "stop_loss_id", "take_profit_id", "update_rationale",
+                         "entry", "entry_source",
                          "stop_loss", "stop_loss_source", "take_profit", "take_profit_source",
                          "rr", "sl_width_pct", "confidence_pct", "position_size",
                          "entry_trigger", "invalidation", "counter_structure",
@@ -932,7 +953,8 @@ GEMINI_RESPONSE_SCHEMA = {
                          "take_profit", "rr", "volume_condition", "supporting_confluence"],
         },
     },
-    "required": ["header", "mtf_context", "narrative", "trade_decision", "forward_scenario"],
+    "required": ["verdict", "header", "mtf_context", "narrative", "trade_decision",
+                 "forward_scenario"],
 }
 
 

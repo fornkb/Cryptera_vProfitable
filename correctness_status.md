@@ -102,8 +102,17 @@ independent of the labeler); B1.0 is the measurement ground truth.
       `_data_degraded` flags missing orderbook/funding/OI/cvd-proxy. Injected into
       `_build_llm_view`. The system-instruction rewrite that consumes it rides with schema v2.
       `test_engine_case.py` (9). 159/159.
-- [ ] Schema v2 AGREE/UPDATE/REJECT + `level_id` resolution in the validator; `by_verdict`
-      eval; shadow rollout.
+- [x] **Schema v2 verdict + `level_id` resolution** — `GEMINI_RESPONSE_SCHEMA` gains
+      `verdict` (AGREE|UPDATE|REJECT, required), `reject_reason{code,note}`, trade_decision
+      `entry_id/stop_loss_id/take_profit_id`+`update_rationale[]`, and tm
+      `tp1_id/tp2_id/move_to_breakeven_at_id`; system instruction rewritten as an
+      adjudicator contract that consumes `engine_case` and selects by id. `trade_validation`
+      now branches on verdict: AGREE→engine primary; UPDATE→resolve ids→exact price (null id
+      keeps primary, off-menu id reverts+records); REJECT→HOLD (overrides the engine gate) +
+      validated `reject_reason`. `header.action` is engine-derived (REJECT→HOLD). Absent
+      verdict = legacy tolerance path (nothing regresses). `test_trade_validation.py` +8 (18).
+      167/167.
+- [ ] `by_verdict` eval (paired AGREE/UPDATE vs engine primary); shadow rollout.
 
 ## Wave 3 — structure & menus (semantics-changing; land before collection restarts)
 
@@ -167,3 +176,8 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - 2026-07-23 — **Wave 2 `engine_case` block landed** (`main.py`). `_build_engine_case`
   builds thesis/for/against/vetoes_or_caps/uncertainty from data the engine already computes;
   attached to the LLM view. New `test_engine_case.py` (9). 159/159.
+- 2026-07-23 — **Wave 2 schema v2 verdict + level_id resolution landed** (`main.py`,
+  `trade_validation.py`). AGREE/UPDATE/REJECT contract; UPDATE re-selects candidates by
+  level_id (engine resolves id→exact price, killing float-tolerance guessing); REJECT→HOLD
+  overrides the engine gate; system-instruction adjudicator rewrite consuming engine_case.
+  `test_trade_validation.py` +8 (18 total). 167/167.

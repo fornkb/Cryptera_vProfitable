@@ -15,9 +15,12 @@ def _snap(score=70, gate="CLEAR", setup_direction="bullish", valid=True, event=F
         "entry": entry, "stop_loss": sl, "take_profit": tp, "rr": 2.4,
         "entry_source": "OB mid", "stop_loss_source": "swing", "take_profit_source": "BSL",
         "candidates": {
-            "entries": [{"price": entry, "source": "OB mid"}, {"price": 99.0, "source": "FVG"}],
-            "stops": [{"price": sl, "source": "swing"}],
-            "targets": [{"price": tp, "source": "BSL"}, {"price": 108.0, "source": "POC"}],
+            "entries": [{"price": entry, "source": "OB mid", "level_id": "E1"},
+                        {"price": 99.0, "source": "FVG", "level_id": "E2"}],
+            "stops": [{"price": sl, "source": "swing", "level_id": "S1"},
+                      {"price": 94.0, "source": "DR low", "level_id": "S2"}],
+            "targets": [{"price": tp, "source": "BSL", "level_id": "T1"},
+                        {"price": 108.0, "source": "POC", "level_id": "T2"}],
         },
     }
     return {
@@ -143,3 +146,88 @@ def test_clean_echo_has_no_violations():
 def test_error_analysis_passes_through_untouched():
     a, v = validate_and_normalize_analysis({"error": "gemini failed"}, _snap())
     assert a == {"error": "gemini failed"} and v == []
+
+
+# ---------------- I1.0 schema v2: verdict + level_id resolution ---------------- #
+
+def _v2(verdict, entry_id=None, stop_loss_id=None, take_profit_id=None,
+        reject_reason=None, entry=None, sl=None, tp=None):
+    a = _analysis(entry=entry if entry is not None else 100.0,
+                  sl=sl if sl is not None else 95.0,
+                  tp=tp if tp is not None else 112.0)
+    a["verdict"] = verdict
+    if reject_reason is not None:
+        a["reject_reason"] = reject_reason
+    td = a["trade_decision"]
+    td["entry_id"], td["stop_loss_id"], td["take_profit_id"] = entry_id, stop_loss_id, take_profit_id
+    return a
+
+
+def test_agree_forces_engine_primary_ignoring_model_prices():
+    # model wrote off-menu prices but verdict AGREE -> engine primary wins, no price violation
+    a = _v2("AGREE", entry=123.45, sl=1.0, tp=999.0)
+    a, v = validate_and_normalize_analysis(a, _snap(entry=100.0, sl=95.0, tp=112.0))
+    td = a["trade_decision"]
+    assert (td["entry"], td["stop_loss"], td["take_profit"]) == (100.0, 95.0, 112.0)
+    assert td["trade_management"]["selected_from_engine"] is True
+    assert "trade_decision.entry" not in v          # AGREE path never tolerance-matches
+
+
+def test_update_resolves_entry_id_to_candidate_price():
+    a = _v2("UPDATE", entry_id="E2")                # E2 -> 99.0, others null -> keep primary
+    a, v = validate_and_normalize_analysis(a, _snap(entry=100.0))
+    td = a["trade_decision"]
+    assert td["entry"] == 99.0 and td["stop_loss"] == 95.0 and td["take_profit"] == 112.0
+    assert td["entry_source"] == "FVG"              # source pulled from the resolved candidate
+    assert td["trade_management"]["selected_from_engine"] is False
+    # the id resolution + geometry are clean (the selected_from_engine correction is expected:
+    # the fixture claimed True, the UPDATE made it False).
+    assert not [x for x in v if "_id" in x or x.endswith(".geometry")]
+
+
+def test_update_null_ids_keep_primary_without_violation():
+    a = _v2("UPDATE")                               # all ids null -> full primary
+    a, v = validate_and_normalize_analysis(a, _snap(entry=100.0))
+    td = a["trade_decision"]
+    assert (td["entry"], td["stop_loss"], td["take_profit"]) == (100.0, 95.0, 112.0)
+    assert td["trade_management"]["selected_from_engine"] is True
+    assert not [x for x in v if x.startswith("trade_")]
+
+
+def test_update_unresolvable_id_reverts_field_and_records():
+    a = _v2("UPDATE", stop_loss_id="S9")            # not in the menu
+    a, v = validate_and_normalize_analysis(a, _snap(sl=95.0))
+    assert a["trade_decision"]["stop_loss"] == 95.0
+    assert "trade_decision.stop_loss_id" in v
+
+
+def test_update_tp_management_by_id():
+    a = _v2("UPDATE")
+    a["trade_decision"]["trade_management"]["tp1_id"] = "T2"     # -> 108.0
+    a, v = validate_and_normalize_analysis(a, _snap(entry=100.0, sl=95.0))
+    tm = a["trade_decision"]["trade_management"]
+    assert tm["tp1"] == 108.0 and tm["tp1_source"] == "POC"
+    assert tm["tp1_rr"] == round(abs(108.0 - 100.0) / 5.0, 2)
+
+
+def test_reject_forces_hold_over_active_engine():
+    a = _v2("REJECT", reject_reason={"code": "crowding", "note": "OI building against"})
+    a, v = validate_and_normalize_analysis(a, _snap(score=80))   # engine would call ACTIVE
+    assert a["header"]["action"] == "HOLD"
+    td = a["trade_decision"]
+    assert td["entry"] is None and td["primary"]["direction"] == "HOLD"
+    assert a["reject_reason"] == {"code": "crowding", "note": "OI building against"}
+
+
+def test_reject_invalid_reason_coerced_to_other():
+    a = _v2("REJECT", reject_reason={"code": "vibes", "note": "n"})
+    a, v = validate_and_normalize_analysis(a, _snap(score=80))
+    assert a["reject_reason"]["code"] == "other" and "reject_reason" in v
+
+
+def test_update_direction_still_forced_to_engine():
+    a = _v2("UPDATE", entry_id="E2")
+    a["trade_decision"]["primary"]["direction"] = "SELL"
+    a, v = validate_and_normalize_analysis(a, _snap(setup_direction="bullish"))
+    assert a["trade_decision"]["primary"]["direction"] == "BUY"
+    assert "trade_decision.primary.direction" in v
