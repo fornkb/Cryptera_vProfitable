@@ -622,6 +622,61 @@ def get_premium_discount(swing_high, swing_low, current_price, leg_direction="bu
     }
 
 
+def _latest_event(bos, choch):
+    """Whichever structural event broke most recently (they are now distinct events)."""
+    cands = []
+    if (bos or {}).get("break_idx") is not None:
+        cands.append(("BOS", bos))
+    if (choch or {}).get("break_idx") is not None and (choch or {}).get("detected"):
+        cands.append(("CHOCH", choch))
+    if not cands:
+        return None, None
+    kind, ev = max(cands, key=lambda c: c[1]["break_idx"])
+    return kind, ev
+
+
+def impulse_leg_ote(df, bos, choch, current_price):
+    """
+    OTE on the IMPULSE LEG that produced the last structural break (I6.0 / B9.0).
+
+    OTE belongs to the leg that did the breaking — impulse origin swing -> the extreme
+    that leg has reached — not to "whichever confirmed swings happen to bracket price".
+    The old implementation drew it on the dealing range, whose `leg_direction` was taken
+    from the latest confirmed swing and survived re-bracketing, so after a breakdown the
+    band could be drawn as a pullback-to-BUY zone inside what was now a bearish leg.
+
+    A retracement past 100% is not a retracement: once price trades back through the
+    impulse origin the leg is void and there is no OTE. Returns None when no event, no
+    origin, or a violated leg — the caller then reports no OTE rather than guessing.
+    """
+    kind, ev = _latest_event(bos, choch)
+    if not ev or ev.get("origin_price") is None or df is None or df.empty:
+        return None
+    origin_idx = ev.get("origin_idx")
+    direction = (ev.get("direction") or "").upper()
+    if origin_idx is None or direction not in ("BULLISH", "BEARISH"):
+        return None
+
+    origin = float(ev["origin_price"])
+    if direction == "BULLISH":
+        extreme = float(df["high"].iloc[origin_idx:].max())
+        if current_price is not None and current_price <= origin:
+            return None                     # leg fully retraced -> void
+        hi, lo, leg = extreme, origin, "bullish"
+    else:
+        extreme = float(df["low"].iloc[origin_idx:].min())
+        if current_price is not None and current_price >= origin:
+            return None
+        hi, lo, leg = origin, extreme, "bearish"
+    if hi <= lo:
+        return None
+
+    band = get_premium_discount(hi, lo, current_price, leg_direction=leg)
+    band["leg_source"] = f"{kind.lower()}_impulse"
+    band["leg_high"], band["leg_low"] = round(hi, 6), round(lo, 6)
+    return band
+
+
 def _current_dealing_range(confirmed_highs, confirmed_lows, current_price=None):
     """
     Most recent dealing range that BRACKETS current price (BUG-09). Start from the
@@ -649,13 +704,24 @@ def _current_dealing_range(confirmed_highs, confirmed_lows, current_price=None):
 
     brackets = True
     if current_price is not None and not (lo <= current_price <= hi):
-        highs_above = [h["price"] for h in confirmed_highs if h["price"] >= current_price]
-        lows_below = [l["price"] for l in confirmed_lows if l["price"] <= current_price]
+        highs_above = [h for h in confirmed_highs if h["price"] >= current_price]
+        lows_below = [l for l in confirmed_lows if l["price"] <= current_price]
         if highs_above:
-            hi = min(highs_above)          # nearest confirmed resistance above price
+            hi_swing = min(highs_above, key=lambda h: h["price"])
+            hi = hi_swing["price"]         # nearest confirmed resistance above price
         if lows_below:
-            lo = max(lows_below)           # nearest confirmed support below price
+            lo_swing = max(lows_below, key=lambda l: l["price"])
+            lo = lo_swing["price"]         # nearest confirmed support below price
         brackets = bool(highs_above and lows_below and lo <= current_price <= hi)
+        # B9.0: `leg` was pinned to the LATEST confirmed swings and survived the
+        # re-bracket walk, so a re-bracketed range kept the pre-breakout leg direction
+        # (verified: highs [100,105], lows [95,98], price 96 -> range [95,100] labelled
+        # bullish). Re-derive it from the swings actually chosen; when price is beyond
+        # all confirmed structure there is no leg to speak of.
+        if highs_above and lows_below:
+            leg = "bullish" if hi_swing["ts"] >= lo_swing["ts"] else "bearish"
+        else:
+            leg = None
     return hi, lo, leg, brackets
 
 
@@ -692,12 +758,25 @@ def build_smc_context(df_4h, df_1h, df_15m, df_1d=None, value_areas: dict = None
 
         dealing_high, dealing_low, leg_dir, brackets = _current_dealing_range(
             confirmed_highs, confirmed_lows, current_price=current_price)
+
+        # I6.0: premium/discount stays on the bracketing dealing range (that is what the
+        # zone means), but OTE is drawn on the impulse leg of the last structural break.
         if dealing_high is not None and dealing_low is not None:
             pd_zone = get_premium_discount(dealing_high, dealing_low, current_price,
                                            leg_direction=leg_dir or "bullish")
+            pd_zone["leg_source"] = "dealing_range"
         else:
-            pd_zone = {"zone": "neutral", "in_ote": False,
-                       "ote_zone": {"low": 0, "high": 0}, "leg_direction": None}
+            pd_zone = {"zone": "neutral", "in_ote": False, "ote_zone": {"low": 0, "high": 0},
+                       "leg_direction": None, "leg_source": None}
+        impulse = impulse_leg_ote(df, bos, choch, current_price)
+        if impulse is not None:
+            pd_zone.update({k: impulse[k] for k in
+                            ("ote_zone", "in_ote", "leg_direction", "leg_source",
+                             "leg_high", "leg_low")})
+        elif leg_dir is None or not brackets:
+            # no impulse leg AND no honest dealing-range leg -> no OTE, not a guess
+            pd_zone.update({"ote_zone": {"low": 0, "high": 0}, "in_ote": False,
+                            "leg_direction": None, "leg_source": None})
 
         dev_h, dev_l = find_developing_swings(df)
 

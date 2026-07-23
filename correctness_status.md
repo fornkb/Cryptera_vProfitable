@@ -163,7 +163,16 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
       disqualifying M6 after `fresh` ages out). New `test_regime_router.py` (21). 204/204.
 - [ ] **I4.0** sequential setup detectors + expiry (absorbs rest of B2.0/B18.0).
 - [ ] **I5.0** typed liquidity & sweep quality (B12.0).
-- [ ] **I6.0** OTE anchored to displacement leg (B9.0).
+- [x] **I6.0** — `smc.impulse_leg_ote` draws OTE on the impulse leg of the LAST structural
+      break (`_latest_event` → origin swing → the extreme that leg reached), records
+      `leg_source` (`bos_impulse`/`choch_impulse`/`dealing_range`), and returns nothing when
+      the leg has been retraced past 100% (void, not inverted). Premium/discount stays on the
+      bracketing dealing range. **B9.0**: `_current_dealing_range` re-derives `leg` from the
+      swings the re-bracket walk actually chose (it was pinned to the latest confirmed swing
+      and survived re-bracketing, so a breakdown kept a bullish leg label) and reports
+      `leg=None` when price is beyond all confirmed structure → no OTE rather than a guess.
+      New `test_ote_leg.py` (8, incl. the audit's verified 100/105/95/98 case + a mirrored
+      bearish leg). 212/212.
 - [ ] **I7.0** candidate-first geometry & menu enrichment (B11.0/B19.0).
 - [x] **B17.0** — `_dedup_plateau` collapses a run of equal extremes inside one fractal
       half-window to its LAST bar (a flat stretch is one pivot, not N); `fractal_swing_mask`
@@ -251,3 +260,6 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
   `no_trade` score mode, B8.0 counter-CHoCH cap + displacement consumption.
   New `test_regime_router.py` (21). 204/204. **Expect a large drop in trade frequency —
   that is the intended effect; measure quality-per-trade on the clean corpus in Wave 4.**
+- 2026-07-24 — **Wave 3 I6.0 + B9.0 landed** (`smc.py`, `main.py`). OTE moved onto the
+  impulse leg of the last break with `leg_source`; re-bracketed dealing range re-derives its
+  leg and reports none when price is outside all structure. New `test_ote_leg.py` (8). 212/212.

@@ -733,7 +733,9 @@ TRANSITION (a change of character has broken the protected swing and the new dir
 yet confirmed — treat continuation setups there as unproven), or a raw swing progression when
 neither. `bos` and `choch` are mutually exclusive per break; `bos.displacement` is certified
 inside the breaking impulse only. `structure_state.protected_high/protected_low` are the levels
-whose break would change character — the natural invalidation anchors.
+whose break would change character — the natural invalidation anchors. `premium_discount.zone`
+is measured on the bracketing dealing range; `ote_zone`/`in_ote` are drawn on the impulse leg of
+the last break (`leg_source`), and are absent when that leg has been fully retraced.
 
 HTF draws: `smc_context.1d` gives daily structure/BOS and daily liquidity pools; `price_action`
 carries `pwh`/`pwl` (previous-week high/low), `weekly_open`, and `untested_pocs_1d`. These are the
@@ -1271,6 +1273,12 @@ def _build_llm_view(snapshot: dict) -> dict:
             ctx["choch"] = None
         # I3.0: `state`/`trend` are fully encoded by the `structure` label; keep only the
         # protected levels (invalidation anchors) plus transition detail when it applies.
+        pdz = ctx.get("premium_discount")
+        if isinstance(pdz, dict):
+            # I6.0: the OTE band itself is the actionable part; the raw leg bounds are
+            # already implied by it and by the levels menu.
+            pdz.pop("leg_high", None)
+            pdz.pop("leg_low", None)
         ss = ctx.get("structure_state")
         if isinstance(ss, dict):
             ss.pop("state", None)
