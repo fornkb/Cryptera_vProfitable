@@ -193,7 +193,8 @@ def regime_bucket(regime: str) -> str:
     return "ranging" if ("Ranging" in r or "Sideways" in r) else "trending"
 
 
-def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int = 2):
+def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int = 2,
+                                   bar_id=None):
     """
     Pure hysteresis over the RUBRIC bucket (trending vs ranging). A rubric flip is
     the most expensive kind of regime noise (it changes trade-direction logic), so
@@ -202,27 +203,45 @@ def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int
     (e.g. Trending Bullish -> Trending Bearish) apply immediately. IO-free so it
     unit-tests without disk; the caller persists `new_state` keyed by symbol.
 
-    prior_state: {"effective","candidate","candidate_runs"} (or {} on first run).
+    B16.0: hysteresis must advance on new MARKET information (a new closed 15m bar),
+    not per invocation. `bar_id` is the last-closed-15m-bar open ms; re-processing the
+    same bar (service restart, --once smoke run, a CLI run alongside the monitor) is
+    idempotent — it returns the prior state without advancing `candidate_runs`, so two
+    calls inside one bar can no longer flip the rubric with no new data.
+
+    prior_state: {"effective","candidate","candidate_runs","last_bar_id"} (or {} first).
     Returns (effective_regime, new_state).
     """
-    effective = (prior_state or {}).get("effective")
+    prior = prior_state or {}
+    effective = prior.get("effective")
+
+    if bar_id is not None and effective and prior.get("last_bar_id") == bar_id:
+        # same closed bar already processed -> no new information, replay prior state
+        return effective, {"effective": effective, "candidate": prior.get("candidate"),
+                           "candidate_runs": int(prior.get("candidate_runs", 0) or 0),
+                           "last_bar_id": bar_id}
+
     if not effective:
-        return raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
-
-    if regime_bucket(raw_regime) == regime_bucket(effective):
+        eff, state = raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
+    elif regime_bucket(raw_regime) == regime_bucket(effective):
         # same rubric -> accept immediately (picks up direction changes too)
-        return raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
-
-    # candidate is in the opposite rubric bucket
-    prev_cand = (prior_state or {}).get("candidate")
-    cand_runs = int((prior_state or {}).get("candidate_runs", 0) or 0)
-    if prev_cand is not None and regime_bucket(prev_cand) == regime_bucket(raw_regime):
-        cand_runs += 1
+        eff, state = raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
     else:
-        cand_runs = 1
-    if cand_runs >= runs:
-        return raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
-    return effective, {"effective": effective, "candidate": raw_regime, "candidate_runs": cand_runs}
+        # candidate is in the opposite rubric bucket
+        prev_cand = prior.get("candidate")
+        cand_runs = int(prior.get("candidate_runs", 0) or 0)
+        if prev_cand is not None and regime_bucket(prev_cand) == regime_bucket(raw_regime):
+            cand_runs += 1
+        else:
+            cand_runs = 1
+        if cand_runs >= runs:
+            eff, state = raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
+        else:
+            eff, state = effective, {"effective": effective, "candidate": raw_regime,
+                                     "candidate_runs": cand_runs}
+
+    state["last_bar_id"] = bar_id
+    return eff, state
 
 
 # ---------------- session-aware volume + ICT kill zones ---------------- #

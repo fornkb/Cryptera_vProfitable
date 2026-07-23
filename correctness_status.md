@@ -39,8 +39,10 @@ independent of the labeler); B1.0 is the measurement ground truth.
       `resolution_used`/`bars_to_fill`; emits `end_rr` (B4.0 hook). `eval_engine` given an
       `intrabar_unknown` bucket (kept out of timeouts). 24 labeler tests + 88/88 suite.
       Relabel note: label_version bumped → old labels not poolable (corpus archived anyway).
-- [ ] **B2.0** — MR outside-value invalidation + sign-aware `_m1_edge_distance` + universal
-      DOA guard in `compute_trade_geometry`.
+- [x] **B2.0** — `_is_naked_breakout` (OUT_TOL, unless sweep+reclaim) invalidates breakout
+      fades in the MR orchestration; `_m1_edge_distance` sign-aware (0 outside the edge
+      unless reclaim-confirmed); universal DOA guard in `compute_trade_geometry` (reject when
+      live price has already breached the stop). Sequential MR (raid→MSS→return) stays I4.0.
 - [ ] **B3.0 / I2.0** — deterministic `validate_and_normalize_analysis` after every model
       response (price/ID membership, gates recomputed engine-side, DOA, HOLD-null,
       `selected_from_engine` derived, `contract_violations[]`).
@@ -55,7 +57,10 @@ independent of the labeler); B1.0 is the measurement ground truth.
       both-neutral → 0, aligned → ADX tiering. Prompt already frames C1 on "agreement".
 - [ ] **B15.0** — eval integrity: engine universe reads `strategies.*`; bucket by
       `setup_direction`; realized-R expectancy.
-- [ ] **B16.0** — hysteresis keyed by `(symbol, last_closed_15m_bar_open_ms)` (bar-idempotent).
+- [x] **B16.0** — `compute_regime_with_hysteresis` takes `bar_id`; re-processing one closed
+      15m bar is idempotent (`last_bar_id`), so restarts/`--once`/CLI-alongside-monitor can't
+      advance the flip counter with no new data. `apply_regime_hysteresis` + call site pass it.
+      (4-state transition router stays I3.0.)
 - [x] Rider **B25.0** — labeler now writes compact (`separators=(",",":")`) instead of
       `indent=2`, done as part of B1.0's `label_snapshot_file`.
 - [ ] Riders: **B26.0** (ab_thinking canonical replay), **B27.0** (funding interval inference).
@@ -102,4 +107,7 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - 2026-07-23 — **Wave 1 B5.0 + B6.0 + B13.0 landed** (`strategies.py` scoring). Bias-relative
   RSI slope, shared OB/FVG `_zone_distance`, C1 conflict→0/partial→5. New
   `tests/test_scoring_directional.py` establishes the mirror-property pattern. 98/98 tests.
-  Next: B2.0 (MR breakout-fade + DOA guard), then B16.0, B10.0, B3.0/I2.0, B4.0, B15.0.
+- 2026-07-23 — **Wave 1 B2.0 + B16.0 landed** (`strategies.py` MR + geometry, `indicators.py`
+  /`main.py` hysteresis). `_is_naked_breakout` + sign-aware M1 + universal DOA guard;
+  bar-keyed idempotent hysteresis. New `tests/test_mr_and_regime.py`. 111/111 tests.
+  Remaining Wave 1: B10.0, B3.0/I2.0, B4.0, B15.0, riders B26/B27.

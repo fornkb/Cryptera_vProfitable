@@ -385,16 +385,19 @@ def _write_json_file(path, obj):
         logger.warning(f"Failed to persist {os.path.basename(path)}: {e}")
 
 
-def apply_regime_hysteresis(symbol: str, raw_regime: str) -> str:
+def apply_regime_hysteresis(symbol: str, raw_regime: str, bar_id=None) -> str:
     """
     Persist per-symbol regime state and gate rubric flips through
     compute_regime_with_hysteresis (BUG-08). Direction changes within a rubric
     bucket apply immediately; trend<->range flips need REGIME_HYSTERESIS_RUNS
-    consecutive raw runs. Returns the effective regime to score with.
+    consecutive raw runs. `bar_id` (last-closed-15m open ms) makes re-processing
+    one bar idempotent so restarts/CLI runs can't double-count (B16.0). Returns the
+    effective regime to score with.
     """
     state = _read_json_file(REGIME_STATE_PATH, {})
     prior = state.get(symbol) or {}
-    effective, new_state = compute_regime_with_hysteresis(raw_regime, prior, runs=REGIME_HYSTERESIS_RUNS)
+    effective, new_state = compute_regime_with_hysteresis(
+        raw_regime, prior, runs=REGIME_HYSTERESIS_RUNS, bar_id=bar_id)
     new_state["updated"] = int(time.time())
     state[symbol] = new_state
     _write_json_file(REGIME_STATE_PATH, state)
@@ -1442,9 +1445,15 @@ async def compute_snapshot_no_llm(symbol: str) -> tuple[dict, dict]:
     # Volatility regimes per TF
     vol_regime = {tf: detect_volatility_regime(data[tf]) for tf in data}
 
-    # Global regime (SMC-driven) with cross-run hysteresis on the rubric (BUG-08)
+    # Global regime (SMC-driven) with cross-run hysteresis on the rubric (BUG-08),
+    # keyed by the last-closed 15m bar so a restart/CLI re-run within one bar is
+    # idempotent and can't advance the flip counter with no new data (B16.0).
     raw_regime = detect_regime(data["4h"], data["1h"], data["15m"], smc_context=smc_context)
-    regime = apply_regime_hysteresis(symbol, raw_regime)
+    try:
+        bar_id = int(data["15m"]["timestamp"].iloc[-1].value // 1_000_000)
+    except Exception:
+        bar_id = None
+    regime = apply_regime_hysteresis(symbol, raw_regime, bar_id)
 
     # 1H Supertrend pulled out for the dashboard pill
     latest_1h = data["1h"].iloc[-1]

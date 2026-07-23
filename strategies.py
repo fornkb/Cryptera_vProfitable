@@ -387,10 +387,37 @@ def _mr_setup(price, pa_context, smc_context):
     return None, None, va
 
 
-def _m1_edge_distance(price, edge, va):
+def _is_naked_breakout(mr_dir, price, va, atr_1h, reclaimed) -> bool:
+    """B2.0: True when price has broken OUT of the value area beyond a tolerance with NO
+    sweep+reclaim — i.e. an accepted breakout, not a fade. `_mr_setup` returns a fade on
+    location alone; this is the missing outer bound. A FAILED breakout (sweep+reclaim of
+    the edge, `reclaimed`) is the legitimate fade trigger and survives.
+    OUT_TOL = max(0.25*ATR_1h, 0.1*span)."""
+    if mr_dir is None or reclaimed:
+        return False
+    vah, val = (va or {}).get("vah"), (va or {}).get("val")
+    if not vah or not val or vah <= val:
+        return False
+    out_tol = max(0.25 * (atr_1h or 0.0), 0.1 * (vah - val))
+    if mr_dir == "bearish":
+        return price > vah + out_tol
+    if mr_dir == "bullish":
+        return price < val - out_tol
+    return False
+
+
+def _m1_edge_distance(price, edge, va, mr_dir=None, reclaimed=False):
     if not edge or not va or va.get("vah", 0) <= va.get("val", 0):
         return 0, "mid-range"
-    span = va["vah"] - va["val"]
+    vah, val = va["vah"], va["val"]
+    span = vah - val
+    # Sign-aware (B2.0): price BEYOND the fade edge (above VAH for a short / below VAL for
+    # a long) is the single worst place to pay "at edge" credit — the old abs() distance
+    # rewarded exactly the naked-breakout location. 0 there unless a sweep+reclaim
+    # confirmed a failed breakout (then the proximity below scores the reclaim quality).
+    outside = (mr_dir == "bearish" and price > vah) or (mr_dir == "bullish" and price < val)
+    if outside and not reclaimed:
+        return 0, "outside edge (no reclaim)"
     d = abs(price - edge) / span
     if d <= 0.05:
         return 25, f"at edge ({d*100:.1f}% of VA)"
@@ -921,6 +948,13 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     reward = abs(tp - entry)
     rr = round(reward / risk, 2) if risk > 0 else None
 
+    # B2.0 universal dead-on-arrival guard (mode-agnostic): never emit a trade whose stop
+    # the LIVE price has already breached — e.g. an MR fade whose SL sits between price and
+    # the edge (SELL entry=100 sl=100.8 while price=105). Such geometry replays into a
+    # near-certain sl_first and poisons calibration; a trader would reject it outright.
+    if (direction == "bearish" and price >= sl) or (direction == "bullish" and price <= sl):
+        return out
+
     out.update({
         "valid": True,
         "direction": "BUY" if direction == "bullish" else "SELL",
@@ -975,6 +1009,18 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
     if is_ranging:
         score_mode = "mean_revert"
         mr_dir, mr_edge, va = _mr_setup(price, pa_context, smc_context)
+        # B2.0: a fade requires the range to still contain price, OR a sweep+reclaim of the
+        # edge (a FAILED breakout is the legitimate fade trigger). A naked breakout well
+        # beyond the value area with no reclaim is NOT a fade — kill it before scoring so it
+        # can't be alerted and can't emit dead-on-arrival geometry. Compute M2 once here.
+        m2 = 0
+        n2 = "no aggressive sweep"
+        reclaimed = False
+        if mr_dir is not None:
+            m2, n2 = _m2_edge_sweep(df_15m, smc_context, pdh, pdl, mr_dir, pwh, pwl)
+            reclaimed = m2 > 0
+            if _is_naked_breakout(mr_dir, price, va, atr_map.get("1h"), reclaimed):
+                mr_dir, mr_edge = None, None
         direction = mr_dir or "neutral"
         if mr_dir is None:
             # Canonical component keys even with no fade setup (FA-07) — short
@@ -986,8 +1032,8 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
             base = 0
             absorption = False
         else:
-            m1, n1 = _m1_edge_distance(price, mr_edge, va)
-            m2, n2 = _m2_edge_sweep(df_15m, smc_context, pdh, pdl, mr_dir, pwh, pwl)
+            m1, n1 = _m1_edge_distance(price, mr_edge, va, mr_dir, reclaimed)
+            # m2, n2 already computed above for the naked-breakout check
             m3, n3 = _m3_cvd_absorption(windowed_indicators, mr_dir)
             m4, n4 = _m4_stoch_extreme(windowed_indicators, mr_dir)
             m5, n5 = _m5_rejection(pa_context, mr_dir)
