@@ -46,10 +46,13 @@ independent of the labeler); B1.0 is the measurement ground truth.
       `selected_from_engine` derived, `contract_violations[]`).
 - [ ] **B4.0** — win-rate semantics: blend excursion+terminal (`end_rr`), rename MFE fraction
       (no `win_rate`/`realized_rr` may be an excursion), `ENTRY_ATR_CAP`.
-- [ ] **B5.0** — RSI-slope bias-relative (`rel_slope`) + mirror test.
-- [ ] **B6.0** — one distance rule for OB and FVG (0 inside zone, else nearest boundary) + parity test.
+- [x] **B5.0** — `_c4_momentum` reads slope in bias-relative space (`rel_slope`); mirror
+      test proves bearish+falling==bullish+rising. Was inverted for every short.
+- [x] **B6.0** — shared `_zone_distance` (0 inside zone, else nearest boundary) for both OB
+      and FVG in `_c2_ob_prox`; parity test on an identical zone (was 0 vs 15).
 - [ ] **B10.0** — PDH/PDL/PWH/PWL/weekly_open by calendar identity vs explicit UTC now.
-- [ ] **B13.0** — C1 conflict → 0 (+`tf_conflict`), 4H-dir/1H-neutral → 5.
+- [x] **B13.0** — `_c1_trend`: full conflict → 0 (+`tf_conflict` note), one-TF-directional → 5,
+      both-neutral → 0, aligned → ADX tiering. Prompt already frames C1 on "agreement".
 - [ ] **B15.0** — eval integrity: engine universe reads `strategies.*`; bucket by
       `setup_direction`; realized-R expectancy.
 - [ ] **B16.0** — hysteresis keyed by `(symbol, last_closed_15m_bar_open_ms)` (bar-idempotent).
@@ -95,5 +98,8 @@ independent of the labeler); B1.0 is the measurement ground truth.
   created.
 - 2026-07-23 — **Wave 1 B1.0 + B25.0 landed** (`tools/label_snapshots.py` rewrite,
   `tools/eval_engine.py` intrabar bucket). Chronological state machine, `intrabar_unknown`
-  class, strict horizon, entry-bar excursion fix, `label_version=2`, `end_rr`. 88/88 tests
-  (24 in the labeler suite). Next: B5.0 (RSI-slope sign) + mirror-test pattern, then B6.0/B13.0.
+  class, strict horizon, entry-bar excursion fix, `label_version=2`, `end_rr`. 88/88 tests.
+- 2026-07-23 — **Wave 1 B5.0 + B6.0 + B13.0 landed** (`strategies.py` scoring). Bias-relative
+  RSI slope, shared OB/FVG `_zone_distance`, C1 conflict→0/partial→5. New
+  `tests/test_scoring_directional.py` establishes the mirror-property pattern. 98/98 tests.
+  Next: B2.0 (MR breakout-fade + DOA guard), then B16.0, B10.0, B3.0/I2.0, B4.0, B15.0.

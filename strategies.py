@@ -201,8 +201,17 @@ def _c1_trend(smc_context, windowed):
     s1 = smc_context.get("1h", {}).get("structure", "NEUTRAL")
     adx = float(windowed.get("4h", {}).get("adx", 0.0) or 0.0)
     b4, b1 = _structure_bias(s4), _structure_bias(s1)
-    if not (b4 == b1 and b4 in ("bull", "bear")):
-        return 10, f"4H/1H conflict ({s4} vs {s1})"
+    d4, d1 = b4 in ("bull", "bear"), b1 in ("bull", "bear")
+    # Alignment is the PREMISE of a continuation trade, not a graded bonus (B13.0):
+    # a full 4H-vs-1H conflict must score 0, not the old 10 floor that let contradictory
+    # chop start every snapshot a fifth of the way up the 45/60 ladder.
+    if d4 and d1 and b4 != b1:
+        return 0, f"tf_conflict: 4H {s4} vs 1H {s1}"
+    if not (d4 and d1):
+        if d4 or d1:
+            return 5, f"4H/1H partial ({s4} vs {s1})"      # one TF directional, other neutral
+        return 0, f"no directional structure ({s4} vs {s1})"  # neither TF directional
+    # aligned and directional -> ADX tiering
     if adx < 25:
         return 10, f"weak ADX {adx:.1f}"
     if adx < 41:
@@ -212,28 +221,38 @@ def _c1_trend(smc_context, windowed):
     return 25, f"very strong ADX {adx:.1f}"
 
 
+def _zone_distance(price, a, b):
+    """Distance from price to a zone [min(a,b), max(a,b)]: 0 when price is inside the
+    zone, else the distance to the NEAREST boundary. One rule for OB and FVG alike
+    (B6.0 — OB used to measure to the FAR edge while FVG used the NEAR edge, so the same
+    zone scored 0 as an OB and 15 as an FVG). Returns None if either bound is missing."""
+    if a is None or b is None:
+        return None
+    lo, hi = (a, b) if a <= b else (b, a)
+    if lo <= price <= hi:
+        return 0.0
+    return min(abs(price - lo), abs(price - hi))
+
+
 def _c2_ob_prox(price, smc_context, bias, atr_abs):
     """ATR-scaled OB/FVG proximity (P2). Falls back to fixed % only if ATR is missing."""
     if bias not in ("bullish", "bearish"):
         return 0, "neutral bias"
     direction = "bullish" if bias == "bullish" else "bearish"
-    best, label = None, "none"  # best = ABSOLUTE distance
+    best, label = None, "none"  # best = ABSOLUTE distance to the nearest zone boundary
     for tf in ("15m", "1h"):
         ctx = smc_context.get(tf, {}) or {}
         for ob in ctx.get("order_blocks", {}).get(direction, []) or []:
-            edge = ob.get("bottom") if direction == "bullish" else ob.get("top")
-            if edge is None:
+            d = _zone_distance(price, ob.get("bottom"), ob.get("top"))
+            if d is None:
                 continue
-            d = abs(price - edge)
             if best is None or d < best:
                 best, label = d, f"{tf.upper()} {direction} OB"
         fv = (ctx.get("fvg", {}) or {}).get(f"nearest_{direction}_fvg")
         if fv and not fv.get("filled", True):
-            edge = fv.get("top") if direction == "bullish" else fv.get("bottom")
-            if edge is not None:
-                d = abs(price - edge)
-                if best is None or d < best:
-                    best, label = d, f"{tf.upper()} {direction} FVG"
+            d = _zone_distance(price, fv.get("bottom"), fv.get("top"))
+            if d is not None and (best is None or d < best):
+                best, label = d, f"{tf.upper()} {direction} FVG"
     if best is None:
         return 0, "no nearby OB/FVG"
     if atr_abs and atr_abs > 0:
@@ -271,10 +290,15 @@ def _c4_momentum(df_1h, windowed, bias):
     adj, lbl = 0, "no slope"
     if len(series) >= 3:
         slope = float(series[-1]) - float(series[-3])
-        if slope > 5:
-            adj, lbl = 5, f"slope +{slope:.1f}"
-        elif slope < -5:
-            adj, lbl = -5, f"slope {slope:.1f}"
+        # Momentum must be read IN the trade's direction (B5.0): rising RSI is momentum
+        # for a long and against a short. The old code applied +5/-5 by raw slope sign,
+        # so every short had its momentum evidence scored backwards.
+        sign = 1 if bias == "bullish" else (-1 if bias == "bearish" else 0)
+        rel_slope = slope * sign
+        if rel_slope > 5:
+            adj, lbl = 5, f"slope {slope:+.1f} (w/ bias)"
+        elif rel_slope < -5:
+            adj, lbl = -5, f"slope {slope:+.1f} (vs bias)"
         else:
             lbl = f"slope {slope:+.1f}"
     return max(0, min(15, base + adj)), f"RSI {rsi:.1f}, {lbl}"
