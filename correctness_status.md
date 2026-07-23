@@ -112,7 +112,17 @@ independent of the labeler); B1.0 is the measurement ground truth.
       validated `reject_reason`. `header.action` is engine-derived (REJECT→HOLD). Absent
       verdict = legacy tolerance path (nothing regresses). `test_trade_validation.py` +8 (18).
       167/167.
-- [ ] `by_verdict` eval (paired AGREE/UPDATE vs engine primary); shadow rollout.
+- [x] **`by_verdict` eval cut** — `tools/eval_engine._by_verdict` pairs the adjudicated plan
+      (trade_decision_outcome) against the engine primary (engine_trade_outcome) on the SAME
+      narrated snapshots: AGREE/UPDATE carry a `paired_delta_r` (does adjudication add alpha?),
+      REJECT carries the engine primary's outcome had the declined trade been taken (rejection
+      quality). NOT episode-collapsed. Also fixed a latent `by_action` crash (raw `td.rr` dict
+      → `float(dict)`) via a shared `_plan_rr` unwrap. Promotion decision is Wave-4
+      measurement-gated (needs clean corpus + ≥50 UPDATE episodes). `test_eval_engine.py` +2.
+      169/169.
+- [ ] Shadow rollout: build machinery now (verdict persisted, `by_verdict` readout); the
+      promotion decision defers to Wave 4 (clean corpus). CLAUDE.md invariant #1 + geometry
+      note relaxed in the final docs commit.
 
 ## Wave 3 — structure & menus (semantics-changing; land before collection restarts)
 
@@ -181,3 +191,7 @@ independent of the labeler); B1.0 is the measurement ground truth.
   level_id (engine resolves id→exact price, killing float-tolerance guessing); REJECT→HOLD
   overrides the engine gate; system-instruction adjudicator rewrite consuming engine_case.
   `test_trade_validation.py` +8 (18 total). 167/167.
+- 2026-07-23 — **Wave 2 `by_verdict` eval cut landed** (`tools/eval_engine.py`). Paired
+  AGREE/UPDATE vs engine primary (`paired_delta_r`) + REJECT rejection-quality readout;
+  shared `_plan_rr` unwrap also fixes a latent `by_action` `float(dict)` crash.
+  `test_eval_engine.py` +2. 169/169. Promotion decision deferred to Wave 4.

@@ -151,3 +151,70 @@ def test_engine_universe_ignores_header_and_buckets_by_setup_direction(monkeypat
     assert "BEARISH" in report["by_bias"]                                       # setup_direction, not trend_bias
     assert report["by_volume_gate"]["CLEAR"]["snapshots"] == 1                  # strategies gate, not HARD_GATE
     assert report["overall"]["expectancy_r"] == round(2.0 - ee.ROUND_TRIP_COST_R, 3)  # realized R, not excursion
+
+
+# ---------------- I1.0 by_verdict cut ---------------- #
+
+def _narrated(verdict, engine_outcome, llm_outcome=None, engine_rr=2.0, plan_ratio=2.0):
+    td = {"trade_management": {"selected_from_engine": verdict == "AGREE"},
+          "rr": {"ratio": plan_ratio}}
+    outcome = {"engine_trade_outcome": engine_outcome}
+    if llm_outcome is not None:
+        outcome["trade_decision_outcome"] = llm_outcome
+    return {
+        "symbol": "BTC/USDT",
+        "engine_trade": {"rr": engine_rr, "direction": "BUY"},
+        "strategies": {"confluence_score": 70, "score_mode": "trending", "trend_bias": "bullish",
+                       "setup_direction": "bullish", "volume_gate": {"state": "CLEAR"}},
+        "volatility_regime": {"15m": {"regime": "normal"}},
+        "event_guard": {"active": False},
+        "analysis": {"verdict": verdict, "header": {"action": "ACTIVE_TRADE"},
+                     "trade_decision": td},
+        "outcome": outcome,
+    }
+
+
+def test_by_verdict_pairs_update_against_engine_primary(monkeypatch, tmp_path):
+    c = ee.ROUND_TRIP_COST_R
+    # UPDATE: the adjudicated plan won (tp_first) where the engine primary lost (sl_first).
+    _write(tmp_path, "snapshot_BTC_USDT_20260101_000000.json",
+           _narrated("UPDATE",
+                     engine_outcome={"triggered": True, "outcome": "sl_first", "mfe_r": 0.3},
+                     llm_outcome={"triggered": True, "outcome": "tp_first", "mfe_r": 2.4}))
+    # AGREE: both are the same trade -> identical outcome, delta 0.
+    _write(tmp_path, "snapshot_BTC_USDT_20260101_001500.json",
+           _narrated("AGREE",
+                     engine_outcome={"triggered": True, "outcome": "tp_first", "mfe_r": 2.2},
+                     llm_outcome={"triggered": True, "outcome": "tp_first", "mfe_r": 2.2}))
+    # REJECT: declined; the engine primary would have lost -> good rejection.
+    _write(tmp_path, "snapshot_BTC_USDT_20260101_003000.json",
+           _narrated("REJECT",
+                     engine_outcome={"triggered": True, "outcome": "sl_first", "mfe_r": 0.1}))
+
+    report = _run(monkeypatch, tmp_path)
+    bv = report["by_verdict"]
+
+    # UPDATE: llm +2.0R vs engine -1.0R (each net of cost) -> positive paired delta.
+    assert bv["UPDATE"]["decisions"] == 1
+    assert bv["UPDATE"]["llm"]["expectancy_r"] == round(2.0 - c, 3)
+    assert bv["UPDATE"]["engine_primary"]["expectancy_r"] == round(-1.0 - c, 3)
+    assert bv["UPDATE"]["paired_delta_r"] == round((2.0 - c) - (-1.0 - c), 3)   # == 3.0
+
+    assert bv["AGREE"]["paired_delta_r"] == 0.0
+
+    # REJECT reports the avoided trade's outcome (a loss -> rejection was correct).
+    assert bv["REJECT"]["decisions"] == 1
+    assert bv["REJECT"]["engine_primary_if_taken"]["expectancy_r"] == round(-1.0 - c, 3)
+    assert "llm" not in bv["REJECT"]
+
+
+def test_by_verdict_absent_when_no_narration(monkeypatch, tmp_path):
+    _write(tmp_path, "snapshot_BTC_USDT_20260101_000000.json", {
+        "symbol": "BTC/USDT",
+        "strategies": {"confluence_score": 62, "score_mode": "trending", "trend_bias": "bullish",
+                       "volume_gate": {"state": "CLEAR"}},
+        "volatility_regime": {"15m": {"regime": "normal"}}, "event_guard": {"active": False},
+        "outcome": {"engine_trade_outcome": {"triggered": True, "outcome": "tp_first", "mfe_r": 2.0}},
+    })
+    report = _run(monkeypatch, tmp_path)
+    assert report["by_verdict"] == {}

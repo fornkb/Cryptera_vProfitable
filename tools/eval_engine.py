@@ -9,10 +9,15 @@ block with two independent universes (FA-06):
     expectancy, avg MFE/MAE, and every `by_*` bucket below are computed on it.
   * `trade_decision_outcome` — the LLM's selected trade, present only on
     narrated snapshots. Kept as secondary cuts (`by_action`,
-    `by_selected_from_engine`) so the LLM-vs-engine divergence question stays
-    answerable, but it is NOT the loop's primary universe (it used to be,
-    which reported `snapshots_labelled: 0` against a corpus that's almost
-    entirely no-LLM snapshots).
+    `by_selected_from_engine`, and the I1.0 `by_verdict`) so the LLM-vs-engine
+    divergence question stays answerable, but it is NOT the loop's primary
+    universe (it used to be, which reported `snapshots_labelled: 0` against a
+    corpus that's almost entirely no-LLM snapshots).
+
+`by_verdict` (I1.0) pairs the adjudicated plan against the engine primary on the same
+narrated snapshots: AGREE/UPDATE carry a `paired_delta_r` (does adjudication add alpha?),
+REJECT carries the engine primary's outcome had the declined trade been taken (rejection
+quality). Promotion of the adjudicated plan to headline is Wave-4 measurement-gated.
 
 Pseudo-replication fix (tools.episodes): the cheap pass scores every watched symbol
 every 15m, so ONE persisting setup (same entry/SL/TP unchanged for hours) produces many
@@ -179,6 +184,56 @@ def _finalize(acc):
     }
 
 
+def _plan_rr(td: dict):
+    """The LLM plan's own R:R ratio (validator-recomputed) — the realized-R target for the
+    geometry the model actually chose. In the analysis schema `trade_decision.rr` is a dict
+    {ratio, ...}; fall back to a bare number for older shapes."""
+    rr = (td or {}).get("rr")
+    return rr.get("ratio") if isinstance(rr, dict) else rr
+
+
+def _by_verdict(verdict_rows):
+    """I1.0 by_verdict cut (NOT episode-collapsed -- narration is already gated + cooldown'd):
+      * AGREE / UPDATE — the adjudicated plan's realized R (trade_decision_outcome) PAIRED
+        against the engine primary's (engine_trade_outcome) on the SAME narrated snapshots.
+        `paired_delta_r` = llm expectancy_r - engine primary expectancy_r is the direct measure
+        of whether adjudication adds alpha (UPDATE is the verdict that should).
+      * REJECT — the engine primary's outcome had the declined trade been TAKEN, i.e. rejection
+        quality: how often the avoided trade would have lost.
+    Promotion of the adjudicated plan to headline is measurement-gated (Wave 4, needs the clean
+    corpus + >=50 UPDATE episodes with a non-negative paired delta); this only builds the readout."""
+    llm_acc = defaultdict(_accumulator)
+    eng_acc = defaultdict(_accumulator)
+    counts = defaultdict(int)
+    for _name, snap, eng_o, llm_o, verdict in verdict_rows:
+        counts[verdict] += 1
+        strategies = snap.get("strategies") or {}
+        eng = snap.get("engine_trade") or strategies.get("engine_trade") or {}
+        td = (snap.get("analysis") or {}).get("trade_decision") or {}
+        if verdict in ("AGREE", "UPDATE"):
+            if llm_o is not None:
+                _record(llm_acc[verdict], llm_o, _plan_rr(td))
+            if eng_o is not None:
+                _record(eng_acc[verdict], eng_o, eng.get("rr"))
+        elif verdict == "REJECT" and eng_o is not None:
+            _record(eng_acc[verdict], eng_o, eng.get("rr"))
+
+    out = {}
+    for verdict in ("AGREE", "UPDATE"):
+        if not counts.get(verdict):
+            continue
+        llm_s, eng_s = _finalize(llm_acc[verdict]), _finalize(eng_acc[verdict])
+        delta = (round(llm_s["expectancy_r"] - eng_s["expectancy_r"], 3)
+                 if llm_s["expectancy_r"] is not None and eng_s["expectancy_r"] is not None
+                 else None)
+        out[verdict] = {"decisions": counts[verdict], "llm": llm_s,
+                        "engine_primary": eng_s, "paired_delta_r": delta}
+    if counts.get("REJECT"):
+        out["REJECT"] = {"decisions": counts["REJECT"],
+                         "engine_primary_if_taken": _finalize(eng_acc["REJECT"])}
+    return out
+
+
 def _expectancy(stats):
     """DEPRECATED excursion expectancy (avg_mfe*hit + avg_mae*(1-hit)) — kept for reference
     only. The trustworthy figure is stats['expectancy_r'] (realized R, B15.0)."""
@@ -215,6 +270,7 @@ def main():
     seen = 0
     raw_engine_rows = []   # (name, snap, outcome) -- collapsed to episodes below
     llm_rows = []          # (name, snap, outcome) -- NOT collapsed, see note below
+    verdict_rows = []      # (name, snap, engine_outcome, llm_outcome, verdict) -- I1.0 by_verdict
     for name, snap in _iter_snapshots(args.symbol):
         seen += 1
         outcome_block = snap.get("outcome") or {}
@@ -224,6 +280,12 @@ def main():
             raw_engine_rows.append((name, snap, engine_outcome))
         if llm_outcome is not None:
             llm_rows.append((name, snap, llm_outcome))
+        # by_verdict spans narrated snapshots regardless of which universe got labelled: a
+        # REJECT is a HOLD (no trade_decision_outcome) but its engine_trade_outcome measures
+        # rejection quality.
+        verdict = ((snap.get("analysis") or {}).get("verdict") or "").upper()
+        if verdict in ("AGREE", "UPDATE", "REJECT"):
+            verdict_rows.append((name, snap, engine_outcome, llm_outcome, verdict))
 
     # Pseudo-replication fix: one persisting setup scored every 15m yields many
     # near-identical rows here -- collapse to one representative per episode BEFORE
@@ -274,9 +336,11 @@ def main():
         tm = td.get("trade_management") or {}
         sel = tm.get("selected_from_engine")
         sel_key = "engine_primary" if sel is True else ("llm_alternative" if sel is False else "unknown")
-        # realized R for the LLM trade uses the LLM plan's own rr (its geometry may differ
-        # from the engine primary when it selected an alternative candidate).
-        llm_rr = (td.get("primary") or {}).get("rr") if isinstance(td.get("primary"), dict) else td.get("rr")
+        # realized R for the LLM trade uses the LLM plan's own rr ratio (its geometry may
+        # differ from the engine primary when it selected an alternative candidate).
+        # trade_decision.rr is a {ratio,...} dict in the analysis schema -- _plan_rr unwraps it
+        # (the old `td.get("rr")` fallback passed the raw dict to _realized_r -> float(dict) crash).
+        llm_rr = _plan_rr(td)
         _record(buckets["by_action"][action], llm_outcome, llm_rr)
         _record(buckets["by_selected_from_engine"][sel_key], llm_outcome, llm_rr)
 
@@ -301,6 +365,9 @@ def main():
             s["expectancy_pct"] = _expectancy(s)
             bucket_report[sub_k] = s
         report[k] = bucket_report
+
+    # I1.0: paired AGREE/UPDATE vs engine primary + REJECT rejection quality.
+    report["by_verdict"] = _by_verdict(verdict_rows)
 
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
