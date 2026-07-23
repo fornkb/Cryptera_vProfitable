@@ -23,6 +23,7 @@ from indicators import (calculate_indicators, detect_regime, detect_volatility_r
 from strategies import evaluate_strategies
 from smc import build_smc_context
 from price_action import build_pa_context, calculate_previous_day, get_value_area
+from trade_validation import validate_and_normalize_analysis
 from config import (SCHEMA_VERSION, DATA_DIR, SNAPSHOTS_DIR, OI_HISTORY_PATH,
                     EVENTS_PATH, REGIME_STATE_PATH, REGIME_HYSTERESIS_RUNS,
                     SNAPSHOT_RETENTION, HORIZON_HOURS, MARKET, TIMEFRAMES,
@@ -1395,7 +1396,10 @@ def _splice_mtf_context(analysis: dict, snapshot: dict) -> dict:
 
 
 def _finalize_analysis(analysis: dict, snapshot: dict) -> dict:
-    """Post-call engine splices: score_breakdown + per-TF mtf_context table."""
+    """Post-call engine steps: B3.0/I2.0 semantic validation FIRST (recompute gates,
+    force real candidate prices, engine-side R:R, HOLD-null, derive selected_from_engine,
+    record contract_violations), THEN splice score_breakdown + per-TF mtf_context."""
+    analysis, _ = validate_and_normalize_analysis(analysis, snapshot)
     analysis = _splice_score_breakdown(analysis, snapshot.get("strategies") or {})
     return _splice_mtf_context(analysis, snapshot)
 

@@ -43,9 +43,13 @@ independent of the labeler); B1.0 is the measurement ground truth.
       fades in the MR orchestration; `_m1_edge_distance` sign-aware (0 outside the edge
       unless reclaim-confirmed); universal DOA guard in `compute_trade_geometry` (reject when
       live price has already breached the stop). Sequential MR (raid→MSS→return) stays I4.0.
-- [ ] **B3.0 / I2.0** — deterministic `validate_and_normalize_analysis` after every model
-      response (price/ID membership, gates recomputed engine-side, DOA, HOLD-null,
-      `selected_from_engine` derived, `contract_violations[]`).
+- [x] **B3.0 / I2.0** — `trade_validation.validate_and_normalize_analysis` runs in
+      `_finalize_analysis` (both CLI/web + monitor paths). Recomputes header
+      pair/price/regime/bias/volume_gate/score/action from engine (engine_gate); forces
+      entry/stop/tp to be real candidate levels (rel tol 5e-4, revert to primary); enforces
+      direction==engine + ordering + DOA (revert geometry); recomputes R:R/sl_width; nulls
+      trade fields on HOLD/HARD_GATE/invalid; derives `selected_from_engine` by comparison;
+      stamps `analysis.contract_violations[]`. 10 tests. **Candidate-ID selection is Wave 2 (I1.0).**
 - [x] **B4.0** — `_soft_label` timeout credit blends `mfe_r` + `end_rr` (0.5/0.5 vs target_rr),
       so give-back timeouts stop scoring 0.75; labeler field `realized_rr`→`mfe_r` (honest
       excursion name); `ENTRY_ATR_CAP=1.5` on entry candidates (stale far OB no longer becomes
@@ -132,4 +136,8 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - 2026-07-23 — **Wave 1 B10.0 + B26.0 + B27.0 landed** (`price_action.py`, `tools/ab_thinking.py`,
   `main.py` funding). Calendar-correct PDH/PDL/PWH/PWL; ab_thinking canonical replay + net-R;
   funding interval inference. New `test_calendar_levels.py` (6) + `test_funding.py` (2). 126/126.
-  **Only B3.0/I2.0 (the post-LLM validator, last P0) remains in Wave 1.**
+- 2026-07-23 — **Wave 1 B3.0/I2.0 landed → WAVE 1 COMPLETE.** New `trade_validation.py`
+  (post-LLM validator) hooked into `_finalize_analysis`; 10 tests; 136/136 suite. All four P0s
+  (B1/B2/B3/B4) + directional (B5/B6/B13) + MR/regime (B2/B16) + measurement (B4/B15/B25) +
+  levels/ops (B10/B14/B26/B27) done. **Next: Wave 2 — I1.0 adjudicator on the I2.0 validator.**
+  Reminder: nothing has been deployed; VM still collecting the pre-fix corpus (archive at deploy).
