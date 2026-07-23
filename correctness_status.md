@@ -55,7 +55,10 @@ independent of the labeler); B1.0 is the measurement ground truth.
       test proves bearish+falling==bullish+rising. Was inverted for every short.
 - [x] **B6.0** — shared `_zone_distance` (0 inside zone, else nearest boundary) for both OB
       and FVG in `_c2_ob_prox`; parity test on an identical zone (was 0 vs 15).
-- [ ] **B10.0** — PDH/PDL/PWH/PWL/weekly_open by calendar identity vs explicit UTC now.
+- [x] **B10.0** — `calculate_previous_day`/`weekly_levels` select by UTC calendar identity
+      vs explicit `now` (prev-day = date==now-1d; prev-week = ISO week of now-7d, rollover-safe),
+      not `iloc[-2]`/`groups[-1]`. Fixes PDH two-days-ago 00:00-01:00 UTC and PWH two-weeks-old
+      all Monday; weekly_open honestly None on Monday. 6 tests in `test_calendar_levels.py`.
 - [x] **B13.0** — `_c1_trend`: full conflict → 0 (+`tf_conflict` note), one-TF-directional → 5,
       both-neutral → 0, aligned → ADX tiering. Prompt already frames C1 on "agreement".
 - [x] **B15.0** — eval engine universe reads `strategies.*` exclusively (never `header.*`);
@@ -69,7 +72,12 @@ independent of the labeler); B1.0 is the measurement ground truth.
       (4-state transition router stays I3.0.)
 - [x] Rider **B25.0** — labeler now writes compact (`separators=(",",":")`) instead of
       `indent=2`, done as part of B1.0's `label_snapshot_file`.
-- [ ] Riders: **B26.0** (ab_thinking canonical replay), **B27.0** (funding interval inference).
+- [x] Rider **B26.0** — `ab_thinking` now uses the canonical replay path: floored window,
+      1m intrabar drill, episode collapse before any LLM call, net-R (realized) instead of raw
+      hit-rate. Paired per-episode net-R + bootstrap CI rides with I8.0.
+- [x] Rider **B27.0** — `fetch_funding` infers `interval_hours` from `fundingTime` deltas and
+      windows the 24h average by hours (4h/1h perps no longer mislabel a 12h/3h span as 24h);
+      `interval_hours` added to the block. 2 tests in `test_funding.py`.
 - [ ] Relabel + recalibrate discipline; schema/label_version bump; full pytest + regression seeds.
 
 ## Wave 2 — I1.0 adjudicator (on the I2.0 validator)
@@ -121,3 +129,7 @@ independent of the labeler); B1.0 is the measurement ground truth.
   rename, `ENTRY_ATR_CAP`; eval reads strategies.* only, `setup_direction` bucket, realized-R
   `expectancy_r`. 118/118 tests. P0s B1.0 + B2.0 + B4.0 done; **B3.0/I2.0 (post-LLM
   validator) is the last remaining P0.** Remaining Wave 1: B10.0, B3.0/I2.0, riders B26/B27.
+- 2026-07-23 — **Wave 1 B10.0 + B26.0 + B27.0 landed** (`price_action.py`, `tools/ab_thinking.py`,
+  `main.py` funding). Calendar-correct PDH/PDL/PWH/PWL; ab_thinking canonical replay + net-R;
+  funding interval inference. New `test_calendar_levels.py` (6) + `test_funding.py` (2). 126/126.
+  **Only B3.0/I2.0 (the post-LLM validator, last P0) remains in Wave 1.**

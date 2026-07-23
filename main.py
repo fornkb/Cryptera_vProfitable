@@ -513,7 +513,7 @@ def fetch_open_interest(symbol):
 
 def fetch_funding(symbol):
     """Current funding + 24-period trajectory + percentile-within-window."""
-    default = {"current": 0.0, "avg_24h": 0.0, "trend": "unknown",
+    default = {"current": 0.0, "avg_24h": 0.0, "interval_hours": None, "trend": "unknown",
                "sign_changes": 0, "percentile_window": None, "window_periods": 0}
     try:
         r = requests.get(
@@ -537,8 +537,26 @@ def fetch_funding(symbol):
     except Exception:
         return default
 
+    # B27.0: infer the funding interval from consecutive fundingTime deltas instead of
+    # assuming 8h. Binance runs 4h (and some 1h) funding on a growing set of USDT-perps;
+    # there the fixed last-3-rows "24h" average actually spanned 12h/3h and mixed regimes.
+    times = []
+    for x in r:
+        try:
+            times.append(int(x["fundingTime"]))
+        except Exception:
+            pass
+    interval_ms = 8 * 3600 * 1000
+    if len(times) >= 2:
+        deltas = sorted(t2 - t1 for t1, t2 in zip(times, times[1:]) if t2 > t1)
+        if deltas:
+            interval_ms = deltas[len(deltas) // 2]           # median delta, robust to gaps
+    interval_hours = round(interval_ms / 3_600_000, 2)
+    n_24h = max(1, round(24 / interval_hours)) if interval_hours > 0 else 3
+
     current = rates[-1]
-    avg_24h = sum(rates[-3:]) / max(len(rates[-3:]), 1)
+    last_window = rates[-n_24h:]
+    avg_24h = sum(last_window) / len(last_window)
     sign_changes = sum(1 for i in range(1, len(rates)) if (rates[i] > 0) != (rates[i - 1] > 0))
     delta = current - avg_24h
     if abs(delta) < 1e-6:
@@ -553,6 +571,7 @@ def fetch_funding(symbol):
     return {
         "current": round(current, 6),
         "avg_24h": round(avg_24h, 6),
+        "interval_hours": interval_hours,
         "trend": trend,
         "sign_changes": int(sign_changes),
         "percentile_window": percentile,

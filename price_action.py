@@ -6,6 +6,8 @@ high-low range), not close-only. Session POCs use true non-overlapping windows.
 Candle-pattern detection is limited to confirmation-grade reversal patterns.
 """
 
+from datetime import datetime, timezone, timedelta
+
 import pandas as pd
 import numpy as np
 from smc import find_swings, fractal_swing_mask
@@ -181,12 +183,26 @@ def get_sr_levels(swing_highs, swing_lows, current_price, value_area=None, atr_p
     return {"support": supports, "resistance": resistances}
 
 
-def calculate_previous_day(df: pd.DataFrame):
+def calculate_previous_day(df: pd.DataFrame, now: datetime = None):
+    """Previous UTC day's high/low/close, selected by CALENDAR identity relative to `now`,
+    not by position (B10.0). The old `iloc[-2]` returned TWO days ago during 00:00-01:00 UTC,
+    when the current day has no closed 1H bar yet so the last date-group is still yesterday.
+    Previous day = the group whose date == (now-1d); fall back to the most recent day strictly
+    before today on a gap."""
     try:
+        if now is None:
+            now = datetime.now(timezone.utc)
+        today = now.date()
+        prev_date = today - timedelta(days=1)
         dates = df["timestamp"].dt.date
         daily = df.groupby(dates).agg({"high": "max", "low": "min", "close": "last"}).sort_index()
-        if len(daily) >= 2:
-            return float(daily["high"].iloc[-2]), float(daily["low"].iloc[-2]), float(daily["close"].iloc[-2])
+        if prev_date in daily.index:
+            row = daily.loc[prev_date]
+            return float(row["high"]), float(row["low"]), float(row["close"])
+        past = daily[daily.index < today]           # gap: most recent fully-past day
+        if len(past) >= 1:
+            row = past.iloc[-1]
+            return float(row["high"]), float(row["low"]), float(row["close"])
         return float(df["high"].max()), float(df["low"].min()), float(df["close"].iloc[-1])
     except Exception:
         return float(df["high"].max()), float(df["low"].min()), float(df["close"].iloc[-1])
@@ -232,27 +248,40 @@ def find_untested_pocs(df: pd.DataFrame, n_sessions: int = 4, session_bars: int 
     return deduped[:5]
 
 
-def weekly_levels(df_1d: pd.DataFrame) -> dict:
+def weekly_levels(df_1d: pd.DataFrame, now: datetime = None) -> dict:
     """
-    Previous-week high/low and current-week open from daily candles (HTF draws for
-    the 1D timeframe). Weeks are ISO weeks in UTC. Falls back to the current week
-    when only one week of daily data is present.
+    Previous-week high/low and current-week open from daily candles (HTF draws for the 1D
+    timeframe). Weeks are selected by ISO-week CALENDAR identity relative to `now`, not by
+    position (B10.0). The old `groups[-1]` treated the last CLOSED daily week as "current";
+    on Monday (all day, before Monday's daily bar closes) that is LAST week, so PWH/PWL were
+    two weeks old and weekly_open was last week's. `now - 7d` is always in the previous ISO
+    week, so this is robust across the ISO-year rollover.
     """
     out = {"pwh": None, "pwl": None, "weekly_open": None}
     if df_1d is None or df_1d.empty:
         return out
+    if now is None:
+        now = datetime.now(timezone.utc)
     ts = pd.to_datetime(df_1d["timestamp"])
     iso = ts.dt.isocalendar()
     wk_key = (iso["year"].astype(int) * 100 + iso["week"].astype(int)).to_numpy()
     d = df_1d.assign(_wk=wk_key)
-    groups = [g for _, g in d.groupby("_wk", sort=True)]
-    if not groups:
+    by_key = {int(k): g for k, g in d.groupby("_wk", sort=True)}
+    if not by_key:
         return out
-    cur = groups[-1]
-    out["weekly_open"] = round(float(cur["open"].iloc[0]), 6)
-    prev = groups[-2] if len(groups) >= 2 else cur
-    out["pwh"] = round(float(prev["high"].max()), 6)
-    out["pwl"] = round(float(prev["low"].min()), 6)
+    cur_iso, prev_iso = now.isocalendar(), (now - timedelta(days=7)).isocalendar()
+    cur_key = cur_iso[0] * 100 + cur_iso[1]
+    prev_key = prev_iso[0] * 100 + prev_iso[1]
+    prev = by_key.get(prev_key)
+    if prev is None:                                # gap: latest week strictly before now's
+        past = sorted(k for k in by_key if k < cur_key)
+        prev = by_key[past[-1]] if past else None
+    if prev is not None:
+        out["pwh"] = round(float(prev["high"].max()), 6)
+        out["pwl"] = round(float(prev["low"].min()), 6)
+    cur = by_key.get(cur_key)                        # None on Monday (no closed daily yet) ->
+    if cur is not None:                              # leave weekly_open None rather than
+        out["weekly_open"] = round(float(cur["open"].iloc[0]), 6)  # reporting last week's
     return out
 
 
