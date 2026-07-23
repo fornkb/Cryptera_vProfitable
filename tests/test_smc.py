@@ -119,6 +119,39 @@ def test_get_premium_discount_bearish_leg_not_in_ote_when_deep_discount():
     assert result["zone"] == "discount"
 
 
+# ---------------- B17.0: flat-tape swing artifacts ---------------- #
+
+def test_plateau_reports_one_swing_not_a_run():
+    """B17.0: every bar of a flat stretch used to qualify as a swing high/low."""
+    highs = [1, 2, 3, 10, 10, 10, 10, 10, 3, 2, 1]
+    lows = [-h for h in highs]
+    is_high, is_low = fractal_swing_mask(
+        pd.Series(highs, dtype=float), pd.Series(lows, dtype=float), left=2, right=2)
+    assert int(is_high.sum()) == 1
+    assert int(is_low.sum()) == 1
+    # the LAST bar of the run is the surviving pivot (freshest)
+    assert bool(is_high.iloc[7]) is True
+
+
+def test_equal_highs_far_apart_stay_two_touches():
+    """Dedup is plateau-local: genuine repeat tests remain separate swings (EQH pool)."""
+    highs = [1, 2, 10, 2, 1, 1, 1, 10, 1, 1]
+    lows = [0, 1, 9, 1, 0, 0, 0, 9, 0, 0]
+    is_high, _ = fractal_swing_mask(
+        pd.Series(highs, dtype=float), pd.Series(lows, dtype=float), left=2, right=2)
+    assert int(is_high.sum()) == 2
+
+
+def test_flat_tape_structure_is_not_bearish():
+    """B17.0: an exact tie used to break to LH/LL, so the router shorted chop."""
+    from strategies import _structure_bias
+    flat_h = [{"idx": i, "ts": f"t{i}", "price": 100.0} for i in (1, 4, 7)]
+    flat_l = [{"idx": i, "ts": f"t{i}", "price": 99.0} for i in (2, 5, 8)]
+    structure, _, _ = get_market_structure(flat_h, flat_l, df=None)
+    assert "LH" not in structure and "LL" not in structure
+    assert _structure_bias(structure) not in ("bullish", "bearish")
+
+
 # ---------------- find_liquidity_levels (side filtering) ---------------- #
 
 def test_liquidity_pools_are_side_filtered():

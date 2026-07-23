@@ -138,7 +138,12 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
 - [ ] **I5.0** typed liquidity & sweep quality (B12.0).
 - [ ] **I6.0** OTE anchored to displacement leg (B9.0).
 - [ ] **I7.0** candidate-first geometry & menu enrichment (B11.0/B19.0).
-- [ ] **B17.0** flat-tape swing artifacts; **B21.0** DST kill zones; **B22.0** stable POC windows;
+- [x] **B17.0** — `_dedup_plateau` collapses a run of equal extremes inside one fractal
+      half-window to its LAST bar (a flat stretch is one pivot, not N); `fractal_swing_mask`
+      gains a relative `tol` fed by `_equal_tol(df)` (ATR%·0.25, ≤20bps) so "equal" is the
+      cluster tolerance, not float equality; `_hl_label` tie → neutral `EQ` token (flat tape
+      no longer reads LH/LL → no more shorting chop). 3 tests. 172/172.
+- [ ] **B21.0** DST kill zones; **B22.0** stable POC windows;
       **B23.0** distance-based episode identity.
 
 ## DEPLOY EVENT
@@ -207,3 +212,6 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
   UPDATE-by-`level_id`); pipeline note + file map (`trade_validation.py`, `should_call_llm`,
   `LLM_CALL_THRESHOLD`) + geometry note updated. Full I1.0 adjudicator landed on the I2.0
   validator. **Next: Wave 3 (structure & menus) — all before the collection restart.**
+- 2026-07-24 — **Wave 3 B17.0 landed** (`smc.py`). Plateau dedup in the shared swing mask +
+  ATR-scaled equality tolerance + neutral `EQ` structure token on a tie. `test_smc.py` +3.
+  172/172. Swing layer cleaned before the I3.0 state machine reads it.

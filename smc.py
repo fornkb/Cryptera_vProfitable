@@ -25,13 +25,53 @@ def _atr_pct(df: pd.DataFrame, fallback: float = 0.005) -> float:
     return max(float(atr) / price, 0.0005)
 
 
+def _equal_tol(df: pd.DataFrame) -> float:
+    """
+    Relative tolerance for calling two extremes 'equal' (B17.0): a quarter of the
+    ATR-as-fraction-of-price, capped at 20bps. Scales with the asset/TF the same way
+    the liquidity-pool cluster tolerance does, instead of float equality.
+    """
+    return max(0.0, min(0.002, _atr_pct(df) * 0.25))
+
+
 # ---------------- unified fractal swing detection ---------------- #
 
-def fractal_swing_mask(high: pd.Series, low: pd.Series, left: int, right: int):
+def _dedup_plateau(mask: pd.Series, prices: pd.Series, span: int, tol: float) -> pd.Series:
+    """
+    Collapse a run of equal extremes inside one fractal half-window to its LAST bar
+    (B17.0). `high == roll_high` flags EVERY bar of a flat stretch, so a plateau used
+    to report N swings — junk pools, inflated S/R touch counts, degenerate dealing
+    ranges. A flat stretch is ONE pivot; the equal extremes are EQH/EQL liquidity,
+    which the typed pools surface separately. Touches more than `span` bars apart are
+    left alone — those are genuine repeat tests, not a plateau.
+    """
+    idxs = np.flatnonzero(mask.to_numpy())
+    if idxs.size < 2:
+        return mask
+    vals = prices.to_numpy()
+    drop = []
+    for a in range(idxs.size - 1):
+        i, j = int(idxs[a]), int(idxs[a + 1])
+        pi, pj = float(vals[i]), float(vals[j])
+        if (j - i) <= span and abs(pj - pi) <= max(abs(pi), 1e-12) * tol:
+            drop.append(i)
+    if not drop:
+        return mask
+    out = mask.copy()
+    out.iloc[drop] = False
+    return out
+
+
+def fractal_swing_mask(high: pd.Series, low: pd.Series, left: int, right: int,
+                       tol: float = 0.0):
     """
     Vectorised fractal pivots. A bar is a swing high if its high is the maximum
     over [i-left, i+right]; swing low symmetrically. The last `right` bars are
     NaN/False (no look-ahead). Returns (is_high: bool Series, is_low: bool Series).
+
+    `tol` is a RELATIVE price tolerance for treating neighbouring extremes as equal
+    (B17.0 plateau dedup); 0.0 keeps exact-equality dedup, which is what the mask
+    actually produces on flat tape.
     """
     window = left + right + 1
     # rolling(window).max() at q covers [q-window+1, q]; shift(-right) re-centres
@@ -39,14 +79,17 @@ def fractal_swing_mask(high: pd.Series, low: pd.Series, left: int, right: int):
     roll_low = low.rolling(window).min().shift(-right)
     is_high = (high == roll_high) & roll_high.notna()
     is_low = (low == roll_low) & roll_low.notna()
-    return is_high, is_low
+    span = max(1, int(right))
+    return (_dedup_plateau(is_high, high, span, tol),
+            _dedup_plateau(is_low, low, span, tol))
 
 
 def _confirmed_swings(df: pd.DataFrame, left: int, right: int):
     """Return confirmed swings as ordered lists of dicts {idx, ts, price}."""
     if df is None or len(df) < (left + right + 1):
         return [], []
-    is_high, is_low = fractal_swing_mask(df["high"], df["low"], left, right)
+    is_high, is_low = fractal_swing_mask(df["high"], df["low"], left, right,
+                                         tol=_equal_tol(df))
 
     def _collect(mask, col):
         out = []
@@ -134,13 +177,18 @@ def _seq_state(prices) -> int:
 
 
 def _hl_label(prices, up_tok, dn_tok) -> str:
-    """Majority-vote state -> token; tie falls back to the last-two comparison."""
+    """
+    Majority-vote state -> token. A tie is NOT directional (B17.0): it used to fall
+    back to the last-two comparison, which broke exact ties to the down-token, so flat
+    tape read LH/LL and the router shorted chop. Equal extremes are liquidity, not
+    structure -> neutral 'EQ' token, which no bias test matches.
+    """
     st = _seq_state(prices)
     if st > 0:
         return up_tok
     if st < 0:
         return dn_tok
-    return up_tok if (len(prices) >= 2 and prices[-1] > prices[-2]) else dn_tok
+    return "EQ"
 
 
 def get_market_structure(confirmed_highs, confirmed_lows, df=None, recent_bars=12):
