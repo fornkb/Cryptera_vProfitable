@@ -222,6 +222,9 @@ document.addEventListener("DOMContentLoaded", () => {
         valMarketRegime.className = "";
         if (snapshot.market_regime === "Trending Bullish") valMarketRegime.classList.add("text-green");
         else if (snapshot.market_regime === "Trending Bearish") valMarketRegime.classList.add("text-red");
+        // I3.0 4-state router: the two no-rubric stand-down states read as warnings.
+        else if (snapshot.market_regime === "Transition" || snapshot.market_regime === "Untradeable")
+            valMarketRegime.classList.add("text-amber");
 
         safeText(valFearGreed, snapshot.fear_greed_index != null ? `${snapshot.fear_greed_index} / 100` : "—", "—");
 

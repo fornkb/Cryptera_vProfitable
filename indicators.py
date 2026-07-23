@@ -131,39 +131,69 @@ def _adx_last(df) -> float:
     return float(v) if pd.notna(v) else None
 
 
-def detect_regime(df_4h, df_1h, df_15m, smc_context: dict = None) -> str:
+REGIME_BULL = "Trending Bullish"
+REGIME_BEAR = "Trending Bearish"
+REGIME_RANGE = "Ranging / Sideways"
+REGIME_TRANSITION = "Transition"
+REGIME_UNTRADEABLE = "Untradeable"
+
+
+def detect_regime(df_4h, df_1h, df_15m, smc_context: dict = None,
+                  volatility: dict = None) -> str:
     """
-    Global regime (raw, pre-hysteresis): multi-swing 4H structure gated by a 4H
-    ADX floor, with a weighted EMA/RSI fallback that also respects the floor.
-    A directional structure with weak 4H ADX (< ADX_TREND_FLOOR) is treated as a
-    range, not a trend (BUG-08) — this stops the mean-revert rubric firing on
-    limp trends and the continuation rubric firing on choppy drift. Hysteresis
-    (compute_regime_with_hysteresis) is applied by the caller across runs.
+    4-state router (I3.0): trend / balanced range / transition / untradeable.
+
+    The old router assigned "Ranging / Sideways" on FAILURE of the trend test, so early
+    trends, post-CHoCH transitions and low-ADX directional drifts all routed into the
+    VAH/VAL fade rubric and got faded. A range must now be EARNED by positive evidence
+    of balance — no trend on either HTF, price contained by a bracketing 4H dealing
+    range, nothing breaking, volatility not expanding. Everything left over is
+    `Transition`: no continuation rubric, no fade rubric, HOLD with a named reason,
+    which is what a discretionary trader does in that tape.
+
+    `volatility` is a `detect_volatility_regime` block (computed today, previously
+    unused as a routing input): an expanding tape is not a fadeable range, and a
+    structureless expanding tape is not tradable at all.
+
+    Hysteresis (compute_regime_with_hysteresis) is applied by the caller across runs.
     """
     adx_4h = _adx_last(df_4h)
+    adx_1h = _adx_last(df_1h)
     trend_ok = adx_4h is None or adx_4h >= ADX_TREND_FLOOR
+    vol = (volatility or {}).get("regime")
 
     if smc_context:
-        struct_4h = smc_context.get("4h", {}).get("structure", "NEUTRAL")
-        struct_1h = smc_context.get("1h", {}).get("structure", "NEUTRAL")
-        bos_1h = smc_context.get("1h", {}).get("bos", {}) or {}
-        choch_1h = smc_context.get("1h", {}).get("choch", {}) or {}
+        c4 = smc_context.get("4h") or {}
+        c1 = smc_context.get("1h") or {}
+        st4 = c4.get("structure_state") or {}
 
-        def is_bull(s):
-            return "HH" in s and "HL" in s
+        bull4 = st4.get("state") == "trending" and st4.get("trend") == "bullish"
+        bear4 = st4.get("state") == "trending" and st4.get("trend") == "bearish"
+        no_read_4h = st4.get("state") == "neutral" and not st4.get("trend")
 
-        def is_bear(s):
-            return "LH" in s and "LL" in s
+        quiet = ((adx_4h is None or adx_4h < ADX_TREND_FLOOR)
+                 and (adx_1h is None or adx_1h < ADX_TREND_FLOOR))
+        contained = bool((c4.get("dealing_range") or {}).get("brackets_price"))
+        fresh_break = any((ctx.get("bos") or {}).get("fresh")
+                          or (ctx.get("choch") or {}).get("fresh")
+                          for ctx in (c1, c4))
 
-        if trend_ok and is_bull(struct_4h):
-            return "Trending Bullish"
-        if trend_ok and is_bear(struct_4h):
-            return "Trending Bearish"
-        # Directional 4H structure but sub-floor ADX -> not a tradable trend.
-        if not trend_ok and (is_bull(struct_4h) or is_bear(struct_4h)):
-            return "Ranging / Sideways"
-        if bos_1h.get("level") is None and not choch_1h.get("detected") and not (is_bull(struct_1h) or is_bear(struct_1h)):
-            return "Ranging / Sideways"
+        # (1) balanced range — earned, not defaulted to. An early trend fails this on
+        #     `fresh_break` (that break IS the early trend) or on containment (price has
+        #     left the range), which is exactly the case the old router mis-faded.
+        if quiet and contained and not fresh_break and vol != "expanded":
+            return REGIME_RANGE
+        # (2) trend
+        if trend_ok and bull4:
+            return REGIME_BULL
+        if trend_ok and bear4:
+            return REGIME_BEAR
+        # (3) untradeable — no structural read at all AND a tape that can't be faded
+        if no_read_4h and vol in ("expanded", "unknown", None):
+            return REGIME_UNTRADEABLE
+        # (4) directional structure with sub-floor ADX, unconfirmed changes of character,
+        #     everything else: a transition, NOT a range.
+        return REGIME_TRANSITION
 
     def tf_score(df):
         if df is None or df.empty or "EMA_50" not in df.columns or "EMA_200" not in df.columns:
@@ -179,18 +209,35 @@ def detect_regime(df_4h, df_1h, df_15m, smc_context: dict = None) -> str:
                 score -= 1
         return score
 
+    # Degraded path (no SMC context): EMA/RSI only. Without structure there is no
+    # evidence of balance, so the non-trend answer is Transition, never a fade.
     weighted = 0.5 * tf_score(df_4h) + 0.3 * tf_score(df_1h) + 0.2 * tf_score(df_15m)
     if trend_ok and weighted > 0.8:
-        return "Trending Bullish"
+        return REGIME_BULL
     if trend_ok and weighted < -0.8:
-        return "Trending Bearish"
-    return "Ranging / Sideways"
+        return REGIME_BEAR
+    return REGIME_TRANSITION
 
 
 def regime_bucket(regime: str) -> str:
-    """Rubric bucket a regime string maps to: 'ranging' (mean-revert) or 'trending'."""
+    """
+    Rubric bucket a regime maps to (I3.0, 4-state): 'trending' (continuation rubric),
+    'ranging' (mean-revert rubric), or the two no-rubric states 'transition' and
+    'untradeable', which route to a deterministic HOLD.
+    """
     r = regime or ""
-    return "ranging" if ("Ranging" in r or "Sideways" in r) else "trending"
+    if "Ranging" in r or "Sideways" in r:
+        return "ranging"
+    if "Transition" in r:
+        return "transition"
+    if "Untradeable" in r:
+        return "untradeable"
+    return "trending"
+
+
+def is_tradable_bucket(bucket: str) -> bool:
+    """True for the two buckets that carry a scoring rubric."""
+    return bucket in ("trending", "ranging")
 
 
 def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int = 2,
@@ -225,6 +272,11 @@ def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int
         eff, state = raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
     elif regime_bucket(raw_regime) == regime_bucket(effective):
         # same rubric -> accept immediately (picks up direction changes too)
+        eff, state = raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
+    elif not is_tradable_bucket(regime_bucket(raw_regime)):
+        # I3.0: hysteresis exists to stop the engine flip-flopping INTO a rubric on
+        # noise. Standing DOWN into transition/untradeable is never delayed — a
+        # confirmed change of character should not be traded for two more bars.
         eff, state = raw_regime, {"effective": raw_regime, "candidate": None, "candidate_runs": 0}
     else:
         # candidate is in the opposite rubric bucket

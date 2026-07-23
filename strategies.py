@@ -20,7 +20,9 @@ import pandas as pd
 
 from config import (LOCATION_CAP, LOCATION_KEYS, SL_ATR_CAP, ENTRY_ATR_CAP,
                     VOLUME_HARD_GATE, VOLUME_LOW_VOL_WARNING,
-                    MAX_TARGET_ATR_1H_MULTIPLE)
+                    MAX_TARGET_ATR_1H_MULTIPLE, CONDITIONAL_ENTRY_THRESHOLD,
+                    DISPLACED_BREAK_MEMORY_BARS)
+from indicators import regime_bucket
 
 _CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "calibration.json")
 _CALIBRATION_CACHE = None
@@ -196,7 +198,38 @@ def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: f
 
 # ---------------- trend-continuation components (C1-C8) ---------------- #
 
-def _c1_trend(smc_context, windowed):
+def _displaced_bos(smc_context, tf, bias):
+    """
+    A displaced BOS in the bias direction on `tf`, still within structural memory.
+    `bos.displacement` is the ICT-native quality marker and was computed but consumed
+    nowhere (B8.0); now that I3.0 anchors it to the breaking impulse it means something.
+    """
+    bos = (smc_context.get(tf) or {}).get("bos") or {}
+    if not bos.get("displacement") or bias not in ("bullish", "bearish"):
+        return False
+    if bos.get("direction", "").lower() != bias:
+        return False
+    ago = bos.get("bars_ago")
+    return ago is not None and ago <= DISPLACED_BREAK_MEMORY_BARS
+
+
+def _counter_choch(smc_context, direction):
+    """
+    A fresh CHoCH on 1H or 4H opposing `direction` (B8.0). Returns a describing note or
+    "" — structure labels lag a change of character by several swings, so without this
+    the engine keeps proposing continuation into a market that has already broken.
+    """
+    if direction not in ("bullish", "bearish"):
+        return ""
+    for tf in ("4h", "1h"):
+        ch = (smc_context.get(tf) or {}).get("choch") or {}
+        if ch.get("fresh") and ch.get("direction", "").lower() != direction:
+            ago = ch.get("bars_ago")
+            return f"fresh {tf.upper()} {ch['direction']} CHoCH ({ago} bars ago) vs {direction} setup"
+    return ""
+
+
+def _c1_trend(smc_context, windowed, bias=None):
     s4 = smc_context.get("4h", {}).get("structure", "NEUTRAL")
     s1 = smc_context.get("1h", {}).get("structure", "NEUTRAL")
     adx = float(windowed.get("4h", {}).get("adx", 0.0) or 0.0)
@@ -213,12 +246,18 @@ def _c1_trend(smc_context, windowed):
         return 0, f"no directional structure ({s4} vs {s1})"  # neither TF directional
     # aligned and directional -> ADX tiering
     if adx < 25:
-        return 10, f"weak ADX {adx:.1f}"
-    if adx < 41:
-        return 15, f"medium ADX {adx:.1f}"
-    if adx < 56:
-        return 20, f"strong ADX {adx:.1f}"
-    return 25, f"very strong ADX {adx:.1f}"
+        pts, note = 10, f"weak ADX {adx:.1f}"
+    elif adx < 41:
+        pts, note = 15, f"medium ADX {adx:.1f}"
+    elif adx < 56:
+        pts, note = 20, f"strong ADX {adx:.1f}"
+    else:
+        pts, note = 25, f"very strong ADX {adx:.1f}"
+    # B8.0: a displaced break in the bias direction is evidence the move is real.
+    # Bounded (+5, still clamped to the C1 max) so it cannot carry a setup alone.
+    if _displaced_bos(smc_context, "1h", bias):
+        pts, note = pts + 5, f"{note} + displaced 1H BOS"
+    return pts, note
 
 
 def _zone_distance(price, a, b):
@@ -469,12 +508,20 @@ def _m5_rejection(pa_context, mr_dir):
 
 
 def _m6_range_confirmed(smc_context):
-    """Bonus when 1H has no fresh BOS/CHoCH (range intact, fade is safer)."""
+    """
+    Bonus when 1H has no fresh BOS/CHoCH (range intact, fade is safer). B8.0: a
+    DISPLACED break of the range stays disqualifying after `fresh` ages out — an
+    impulsive break is not the same event as a drift through the level, and the range
+    it broke does not come back just because 12 bars passed.
+    """
     bos = smc_context.get("1h", {}).get("bos", {}) or {}
     choch = smc_context.get("1h", {}).get("choch", {}) or {}
-    if not bos.get("fresh") and not choch.get("fresh"):
-        return 10, "range intact (no fresh break)"
-    return 0, "structure breaking - range at risk"
+    if bos.get("fresh") or choch.get("fresh"):
+        return 0, "structure breaking - range at risk"
+    ago = bos.get("bars_ago")
+    if bos.get("displacement") and ago is not None and ago <= DISPLACED_BREAK_MEMORY_BARS:
+        return 0, f"displaced 1H BOS {ago} bars ago - range broken"
+    return 10, "range intact (no fresh break)"
 
 
 # ---------------- volume gate ---------------- #
@@ -1027,10 +1074,25 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
     pwh = (pa_context or {}).get("pwh")  # previous-week high/low — HTF sweep draws (IMP-2)
     pwl = (pa_context or {}).get("pwl")
 
-    is_ranging = "Ranging" in (market_regime or "") or "Sideways" in (market_regime or "")
+    bucket = regime_bucket(market_regime)
+    is_ranging = bucket == "ranging"
     trend_bias = derive_trend_bias(smc_context, df_4h)
 
-    if is_ranging:
+    if bucket in ("transition", "untradeable"):
+        # I3.0 4-state router: no continuation rubric, no fade rubric. A change of
+        # character that has not confirmed (or a tape with no structural read) is not a
+        # setup waiting to be scored — it is a stand-down, so the engine says so instead
+        # of routing it into whichever rubric it failed to qualify for.
+        score_mode = "no_trade"
+        direction = "neutral"
+        raw = {k: 0 for k in ("c1_trend_alignment", "c2_ob_proximity", "c3_liquidity_sweep",
+                              "c4_momentum", "c5_fvg_magnet", "c6_ote_bonus",
+                              "c7_cvd_alignment", "c8_stochrsi")}
+        breakdown = dict(raw)
+        notes = {"regime": f"{market_regime} - no rubric applies (structure unresolved)"}
+        base, absorption, mr_edge = 0, False, None
+        geo_bias = "neutral"
+    elif is_ranging:
         score_mode = "mean_revert"
         mr_dir, mr_edge, va = _mr_setup(price, pa_context, smc_context)
         # B2.0: a fade requires the range to still contain price, OR a sweep+reclaim of the
@@ -1074,7 +1136,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
     else:
         score_mode = "trend"
         direction = trend_bias
-        c1, n1 = _c1_trend(smc_context, windowed_indicators)
+        c1, n1 = _c1_trend(smc_context, windowed_indicators, trend_bias)
         c2, n2 = _c2_ob_prox(price, smc_context, trend_bias, atr_abs)
         c3, n3, c3_tier = detect_mtf_sweep(df_15m, smc_context, pdh, pdl, trend_bias, pwh, pwl)
         c4, n4 = _c4_momentum(df_1h, windowed_indicators, trend_bias)
@@ -1104,6 +1166,17 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
                                             sentiment, windowed_indicators, btc_dominance)
     final = int(max(0, min(100, base + of_mod)))
 
+    # B8.0 counter-CHoCH veto: a FRESH change of character on 1H or 4H opposing the trade
+    # direction is the single most important SMC stand-down signal, and it used to have no
+    # effect on the rubric at all. An explicit cap (same mechanism as the event guard)
+    # beats silently zeroing a component — it stays visible, calibratable and explainable.
+    counter_choch = _counter_choch(smc_context, geo_bias)
+    if counter_choch and final > CONDITIONAL_ENTRY_THRESHOLD - 1:
+        final = CONDITIONAL_ENTRY_THRESHOLD - 1
+        notes["counter_choch_cap"] = f"capped at {final}: {counter_choch}"
+    elif counter_choch:
+        notes["counter_choch_cap"] = counter_choch
+
     gate = _volume_gate(windowed_indicators)
 
     # deterministic trade geometry
@@ -1127,6 +1200,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         "setup_direction": direction,
         "liquidity_sweep": breakdown.get("c3_liquidity_sweep", breakdown.get("m2_edge_sweep", 0)) > 0,
         "cvd_absorption_warning": absorption,
+        "counter_choch_warning": bool(counter_choch),
         "volume_gate": gate,
         "base_score": int(base),
         "order_flow_modifier": int(of_mod),

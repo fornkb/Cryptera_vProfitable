@@ -147,6 +147,20 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
       returns a 4-tuple. `SCHEMA_VERSION` 3.4.0→3.5.0. New `test_structure_machine.py`
       (11 golden scenarios, **every one asserted on both mirrored sides**) + 24-check
       offline pipeline smoke. 183/183. *Counter-CHoCH veto + 4-state router = I3.0b.*
+- [x] **I3.0b (router + B8.0)** — `detect_regime` is a 4-state router: **trend** /
+      **Ranging / Sideways** (now EARNED by evidence of balance — sub-floor ADX on 4H *and*
+      1H, price contained by a bracketing 4H dealing range, no fresh break, volatility not
+      expanding) / **Transition** / **Untradeable**, with `detect_volatility_regime` finally
+      wired in as a routing input. Everything that merely fails the trend test is a
+      Transition, not a fade. `regime_bucket` gains the two no-rubric buckets +
+      `is_tradable_bucket`; hysteresis now accepts a stand-down IMMEDIATELY (only entering a
+      tradable rubric needs confirmation runs). `evaluate_strategies` routes those buckets to
+      `score_mode="no_trade"` (canonical zeroed keys, score 0, neutral direction, invalid
+      geometry → HOLD, and below `LLM_CALL_THRESHOLD` so zero Gemini spend). **B8.0**:
+      `_counter_choch` caps the score at `CONDITIONAL_ENTRY_THRESHOLD - 1` on a fresh
+      opposing 1H/4H CHoCH (+ `counter_choch_warning` → engine_case veto), `bos.displacement`
+      is finally consumed (bounded +5 to C1 in the bias direction; a displaced break keeps
+      disqualifying M6 after `fresh` ages out). New `test_regime_router.py` (21). 204/204.
 - [ ] **I4.0** sequential setup detectors + expiry (absorbs rest of B2.0/B18.0).
 - [ ] **I5.0** typed liquidity & sweep quality (B12.0).
 - [ ] **I6.0** OTE anchored to displacement leg (B9.0).
@@ -232,3 +246,8 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
   Mutually-exclusive trend-conditioned BOS/CHoCH + transition state + impulse-anchored
   displacement; `structure` label sourced from the machine; `structure_state` per TF.
   SCHEMA 3.5.0. New `test_structure_machine.py` (11, all mirrored). 183/183.
+- 2026-07-24 — **Wave 3 I3.0b landed** (`indicators.py`, `strategies.py`, `main.py`, `app.js`).
+  4-state router (range must be earned; volatility wired in), immediate stand-down hysteresis,
+  `no_trade` score mode, B8.0 counter-CHoCH cap + displacement consumption.
+  New `test_regime_router.py` (21). 204/204. **Expect a large drop in trade frequency —
+  that is the intended effect; measure quality-per-trade on the clean corpus in Wave 4.**

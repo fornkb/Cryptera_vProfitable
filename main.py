@@ -718,6 +718,9 @@ header.score_breakdown is filled by the engine, not by you):
    M1 edge_distance(25) proximity to VAH/VAL · M2 edge_sweep(15) sweep of the edge
    M3 cvd_absorption(15) · M4 stoch_extreme(15) · M5 rejection candle(10) · M6 range_intact(10)
    Direction = SELL near VAH, BUY near VAL. `setup_direction` carries this.
+ score_mode == "no_trade" (`market_regime` Transition or Untradeable): NEITHER rubric applies.
+   A change of character has not confirmed, or there is no structural read at all — the engine
+   scores 0 and proposes nothing. REJECT unless you can name structure the engine missed.
 
 Order flow: `strategies.order_flow_modifier` (already in the score) reflects L2 depth imbalance,
 funding crowding + trajectory, OI build, F&G extremes, and BTC-dominance (alt macro headwind) —
@@ -1159,6 +1162,8 @@ def _build_engine_case(snapshot: dict) -> dict:
         vetoes.append("event_guard (caps at CONDITIONAL, -15 confidence)")
     if strat.get("cvd_absorption_warning"):
         vetoes.append("cvd_absorption_warning (-10 confidence)")
+    if strat.get("counter_choch_warning"):
+        vetoes.append("counter_choch (fresh opposing change of character; score capped)")
     if (strat.get("volume_gate") or {}).get("state") == "LOW_VOL_WARNING":
         vetoes.append("LOW_VOL_WARNING (50% size, +1 confluence required)")
     if (direction in ("bullish", "bearish") and trend_bias in ("bullish", "bearish")
@@ -1597,7 +1602,8 @@ async def compute_snapshot_no_llm(symbol: str) -> tuple[dict, dict]:
     # Global regime (SMC-driven) with cross-run hysteresis on the rubric (BUG-08),
     # keyed by the last-closed 15m bar so a restart/CLI re-run within one bar is
     # idempotent and can't advance the flip counter with no new data (B16.0).
-    raw_regime = detect_regime(data["4h"], data["1h"], data["15m"], smc_context=smc_context)
+    raw_regime = detect_regime(data["4h"], data["1h"], data["15m"], smc_context=smc_context,
+                               volatility=vol_regime.get("1h"))
     try:
         bar_id = int(data["15m"]["timestamp"].iloc[-1].value // 1_000_000)
     except Exception:

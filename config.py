@@ -50,6 +50,10 @@ DEFAULT_WIDTH = (3, 3)
 # direction confirms nor the old trend reasserts within this many bars OF THAT TF, the
 # transition decays to `neutral` rather than latching a permanent no-trade state.
 TRANSITION_EXPIRY_BARS = 24
+# How long a DISPLACED structural break keeps counting as evidence after `fresh` ages
+# out (B8.0): an impulsive break is a different event from a drift through a level, and
+# the range it broke does not reform just because the freshness window elapsed.
+DISPLACED_BREAK_MEMORY_BARS = 24
 
 # ---------------- regime ---------------- #
 ADX_TREND_FLOOR = 20.0            # 4H ADX must clear this for a "Trending" classification (BUG-08)
