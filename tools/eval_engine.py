@@ -88,6 +88,7 @@ def _accumulator():
         "tp": 0,
         "sl": 0,
         "timeout": 0,
+        "intrabar_unknown": 0,
         "no_data": 0,
         "sum_mfe": 0.0,
         "sum_mae": 0.0,
@@ -110,6 +111,10 @@ def _record(acc, outcome):
             acc["tp"] += 1
         elif o == "sl_first":
             acc["sl"] += 1
+        elif o == "intrabar_unknown":
+            # B1.0: entry-vs-exit order unknowable even at 1m. A distinct class, kept
+            # out of the timeout bucket; realized-R treatment lands with B15.0.
+            acc["intrabar_unknown"] += 1
         else:
             acc["timeout"] += 1
         if outcome.get("mfe_pct") is not None:
@@ -131,6 +136,7 @@ def _finalize(acc):
         "tp_first": acc["tp"],
         "sl_first": acc["sl"],
         "timeout": acc["timeout"],
+        "intrabar_unknown": acc["intrabar_unknown"],
         "no_data": acc["no_data"],
         "trigger_rate": round(acc["triggered"] / n, 3),
         "hit_rate": round(acc["tp"] / triggered, 3) if acc["triggered"] else None,

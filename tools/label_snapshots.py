@@ -2,25 +2,36 @@
 Outcome-label saved snapshots by replaying the realized 15m / 1h candles that
 followed each snapshot timestamp.
 
-For every snapshot that contains an `analysis.trade_decision` with non-null
+Chronological order-state machine (B1.0). For every snapshot with an
+`analysis.trade_decision` / `engine_trade` that carries non-null
 entry / stop_loss / take_profit, we fetch the next `horizon_hours` of candles
-and record:
-  * triggered:           did price reach the entry level?
-  * tp_first:            did TP fill before SL?
-  * sl_first:            did SL fill before TP?
-  * timeout:             neither side hit within the horizon
-  * mfe / mae (pct):     max favourable / adverse excursion vs. entry
-  * realized_rr:         (price extreme towards TP - entry) / (entry - sl)
+and replay them IN TIME ORDER through `PENDING_ENTRY -> OPEN -> TP | SL | TIMEOUT`:
+the entry must fill before any exit is counted. Recorded per trade:
+  * triggered:            did price reach the entry level (touch or gap-through)?
+  * tp_first / sl_first:  which exit filled first, AFTER the entry filled
+  * timeout:              filled but neither exit hit within the horizon
+  * intrabar_unknown:     entry and an exit share one bar's range and the fill-vs-exit
+                          order can't be reconstructed even at 1m -> a distinct class,
+                          NEVER silently scored a win (this is the core B1.0 fix)
+  * not_triggered:        entry never filled
+  * mfe / mae (pct):      max favourable / adverse excursion FROM THE FILL onward
+                          (no pre-fill credit on the entry bar)
+  * realized_rr:          MFE expressed in R (excursion, not PnL -- reworked in B4.0)
+  * end_rr:               close-at-horizon in R (terminal state; feeds B4.0/B15.0)
+  * entry_time / exit_time / resolution_used: chronology + how the exit order was decided
 
-A 15m bar that touches BOTH sl and tp is ambiguous at 15m resolution. Rather than
-blindly assuming the loss, we DRILL into that one bar's 1m candles and replay them
-to see which side was actually hit first (`_resolve_1m`). The pessimistic sl_first
-assumption survives only as the final tiebreak — when 1m data is unavailable or a
-1m bar itself still straddles both. `ambiguous_15m` on the outcome flags that the
-drill happened, so its frequency/impact is auditable.
+Intrabar resolution: when one 15m bar's range straddles two decision levels the order
+is unknowable at 15m, so we DRILL into that bar's 1m candles. Two cases:
+  - a position already OPEN whose bar touches BOTH sl and tp -> `_resolve_1m` (the
+    pessimistic `sl_first` tiebreak from f949ab9 survives when 1m can't separate them);
+  - the ENTRY bar also touching an exit -> `_resolve_entry_1m`, which reconstructs the
+    fill first and only counts an exit after it; unresolvable -> `intrabar_unknown`.
 
-Forward-scenario contingent setups are labelled the same way under
-`forward_outcome` when their entry/SL/TP are present.
+Horizon (B1.0): a bar is kept only if its CLOSE time is within the horizon. `timestamp`
+is the bar OPEN, so the cut is strict `<` (the old `<=` kept the bar opening at +horizon,
+which closes 15m past it).
+
+Forward-scenario contingent setups are labelled the same way under `forward_outcome`.
 
 Usage:
     python -m tools.label_snapshots                # label everything
@@ -43,6 +54,11 @@ import requests
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
+
+# Bump whenever _label_one's semantics change so corpora of mixed label meaning can
+# never be pooled unnoticed. v1 = pre-B1.0 (order-of-events assumed); v2 = chronological
+# state machine + intrabar_unknown + entry-bar excursion fix + strict horizon + end_rr.
+LABEL_VERSION = 2
 
 
 def _parse_snapshot_time(filename: str) -> datetime | None:
@@ -85,10 +101,33 @@ def _floor_to_15m(ms: int) -> int:
     would exclude the bar forming AT snapshot time — up to 14.5 min of price
     action the engine's levels were quoted against. Snapshots are taken ~30s
     after the close (POLL_SECOND_OFFSET), so flooring admits only that
-    negligible pre-snapshot movement; the same-bar SL-first conservatism in
-    _label_one covers the snapshot bar itself.
+    negligible pre-snapshot movement; the entry-bar order state machine in
+    _label_one covers the snapshot bar itself (no exit counts before the fill).
     """
     return ms - ms % 900_000
+
+
+def _ts_iso(ts) -> str | None:
+    """A bar timestamp (pandas Timestamp / None) -> UTC ISO 'Z' string, or None."""
+    if ts is None:
+        return None
+    try:
+        if pd.isna(ts):
+            return None
+    except (TypeError, ValueError):
+        pass
+    t = pd.Timestamp(ts)
+    t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    return t.isoformat().replace("+00:00", "Z")
+
+
+def _truncate_to_horizon(df: pd.DataFrame, since_ms: int, horizon_hours: int) -> pd.DataFrame:
+    """Keep only bars whose CLOSE time is within the horizon. Bars are 15m and
+    `timestamp` is the bar OPEN, so a bar opening at exactly since+horizon closes
+    15m later and must be dropped: strict `<` on open-time (B1.0 — the old `<=`
+    kept one extra bar, letting outcomes be decided up to +15m past the horizon)."""
+    cutoff = pd.Timestamp(since_ms, unit="ms", tz="UTC") + pd.Timedelta(hours=horizon_hours)
+    return df[df["timestamp"] < cutoff].reset_index(drop=True)
 
 
 def _fetch_future_candles(symbol: str, since_ms: int, horizon_hours: int):
@@ -116,15 +155,14 @@ def _fetch_future_candles(symbol: str, since_ms: int, horizon_hours: int):
                for k in r]
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    cutoff = pd.Timestamp(since_ms, unit="ms", tz="UTC") + pd.Timedelta(hours=horizon_hours)
-    return df[df["timestamp"] <= cutoff].reset_index(drop=True)
+    return _truncate_to_horizon(df, since_ms, horizon_hours)
 
 
 def _fetch_1m_window(symbol: str, start_ms: int, minutes: int = 15):
     """Fetch the `minutes` one-minute candles of a single 15m bar (its open at
-    `start_ms`) so an ambiguous bar that straddled both SL and TP can be resolved
-    at 1m resolution instead of assuming the worst case. Same fapi namespace as
-    everything else (BUG-01). Returns a high/low DataFrame, or None on failure."""
+    `start_ms`) so an ambiguous bar can be resolved at 1m resolution instead of
+    guessing. Same fapi namespace as everything else (BUG-01). Returns a
+    high/low DataFrame, or None on failure."""
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/klines",
@@ -141,13 +179,14 @@ def _fetch_1m_window(symbol: str, start_ms: int, minutes: int = 15):
     return pd.DataFrame([[float(k[2]), float(k[3])] for k in r], columns=["high", "low"])
 
 
-def _resolve_1m(df1m, side: str, sl: float, tp: float) -> str:
-    """Given the 1m candles of a 15m bar that straddled BOTH sl and tp, walk them
-    in order and return which was touched first ('tp_first' | 'sl_first'). Falls
-    back to the pessimistic 'sl_first' when 1m data is missing or a single 1m bar
-    itself straddles both (still unknowable — keep the conservative tiebreak)."""
+def _resolve_1m(df1m, side: str, sl: float, tp: float):
+    """Exit-order resolution for a position that is ALREADY OPEN when a single 15m bar
+    touches BOTH sl and tp. Walks the bar's 1m candles in order. Returns
+    (outcome, resolution): ('tp_first'|'sl_first', '1m') when reconstructable; the
+    pessimistic 'sl_first' tiebreak (f949ab9) survives with a '1m_unavailable' /
+    '1m_unresolved' tag when 1m data is missing or a 1m bar itself straddles both."""
     if df1m is None or getattr(df1m, "empty", True):
-        return "sl_first"
+        return "sl_first", "1m_unavailable"
     for _, r in df1m.iterrows():
         hi, lo = float(r["high"]), float(r["low"])
         if side == "long":
@@ -155,111 +194,208 @@ def _resolve_1m(df1m, side: str, sl: float, tp: float) -> str:
         else:
             sl_hit, tp_hit = hi >= sl, lo <= tp
         if sl_hit and tp_hit:
-            return "sl_first"   # still ambiguous even at 1m -> worst case
+            return "sl_first", "1m_unresolved"   # still ambiguous even at 1m -> worst case
         if tp_hit:
-            return "tp_first"
+            return "tp_first", "1m"
         if sl_hit:
-            return "sl_first"
-    return "sl_first"           # both were seen at 15m, so this is unreachable; be safe
+            return "sl_first", "1m"
+    return "sl_first", "1m_unresolved"            # both seen at 15m, so unreachable; be safe
+
+
+def _resolve_entry_1m(df1m, side: str, entry: float, sl: float, tp: float):
+    """Entry-vs-exit order resolution: one 15m bar's range contains BOTH the entry and
+    an exit level, so we cannot tell whether the entry filled before the exit was
+    touched. Walk the bar's 1m candles reconstructing PENDING->OPEN and count an exit
+    ONLY after the fill. Returns (outcome, resolution):
+      ('tp_first'|'sl_first', '1m')   -> order reconstructed
+      ('open_continue', '1m')         -> filled at 1m, no exit inside the bar (stay open)
+      ('intrabar_unknown', ...)       -> 1m missing, never fills, or a single 1m bar
+                                         straddles the fill and an exit
+    Never returns a silent win when the order is truly unknowable (B1.0)."""
+    if df1m is None or getattr(df1m, "empty", True):
+        return "intrabar_unknown", "1m_unavailable"
+    filled = False
+    for _, r in df1m.iterrows():
+        hi, lo = float(r["high"]), float(r["low"])
+        if side == "long":
+            sl_hit, tp_hit = lo <= sl, hi >= tp
+        else:
+            sl_hit, tp_hit = hi >= sl, lo <= tp
+        if not filled:
+            if lo <= entry <= hi:
+                filled = True
+                if sl_hit or tp_hit:
+                    # the fill 1m bar also touches an exit -> order still unknowable
+                    return "intrabar_unknown", "1m_unresolved"
+            # not filled yet: any exit touch is pre-fill and does not count
+            continue
+        if sl_hit and tp_hit:
+            return "intrabar_unknown", "1m_unresolved"
+        if tp_hit:
+            return "tp_first", "1m"
+        if sl_hit:
+            return "sl_first", "1m"
+    return ("open_continue", "1m") if filled else ("intrabar_unknown", "1m_unresolved")
 
 
 def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame,
                intrabar_resolver=None) -> dict:
     """
-    side: 'long' or 'short'.
-    Walk forward bar by bar. A bar that touches BOTH SL and TP is ambiguous at 15m
-    resolution: if `intrabar_resolver` is supplied (a callable bar_open_ms -> 1m
-    DataFrame) we drill into that bar's 1m candles to decide which was hit first
-    (`_resolve_1m`); otherwise, or if 1m data is unavailable, we fall back to the
-    pessimistic `sl_first`. A resting limit order also counts as triggered if price
-    gapped THROUGH the entry level between two consecutive closed bars, even though
-    no single bar's [low, high] range contains it (BUG-18 — previously silently
-    under-counted as not-triggered).
+    side: 'long' or 'short'. Replay `df` (15m bars, time-ordered) through a
+    PENDING_ENTRY -> OPEN -> TP|SL|TIMEOUT state machine. The entry fills on the first
+    bar whose range contains it OR that price gapped THROUGH between two closes (BUG-18);
+    no exit is counted before the fill. A bar that makes the fill-vs-exit or the
+    sl-vs-tp order ambiguous at 15m is drilled to 1m (`_resolve_entry_1m` /
+    `_resolve_1m`); truly unknowable entry-vs-exit orders become `intrabar_unknown`
+    (never a silent win). Excursions (MFE/MAE) accrue from the fill onward — the entry
+    bar contributes no favourable credit (pre-fill contamination fix, B1.0) but keeps
+    its adverse move (pessimistic).
     """
     if df is None or df.empty:
         return {"triggered": False, "outcome": "no_data"}
 
-    triggered = False
+    state = "PENDING"            # PENDING -> OPEN -> (terminal via break)
     entry_idx = None
-    prev_close = None
-    for i, row in df.iterrows():
-        lo, hi = float(row["low"]), float(row["high"])
-        if lo <= entry <= hi:
-            triggered = True
-            entry_idx = i
-            break
-        if prev_close is not None and ((prev_close < entry < lo) or (prev_close > entry > hi)):
-            triggered = True
-            entry_idx = i
-            break
-        prev_close = float(row["close"])
-
-    if not triggered:
-        return {"triggered": False, "outcome": "not_triggered",
-                "bars_observed": int(len(df))}
-
-    post = df.iloc[entry_idx:].reset_index(drop=True)
+    entry_time = None
+    exit_time = None
+    outcome = "timeout"         # stays 'timeout' if filled but no exit within horizon
+    resolution = "none"
+    ambiguous = False
+    bars_to_close = None
     mfe = 0.0
     mae = 0.0
-    outcome = "timeout"
-    bars_to_close = None
-    ambiguous = False
+    prev_close = None
 
-    for i, row in post.iterrows():
+    for i, row in df.iterrows():
+        lo, hi = float(row["low"]), float(row["high"])
+        close = float(row["close"])
+        ts = row.get("timestamp") if hasattr(row, "get") else None
+
         if side == "long":
-            fav = (row["high"] - entry) / entry * 100
-            adv = (row["low"] - entry) / entry * 100
-            mfe = max(mfe, fav)
-            mae = min(mae, adv)
-            sl_hit = row["low"] <= sl
-            tp_hit = row["high"] >= tp
+            fav = (hi - entry) / entry * 100
+            adv = (lo - entry) / entry * 100
+            sl_hit, tp_hit = lo <= sl, hi >= tp
         else:
-            fav = (entry - row["low"]) / entry * 100
-            adv = (entry - row["high"]) / entry * 100
-            mfe = max(mfe, fav)
-            mae = min(mae, adv)
-            sl_hit = row["high"] >= sl
-            tp_hit = row["low"] <= tp
+            fav = (entry - lo) / entry * 100
+            adv = (entry - hi) / entry * 100
+            sl_hit, tp_hit = hi >= sl, lo <= tp
 
+        if state == "PENDING":
+            range_fill = lo <= entry <= hi
+            gap_fill = prev_close is not None and (
+                (prev_close < entry < lo) or (prev_close > entry > hi))
+            if not (range_fill or gap_fill):
+                prev_close = close
+                continue
+
+            entry_idx = i
+            entry_time = ts
+
+            if gap_fill:
+                # Fill at the bar open (price crossed entry between closes), so the whole
+                # bar is post-fill: count its excursion and evaluate exits as OPEN. A gap
+                # bar can reach at most one exit level (price is on one side of entry).
+                mfe, mae = max(mfe, fav), min(mae, adv)
+                if sl_hit and tp_hit:                       # defensive; not reachable on a gap bar
+                    ambiguous = True
+                    outcome, resolution = _drill_open(intrabar_resolver, ts, side, sl, tp)
+                    exit_time, bars_to_close = ts, 0
+                    break
+                if sl_hit:
+                    outcome, resolution, exit_time, bars_to_close = "sl_first", "15m", ts, 0
+                    break
+                if tp_hit:
+                    outcome, resolution, exit_time, bars_to_close = "tp_first", "15m", ts, 0
+                    break
+                state = "OPEN"                              # opened, no exit this bar
+                prev_close = close
+                continue
+
+            # range_fill: the entry filled somewhere inside this bar -> intra-bar order is
+            # unknown. If the same bar also reaches an exit, reconstruct fill-then-exit at 1m.
+            if sl_hit or tp_hit:
+                ambiguous = True
+                res, tag = _drill_entry(intrabar_resolver, ts, side, entry, sl, tp)
+                if res == "open_continue":
+                    state = "OPEN"
+                    mae = min(mae, adv)                     # entry-bar fav withheld; adverse kept
+                    resolution = tag
+                    prev_close = close
+                    continue
+                outcome, resolution = res, tag
+                exit_time, bars_to_close = ts, 0
+                mae = min(mae, adv)
+                break
+
+            # clean fill, no exit on the entry bar -> open from the next bar
+            state = "OPEN"
+            mae = min(mae, adv)                             # no favourable credit on the entry bar
+            prev_close = close
+            continue
+
+        # state == OPEN
+        mfe, mae = max(mfe, fav), min(mae, adv)
         if sl_hit and tp_hit:
-            # Both hit in one 15m bar -> order unknowable at 15m. Drill to 1m if we
-            # have a resolver + this bar's open time; else keep the worst-case sl_first.
             ambiguous = True
-            if intrabar_resolver is not None and "timestamp" in row:
-                bar_open_ms = int(pd.Timestamp(row["timestamp"]).timestamp() * 1000)
-                outcome = _resolve_1m(intrabar_resolver(bar_open_ms), side, sl, tp)
-            else:
-                outcome = "sl_first"
-            bars_to_close = i
+            outcome, resolution = _drill_open(intrabar_resolver, ts, side, sl, tp)
+            exit_time, bars_to_close = ts, i - entry_idx
             break
         if sl_hit:
-            outcome = "sl_first"
-            bars_to_close = i
+            outcome, resolution, exit_time, bars_to_close = "sl_first", "15m", ts, i - entry_idx
             break
         if tp_hit:
-            outcome = "tp_first"
-            bars_to_close = i
+            outcome, resolution, exit_time, bars_to_close = "tp_first", "15m", ts, i - entry_idx
             break
 
+    if entry_idx is None:
+        return {"triggered": False, "outcome": "not_triggered", "bars_observed": int(len(df))}
+
     risk = abs(entry - sl)
-    realized_rr = None
-    if risk > 0:
-        if side == "long":
-            extreme = entry * (1 + mfe / 100)
-        else:
-            extreme = entry * (1 - mfe / 100)
-        realized_rr = round(abs(extreme - entry) / risk, 3)
+    tp_dist_pct = abs(tp - entry) / entry * 100
+    sl_dist_pct = abs(entry - sl) / entry * 100
+    # An exit reached at least its level: keep excursions consistent with the outcome
+    # (covers the entry-bar case where per-bar favourable credit was withheld).
+    if outcome == "tp_first":
+        mfe = max(mfe, tp_dist_pct)
+    elif outcome == "sl_first":
+        mae = min(mae, -sl_dist_pct)
+
+    realized_rr = round((mfe / 100) * entry / risk, 3) if risk > 0 else None
+    last_close = float(df.iloc[-1]["close"])
+    end_move = (last_close - entry) if side == "long" else (entry - last_close)
+    end_rr = round(end_move / risk, 3) if risk > 0 else None
 
     return {
         "triggered": True,
         "outcome": outcome,
-        "bars_to_close": bars_to_close,
+        "resolution_used": resolution,
         "ambiguous_15m": ambiguous,
+        "bars_to_fill": int(entry_idx),
+        "bars_to_close": (int(bars_to_close) if bars_to_close is not None else None),
         "mfe_pct": round(mfe, 3),
         "mae_pct": round(mae, 3),
         "realized_rr": realized_rr,
+        "end_rr": end_rr,
+        "entry_time": _ts_iso(entry_time),
+        "exit_time": _ts_iso(exit_time),
         "bars_observed": int(len(df)),
     }
+
+
+def _drill_open(resolver, ts, side, sl, tp):
+    """Resolve an already-open bar that touches both sl and tp; (outcome, resolution)."""
+    if resolver is not None and ts is not None:
+        bar_open_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+        return _resolve_1m(resolver(bar_open_ms), side, sl, tp)
+    return "sl_first", "1m_unavailable"
+
+
+def _drill_entry(resolver, ts, side, entry, sl, tp):
+    """Resolve an entry bar that also touches an exit; (outcome, resolution)."""
+    if resolver is not None and ts is not None:
+        bar_open_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+        return _resolve_entry_1m(resolver(bar_open_ms), side, entry, sl, tp)
+    return "intrabar_unknown", "1m_unavailable"
 
 
 def _direction_to_side(direction: str) -> str | None:
@@ -327,6 +463,10 @@ def label_snapshot_file(path: str, horizon_hours: int, force: bool):
 
     snapshot["outcome"] = {
         "labeled_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "label_version": LABEL_VERSION,
+        # un-floored snapshot moment: makes the ~30s + up-to-14.5m flooring tolerance
+        # auditable against the fill/exit times (FA-09 / B28.0).
+        "decision_time": snap_time.isoformat().replace("+00:00", "Z"),
         "horizon_hours": horizon_hours,
         "bars_observed": int(len(df)),
         "trade_decision_outcome": trade_outcome,
@@ -335,7 +475,8 @@ def label_snapshot_file(path: str, horizon_hours: int, force: bool):
     }
 
     with open(path, "w") as f:
-        json.dump(snapshot, f, indent=2)
+        # compact: the daily label pass must not re-bloat the machine-read corpus (B25.0)
+        json.dump(snapshot, f, separators=(",", ":"))
     return True
 
 

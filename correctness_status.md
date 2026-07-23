@@ -31,9 +31,14 @@ findings by ID (**B1.0–B28.0**, **I1.0–I15.0**); do not restate them here. T
 One release, schema bump, mirror-property tests introduced. Order flexible (scoring fixes are
 independent of the labeler); B1.0 is the measurement ground truth.
 
-- [ ] **B1.0** — chronological labeler state machine (PENDING_ENTRY→OPEN→TP|SL|TIMEOUT),
-      extend 1m drill to entry+any-exit, horizon close-time ≤ end, entry-bar excursion fix,
-      `label_version`/`entry_time`/`exit_time`/`resolution_used`. Relabel + bump label version.
+- [x] **B1.0** — `_label_one` rewritten as PENDING→OPEN→TP|SL|TIMEOUT state machine;
+      `_resolve_entry_1m` reconstructs fill-then-exit (unknowable → `intrabar_unknown`,
+      never a silent win); `_resolve_1m` keeps the pessimistic SL tiebreak (returns
+      `(outcome,resolution)`); strict horizon via `_truncate_to_horizon`; entry-bar
+      favourable credit withheld; stamps `label_version=2`/`entry_time`/`exit_time`/
+      `resolution_used`/`bars_to_fill`; emits `end_rr` (B4.0 hook). `eval_engine` given an
+      `intrabar_unknown` bucket (kept out of timeouts). 24 labeler tests + 88/88 suite.
+      Relabel note: label_version bumped → old labels not poolable (corpus archived anyway).
 - [ ] **B2.0** — MR outside-value invalidation + sign-aware `_m1_edge_distance` + universal
       DOA guard in `compute_trade_geometry`.
 - [ ] **B3.0 / I2.0** — deterministic `validate_and_normalize_analysis` after every model
@@ -48,8 +53,9 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - [ ] **B15.0** — eval integrity: engine universe reads `strategies.*`; bucket by
       `setup_direction`; realized-R expectancy.
 - [ ] **B16.0** — hysteresis keyed by `(symbol, last_closed_15m_bar_open_ms)` (bar-idempotent).
-- [ ] Riders: **B25.0** (labeler compact write), **B26.0** (ab_thinking canonical replay),
-      **B27.0** (funding interval inference).
+- [x] Rider **B25.0** — labeler now writes compact (`separators=(",",":")`) instead of
+      `indent=2`, done as part of B1.0's `label_snapshot_file`.
+- [ ] Riders: **B26.0** (ab_thinking canonical replay), **B27.0** (funding interval inference).
 - [ ] Relabel + recalibrate discipline; schema/label_version bump; full pytest + regression seeds.
 
 ## Wave 2 — I1.0 adjudicator (on the I2.0 validator)
@@ -86,4 +92,8 @@ independent of the labeler); B1.0 is the measurement ground truth.
 
 - 2026-07-23 — Plan devised from the merged report; decision: keep collecting + archive at
   deploy. **Wave 0 (B14.0/I15.0) landed & verified offline** (7/7 + 72/72). Tracking doc
-  created. Next: Wave 1, starting with B1.0 (chronological labeler).
+  created.
+- 2026-07-23 — **Wave 1 B1.0 + B25.0 landed** (`tools/label_snapshots.py` rewrite,
+  `tools/eval_engine.py` intrabar bucket). Chronological state machine, `intrabar_unknown`
+  class, strict horizon, entry-bar excursion fix, `label_version=2`, `end_rr`. 88/88 tests
+  (24 in the labeler suite). Next: B5.0 (RSI-slope sign) + mirror-test pattern, then B6.0/B13.0.
