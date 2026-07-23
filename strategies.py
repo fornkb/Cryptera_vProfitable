@@ -799,6 +799,22 @@ def _rank_targets(labeled, entry, risk, direction, ref_price=None, atr_abs=None,
     return merged
 
 
+def _assign_level_ids(geometry):
+    """I1.0: stamp a stable, menu-scoped `level_id` on every candidate — E1.. entries,
+    S1.. stops, T1.. targets, in the already-ranked order the menu is emitted in. The
+    LLM adjudicator selects levels by these IDs (outputs an id, never a float), and
+    `trade_validation` resolves an id back to its exact candidate price — which removes
+    the float-tolerance guessing of which level the model "meant". IDs are unique within
+    one snapshot's menu; that is all the resolver needs (the model only ever sees this
+    call's menu). Mutates and returns `geometry`."""
+    cands = geometry.get("candidates") or {}
+    for kind, tag in (("entries", "E"), ("stops", "S"), ("targets", "T")):
+        for i, row in enumerate(cands.get(kind) or [], start=1):
+            if isinstance(row, dict):
+                row["level_id"] = f"{tag}{i}"
+    return geometry
+
+
 def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                            regime, score_mode, mr_edge=None, atr_1h=None):
     """
@@ -983,7 +999,7 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                                      ref_price=price, atr_abs=atr_abs, atr_1h=atr_1h),
         },
     })
-    return out
+    return _assign_level_ids(out)
 
 
 # ---------------- main evaluation ---------------- #

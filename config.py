@@ -16,7 +16,10 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
 REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
 SNAPSHOT_INDEX_PATH = os.path.join(DATA_DIR, "snapshot_index.json")
 
-SCHEMA_VERSION = "3.3.1"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5)
+SCHEMA_VERSION = "3.4.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+                          # 3.4.0: I1.0 adjudicator — candidate level_id menu +
+                          # analysis.verdict (AGREE/UPDATE/REJECT). Relabel+recalibrate
+                          # on deploy; the pre-fix corpus is archive-only (invariant 5).
 
 # ---------------- market / timeframes ---------------- #
 MARKET = "binance-usdm"          # single namespace (BUG-01) — never mix spot/futures

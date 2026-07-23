@@ -86,8 +86,12 @@ independent of the labeler); B1.0 is the measurement ground truth.
 
 ## Wave 2 — I1.0 adjudicator (on the I2.0 validator)
 
-- [ ] Trigger predicate `should_call_llm`; `engine_case` block; schema v2 AGREE/UPDATE/REJECT;
-      `level_id` candidate-ID selection; `by_verdict` eval; shadow rollout.
+- [x] **level_id menu** — `strategies._assign_level_ids` stamps stable menu-scoped
+      `level_id` (E*/S*/T*) on every entry/stop/target candidate in `compute_trade_geometry`,
+      in ranked order. `SCHEMA_VERSION` bumped 3.3.1→3.4.0 (snapshot shape now carries
+      `level_id`). Foundation for ID-based UPDATE selection. `test_level_ids.py` (5). 141/141.
+- [ ] Trigger predicate `should_call_llm`; `engine_case` block; schema v2 AGREE/UPDATE/REJECT
+      + `level_id` resolution in the validator; `by_verdict` eval; shadow rollout.
 
 ## Wave 3 — structure & menus (semantics-changing; land before collection restarts)
 
@@ -141,3 +145,6 @@ independent of the labeler); B1.0 is the measurement ground truth.
   (B1/B2/B3/B4) + directional (B5/B6/B13) + MR/regime (B2/B16) + measurement (B4/B15/B25) +
   levels/ops (B10/B14/B26/B27) done. **Next: Wave 2 — I1.0 adjudicator on the I2.0 validator.**
   Reminder: nothing has been deployed; VM still collecting the pre-fix corpus (archive at deploy).
+- 2026-07-23 — **Wave 2 level_id menu landed** (`strategies.py`, `config.py`). Every
+  entry/stop/target candidate now carries a stable menu-scoped `level_id`; SCHEMA_VERSION
+  3.3.1→3.4.0. New `test_level_ids.py` (5). 141/141. Foundation for schema-v2 UPDATE-by-ID.
