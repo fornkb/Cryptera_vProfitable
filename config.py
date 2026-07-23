@@ -56,6 +56,11 @@ KILL_ZONES = (
 # ---------------- scoring / gates ---------------- #
 ACTIVE_TRADE_THRESHOLD = 60
 CONDITIONAL_ENTRY_THRESHOLD = 45
+# I1.0: confluence floor at/above which a snapshot earns a Gemini adjudication call
+# (main.should_call_llm). Defaults to the CONDITIONAL band on purpose -- 45-59 borderline
+# setups are where AGREE/UPDATE/REJECT adjudication adds the most value. Below it: zero
+# Gemini spend, deterministic HOLD. DO NOT TUNE until Wave 4 (needs the clean corpus).
+LLM_CALL_THRESHOLD = CONDITIONAL_ENTRY_THRESHOLD
 VOLUME_HARD_GATE = 0.1
 VOLUME_LOW_VOL_WARNING = 0.3
 LOCATION_CAP = 25                 # C2+C5+C6 "location" composite cap (rubric decorrelation)

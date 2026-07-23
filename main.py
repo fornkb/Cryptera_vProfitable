@@ -29,7 +29,7 @@ from config import (SCHEMA_VERSION, DATA_DIR, SNAPSHOTS_DIR, OI_HISTORY_PATH,
                     SNAPSHOT_RETENTION, HORIZON_HOURS, MARKET, TIMEFRAMES,
                     REQUIRED_TIMEFRAMES, LIMITS, WINDOW_SIZE, TF_MS, CHART_BARS,
                     OHLCV_CACHE_MAX, CACHE_TTL_SECONDS, EVENT_GUARD_WINDOW_HOURS,
-                    EVENT_CALENDAR_STALE_DAYS,
+                    EVENT_CALENDAR_STALE_DAYS, LLM_CALL_THRESHOLD,
                     GEMINI_MODEL_NAME, GEMINI_THINKING_LEVEL,
                     GEMINI_KEY_COOLDOWN_SECONDS, GEMINI_TRANSIENT_RETRIES,
                     GEMINI_TRANSIENT_BACKOFF_SECONDS)
@@ -1541,6 +1541,69 @@ async def compute_snapshot_no_llm(symbol: str) -> tuple[dict, dict]:
     return snapshot_native, data
 
 
+def should_call_llm(snapshot: dict) -> bool:
+    """I1.0 trigger predicate — the single gate for whether a snapshot earns a Gemini
+    adjudication call. True only when the engine has a real structural trade
+    (`engine_trade.valid`), the volume HARD_GATE isn't forcing HOLD, and confluence clears
+    `LLM_CALL_THRESHOLD` (45 -- the CONDITIONAL band is deliberately included: borderline
+    setups are where AGREE/UPDATE/REJECT adjudication adds the most value). Below the gate:
+    deterministic engine HOLD, zero Gemini spend. Pure; safe on partial/None snapshots.
+
+    CLI/web newly acquire this gate (run_analysis). The monitor's alert path is already
+    gated by the STRICTER active-transition test (alerts.controller.engine_gate/
+    should_narrate) -- active (score >= ACTIVE_TRADE_THRESHOLD, valid, gate != HARD_GATE)
+    strictly implies this predicate, so the monitor is left unchanged."""
+    strat = (snapshot or {}).get("strategies") or {}
+    et = strat.get("engine_trade") or {}
+    gate = (strat.get("volume_gate") or {}).get("state") or "CLEAR"
+    score = strat.get("confluence_score") or 0
+    return bool(et.get("valid")) and gate != "HARD_GATE" and score >= LLM_CALL_THRESHOLD
+
+
+def _deterministic_analysis(snapshot: dict) -> dict:
+    """Engine-only analysis for the below-gate path (should_call_llm False): a clean HOLD
+    with no Gemini spend. The validator in _finalize_analysis recomputes header from the
+    engine and nulls the trade fields (a below-threshold / invalid / HARD_GATE snapshot all
+    resolve to HOLD), so this only supplies a schema-shaped skeleton for the dashboard and
+    downstream tooling. verdict='NO_CALL' marks it apart from an adjudicated plan."""
+    strat = snapshot.get("strategies") or {}
+    gate = (strat.get("volume_gate") or {}).get("state") or "CLEAR"
+    reason = ("engine HOLD — volume HARD_GATE" if gate == "HARD_GATE"
+              else "engine HOLD — below LLM adjudication threshold")
+    return {
+        "verdict": "NO_CALL",
+        "reject_reason": None,
+        "header": {
+            "pair": snapshot.get("symbol"), "price": snapshot.get("live_price"),
+            "bias": "NEUTRAL", "regime": snapshot.get("market_regime"),
+            "score": strat.get("confluence_score", 0), "action": "HOLD", "volume_gate": gate,
+        },
+        "mtf_context": {"cross_tf_momentum": "n/a", "htf_draw": "NONE"},
+        "narrative": {"summary": reason, "primary_draw": "n/a"},
+        "trade_decision": {
+            "primary": {"direction": "HOLD", "probability": 0},
+            "alternative": {"direction": "HOLD", "probability": 0, "trigger": "n/a"},
+            "entry": None, "entry_source": None, "stop_loss": None, "stop_loss_source": None,
+            "take_profit": None, "take_profit_source": None,
+            "rr": {"tp_distance": None, "sl_distance": None, "ratio": None, "passed": False},
+            "sl_width_pct": None, "confidence_pct": 0, "position_size": "100%",
+            "entry_trigger": "n/a", "invalidation": "n/a", "counter_structure": False,
+            "trade_management": {
+                "selected_from_engine": True, "selection_rationale": reason,
+                "tp1": None, "tp1_source": None, "tp1_rr": None,
+                "tp2": None, "tp2_source": None, "tp2_rr": None,
+                "move_to_breakeven_at": None, "scale_out": "n/a"},
+            "reasoning": {"structure": "n/a", "liquidity": "n/a",
+                          "momentum": "n/a", "sentiment": "n/a"},
+        },
+        "forward_scenario": {
+            "direction": "NEUTRAL", "key_levels": {"h4": [], "h1": [], "m15": []},
+            "trigger": "n/a", "entry": None, "stop_loss": None, "take_profit": None,
+            "rr": None, "volume_condition": "n/a", "supporting_confluence": "n/a",
+        },
+    }
+
+
 def narrate(snapshot_native: dict) -> dict:
     """The single Gemini call (expensive pass). Returns the raw analysis dict
     (an {"error": ...} dict on failure -- see query_gemini)."""
@@ -1637,7 +1700,11 @@ async def run_analysis(symbol: str) -> tuple[dict, dict]:
     """End-to-end pipeline (CLI/web). Returns (snapshot_dict, analysis_dict)."""
     snapshot_native, data = await compute_snapshot_no_llm(symbol)
 
-    analysis = narrate(snapshot_native)
+    # I1.0 trigger gate: adjudicate with Gemini only above LLM_CALL_THRESHOLD; below it,
+    # a deterministic engine HOLD with zero Gemini spend. finalize_analysis is a no-op on
+    # a narrate {"error": ...} dict, so it runs the same either way.
+    analysis = narrate(snapshot_native) if should_call_llm(snapshot_native) \
+        else _deterministic_analysis(snapshot_native)
     analysis = finalize_analysis(snapshot_native, analysis)
     snapshot_native["analysis"] = analysis
 

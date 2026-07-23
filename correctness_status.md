@@ -90,8 +90,14 @@ independent of the labeler); B1.0 is the measurement ground truth.
       `level_id` (E*/S*/T*) on every entry/stop/target candidate in `compute_trade_geometry`,
       in ranked order. `SCHEMA_VERSION` bumped 3.3.1→3.4.0 (snapshot shape now carries
       `level_id`). Foundation for ID-based UPDATE selection. `test_level_ids.py` (5). 141/141.
-- [ ] Trigger predicate `should_call_llm`; `engine_case` block; schema v2 AGREE/UPDATE/REJECT
-      + `level_id` resolution in the validator; `by_verdict` eval; shadow rollout.
+- [x] **`should_call_llm` trigger gate** — `config.LLM_CALL_THRESHOLD` (=45);
+      `main.should_call_llm(snapshot)` pure predicate (`engine_trade.valid AND gate !=
+      HARD_GATE AND score >= threshold`). `run_analysis` (CLI/web) newly acquires it —
+      below the gate it emits `_deterministic_analysis` (a clean engine HOLD, `verdict:
+      "NO_CALL"`) with ZERO Gemini spend. Monitor left unchanged (its active-transition
+      gate strictly implies the predicate). `test_should_call_llm.py` (9). 150/150.
+- [ ] `engine_case` block; schema v2 AGREE/UPDATE/REJECT + `level_id` resolution in the
+      validator; `by_verdict` eval; shadow rollout.
 
 ## Wave 3 — structure & menus (semantics-changing; land before collection restarts)
 
@@ -148,3 +154,7 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - 2026-07-23 — **Wave 2 level_id menu landed** (`strategies.py`, `config.py`). Every
   entry/stop/target candidate now carries a stable menu-scoped `level_id`; SCHEMA_VERSION
   3.3.1→3.4.0. New `test_level_ids.py` (5). 141/141. Foundation for schema-v2 UPDATE-by-ID.
+- 2026-07-23 — **Wave 2 `should_call_llm` gate landed** (`config.py`, `main.py`).
+  `LLM_CALL_THRESHOLD`=45; CLI/web `run_analysis` now calls Gemini only above the gate,
+  else a deterministic engine HOLD (`verdict:"NO_CALL"`, zero spend). Monitor unchanged.
+  New `test_should_call_llm.py` (9). 150/150.
