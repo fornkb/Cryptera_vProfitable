@@ -18,7 +18,7 @@ import json
 import math
 import pandas as pd
 
-from config import (LOCATION_CAP, LOCATION_KEYS, SL_ATR_CAP,
+from config import (LOCATION_CAP, LOCATION_KEYS, SL_ATR_CAP, ENTRY_ATR_CAP,
                     VOLUME_HARD_GATE, VOLUME_LOW_VOL_WARNING,
                     MAX_TARGET_ATR_1H_MULTIPLE)
 
@@ -817,6 +817,7 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
 
     buf = max(atr_abs * 0.5, price * 0.001)  # SL buffer
     sl_cap = SL_ATR_CAP * max(atr_abs, price * 0.001)  # max SL width (BUG-06)
+    entry_cap = ENTRY_ATR_CAP * max(atr_abs, price * 0.001)  # max entry distance (B4.0)
     ctx15 = smc_context.get("15m", {}) or {}
     liq15 = ctx15.get("liquidity_levels", {}) or {}
     liq1h = smc_context.get("1h", {}).get("liquidity_levels", {}) or {}
@@ -867,7 +868,11 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                            bool(ob.get("high_volume_node"))) for ob in obs]
             if fvg and not fvg.get("filled", True):
                 ob_entries.append(((fvg["top"] + fvg["bottom"]) / 2.0, "15m bull FVG mid", False))
-            valid_entries = [(p, s, h) for p, s, h in ob_entries if p <= price * 1.002]
+            # B4.0: only entries within ENTRY_ATR_CAP of price; a stale OB 4-5 ATR away would
+            # otherwise become the primary and manufacture a never-filled row. Falls back to
+            # the market entry (price) via the default below when nothing qualifies.
+            valid_entries = [(p, s, h) for p, s, h in ob_entries
+                             if p <= price * 1.002 and (price - p) <= entry_cap]
             entry = max((p for p, _, _ in valid_entries), default=price)
             e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
             entry_labeled = valid_entries + [(price, "current price", False)]
@@ -896,7 +901,9 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
                            bool(ob.get("high_volume_node"))) for ob in obs]
             if fvg and not fvg.get("filled", True):
                 ob_entries.append(((fvg["top"] + fvg["bottom"]) / 2.0, "15m bear FVG mid", False))
-            valid_entries = [(p, s, h) for p, s, h in ob_entries if p >= price * 0.998]
+            # B4.0: cap entry distance (see the bullish branch); market-entry fallback below.
+            valid_entries = [(p, s, h) for p, s, h in ob_entries
+                             if p >= price * 0.998 and (p - price) <= entry_cap]
             entry = min((p for p, _, _ in valid_entries), default=price)
             e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
             entry_labeled = valid_entries + [(price, "current price", False)]

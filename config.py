@@ -58,6 +58,10 @@ VOLUME_LOW_VOL_WARNING = 0.3
 LOCATION_CAP = 25                 # C2+C5+C6 "location" composite cap (rubric decorrelation)
 LOCATION_KEYS = ("c2_ob_proximity", "c5_fvg_magnet", "c6_ote_bonus")
 SL_ATR_CAP = 3.0                  # max structural SL width in 15m-ATR multiples (BUG-06)
+ENTRY_ATR_CAP = 1.5               # max entry-candidate distance from price in 15m-ATR
+                                   # multiples (B4.0) -- a stale OB 4-5 ATR away must not
+                                   # become the primary entry (it manufactures never-filled
+                                   # rows); beyond this, fall back to the market entry
 MAX_TARGET_ATR_1H_MULTIPLE = 10   # drop target candidates beyond this many 1h-ATR from
                                    # price -- mirrors the system prompt's own "reject a
                                    # target more than a few x atr_1h away" rule as an

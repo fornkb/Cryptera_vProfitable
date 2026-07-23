@@ -59,7 +59,7 @@ TREND_KEYS = ["c1_trend_alignment", "c2_ob_proximity", "c3_liquidity_sweep", "c4
 MR_KEYS = ["m1_edge_distance", "m2_edge_sweep", "m3_cvd_absorption",
            "m4_stoch_extreme", "m5_rejection", "m6_range_intact"]
 
-DEFAULT_TARGET_RR = 2.0  # timeout MFE credit is realized_rr / target_rr, capped at 1.0
+DEFAULT_TARGET_RR = 2.0  # timeout credit blends mfe_r and end_rr against target_rr (B4.0)
 
 
 def _iter_labelled():
@@ -93,22 +93,28 @@ def _load_labelled_episodes():
 
 def _soft_label(snap: dict, outcome: dict) -> float:
     """
-    Win-ness in [0,1]. Clean fills are 1/0; a timeout gets MFE-based partial credit
-    = min(1, realized_rr / target_rr) — how far toward its target it ran before the
-    horizon closed (BUG-12).
+    Win-ness in [0,1]. Clean fills are 1/0; a timeout gets partial credit that BLENDS the
+    max-favourable excursion with WHERE PRICE ACTUALLY ENDED (B4.0):
+        y = clamp01( 0.5 * mfe_r/target_rr + 0.5 * max(0, end_rr)/target_rr ).
+    MFE-only credit (the old BUG-12 form) scored a spike-and-retrace timeout 0.75-0.95 even
+    if it gave everything back — exactly the spike-then-fade setups a bad fade produces. The
+    end_rr term prices in the give-back so the logistic target is closer to a real win-ness.
     """
     o = outcome.get("outcome")
     if o == "tp_first":
         return 1.0
     if o == "sl_first":
         return 0.0
-    # timeout
+    # timeout (intrabar_unknown / not_triggered never reach here -- see _iter_labelled filter)
     eng = snap.get("engine_trade") or (snap.get("strategies") or {}).get("engine_trade") or {}
     target_rr = float(eng.get("rr") or DEFAULT_TARGET_RR) or DEFAULT_TARGET_RR
-    rrr = outcome.get("realized_rr")
-    if rrr is None:
+    mfe_r = outcome.get("mfe_r")
+    end_rr = outcome.get("end_rr")
+    if mfe_r is None:
         return 0.0
-    return max(0.0, min(1.0, float(rrr) / target_rr))
+    excursion = float(mfe_r) / target_rr
+    terminal = max(0.0, float(end_rr)) / target_rr if end_rr is not None else 0.0
+    return max(0.0, min(1.0, 0.5 * excursion + 0.5 * terminal))
 
 
 def _component_weights(rows, keys):

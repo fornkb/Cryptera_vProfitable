@@ -54,6 +54,29 @@ except ImportError:  # allow running as `python tools/eval_engine.py` (no packag
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
 
+# Round-trip fees + slippage as a fraction of 1R, subtracted from every triggered trade's
+# realized R (B15.0). A conservative placeholder for liquid USDT-perps; a fitted cost model
+# is Wave-4 (I9.0). Keep small so it documents costs without dominating the economics.
+ROUND_TRIP_COST_R = 0.02
+
+
+def _realized_r(outcome: dict, target_rr):
+    """Realized economics in R for one triggered outcome (B15.0), NOT an excursion:
+    +target_rr on tp_first, -1R on sl_first, the terminal end_rr on a timeout. Returns None
+    for intrabar_unknown / missing data (excluded from the realized-R average, never a win).
+    Fees+slippage are charged once here."""
+    o = outcome.get("outcome")
+    if o == "tp_first":
+        r = float(target_rr) if target_rr is not None else None
+    elif o == "sl_first":
+        r = -1.0
+    elif o == "timeout":
+        er = outcome.get("end_rr")
+        r = float(er) if er is not None else None
+    else:  # intrabar_unknown / not_triggered / no_data
+        r = None
+    return None if r is None else (r - ROUND_TRIP_COST_R)
+
 
 def _iter_snapshots(symbol: str | None) -> Iterable[tuple[str, dict]]:
     for name in sorted(os.listdir(SNAPSHOTS_DIR)):
@@ -92,12 +115,14 @@ def _accumulator():
         "no_data": 0,
         "sum_mfe": 0.0,
         "sum_mae": 0.0,
-        "sum_rr": 0.0,
-        "rr_n": 0,
+        "sum_mfe_r": 0.0,     # sum of the MFE excursion in R (informational, not PnL)
+        "mfe_r_n": 0,
+        "sum_realized_r": 0.0,  # sum of realized economics in R (B15.0 -- the headline)
+        "realized_r_n": 0,
     }
 
 
-def _record(acc, outcome):
+def _record(acc, outcome, target_rr=None):
     acc["n"] += 1
     if not outcome:
         return
@@ -112,8 +137,8 @@ def _record(acc, outcome):
         elif o == "sl_first":
             acc["sl"] += 1
         elif o == "intrabar_unknown":
-            # B1.0: entry-vs-exit order unknowable even at 1m. A distinct class, kept
-            # out of the timeout bucket; realized-R treatment lands with B15.0.
+            # B1.0: entry-vs-exit order unknowable even at 1m. A distinct class, kept out of
+            # the timeout bucket and out of realized-R (excluded by _realized_r).
             acc["intrabar_unknown"] += 1
         else:
             acc["timeout"] += 1
@@ -121,15 +146,18 @@ def _record(acc, outcome):
             acc["sum_mfe"] += float(outcome["mfe_pct"])
         if outcome.get("mae_pct") is not None:
             acc["sum_mae"] += float(outcome["mae_pct"])
-        if outcome.get("realized_rr") is not None:
-            acc["sum_rr"] += float(outcome["realized_rr"])
-            acc["rr_n"] += 1
+        if outcome.get("mfe_r") is not None:
+            acc["sum_mfe_r"] += float(outcome["mfe_r"])
+            acc["mfe_r_n"] += 1
+        r = _realized_r(outcome, target_rr)
+        if r is not None:
+            acc["sum_realized_r"] += r
+            acc["realized_r_n"] += 1
 
 
 def _finalize(acc):
     n = max(acc["n"], 1)
     triggered = max(acc["triggered"], 1)
-    rr_n = max(acc["rr_n"], 1)
     return {
         "snapshots": acc["n"],
         "triggered": acc["triggered"],
@@ -142,12 +170,18 @@ def _finalize(acc):
         "hit_rate": round(acc["tp"] / triggered, 3) if acc["triggered"] else None,
         "avg_mfe_pct": round(acc["sum_mfe"] / triggered, 3) if acc["triggered"] else None,
         "avg_mae_pct": round(acc["sum_mae"] / triggered, 3) if acc["triggered"] else None,
-        "avg_realized_rr": round(acc["sum_rr"] / rr_n, 3) if acc["rr_n"] else None,
+        # informational excursion (renamed from the misleading avg_realized_rr, B4.0)
+        "avg_mfe_r": round(acc["sum_mfe_r"] / acc["mfe_r_n"], 3) if acc["mfe_r_n"] else None,
+        # B15.0 headline: realized economics in R over decisive trades (tp/sl/timeout),
+        # net of fees+slippage. Replaces the excursion-based "expectancy".
+        "decisive": acc["realized_r_n"],
+        "expectancy_r": round(acc["sum_realized_r"] / acc["realized_r_n"], 3) if acc["realized_r_n"] else None,
     }
 
 
 def _expectancy(stats):
-    """Naive expectancy in pct (avg_mfe * hit_rate + avg_mae * (1 - hit_rate))."""
+    """DEPRECATED excursion expectancy (avg_mfe*hit + avg_mae*(1-hit)) — kept for reference
+    only. The trustworthy figure is stats['expectancy_r'] (realized R, B15.0)."""
     hr = stats.get("hit_rate")
     mfe = stats.get("avg_mfe_pct")
     mae = stats.get("avg_mae_pct")
@@ -199,26 +233,31 @@ def main():
 
     for name, snap, engine_outcome in episodes:
         strategies = snap.get("strategies") or {}
-        analysis = snap.get("analysis") or {}
-        header = analysis.get("header") or {}
 
-        # header.* is only populated on narrated snapshots; strategies.* always
-        # is (cheap pass writes it too), so every field below tolerates a
-        # no-LLM snapshot via the `or` fallback.
-        score = int(header.get("score") or strategies.get("confluence_score") or 0)
+        # B15.0: the ENGINE universe reads strategies.* EXCLUSIVELY — never header.*. The
+        # header carries the LLM's copies (incl. any score_override), so preferring it moved
+        # engine outcomes into the wrong score/bias/gate bucket and corrupted the very
+        # score->win-rate curve thresholds are tuned from.
+        score = int(strategies.get("confluence_score") or 0)
         mode = strategies.get("score_mode") or "unknown"
-        bias = (header.get("bias") or (strategies.get("trend_bias") or "neutral").upper())
-        gate = (header.get("volume_gate") or (strategies.get("volume_gate") or {}).get("state") or "CLEAR")
+        # Bucket by the TRADED direction (setup_direction): an MR fade's direction is often
+        # the opposite of trend_bias, so by_bias on trend_bias mislabelled the whole
+        # mean-revert universe's long/short cut. Fall back to trend_bias when neutral.
+        direction = (strategies.get("setup_direction")
+                     or strategies.get("trend_bias") or "neutral").upper()
+        gate = (strategies.get("volume_gate") or {}).get("state") or "CLEAR"
         vr_15m = (snap.get("volatility_regime") or {}).get("15m", {}).get("regime", "unknown")
         event_active = "active" if (snap.get("event_guard") or {}).get("active") else "clear"
+        eng = snap.get("engine_trade") or strategies.get("engine_trade") or {}
+        target_rr = eng.get("rr")
 
-        _record(buckets["overall"], engine_outcome)
-        _record(buckets["by_score"][_bucket_score(score)], engine_outcome)
-        _record(buckets["by_mode"][mode], engine_outcome)
-        _record(buckets["by_bias"][bias], engine_outcome)
-        _record(buckets["by_vol_regime_15m"][vr_15m], engine_outcome)
-        _record(buckets["by_event_guard"][event_active], engine_outcome)
-        _record(buckets["by_volume_gate"][gate], engine_outcome)
+        _record(buckets["overall"], engine_outcome, target_rr)
+        _record(buckets["by_score"][_bucket_score(score)], engine_outcome, target_rr)
+        _record(buckets["by_mode"][mode], engine_outcome, target_rr)
+        _record(buckets["by_bias"][direction], engine_outcome, target_rr)
+        _record(buckets["by_vol_regime_15m"][vr_15m], engine_outcome, target_rr)
+        _record(buckets["by_event_guard"][event_active], engine_outcome, target_rr)
+        _record(buckets["by_volume_gate"][gate], engine_outcome, target_rr)
 
     # LLM-secondary cuts: NOT episode-collapsed. tools.episodes.episode_id fingerprints
     # the ENGINE's primary geometry; when selected_from_engine is False the LLM chose a
@@ -231,11 +270,15 @@ def main():
         analysis = snap.get("analysis") or {}
         header = analysis.get("header") or {}
         action = header.get("action") or "HOLD"
-        tm = (analysis.get("trade_decision") or {}).get("trade_management") or {}
+        td = analysis.get("trade_decision") or {}
+        tm = td.get("trade_management") or {}
         sel = tm.get("selected_from_engine")
         sel_key = "engine_primary" if sel is True else ("llm_alternative" if sel is False else "unknown")
-        _record(buckets["by_action"][action], llm_outcome)
-        _record(buckets["by_selected_from_engine"][sel_key], llm_outcome)
+        # realized R for the LLM trade uses the LLM plan's own rr (its geometry may differ
+        # from the engine primary when it selected an alternative candidate).
+        llm_rr = (td.get("primary") or {}).get("rr") if isinstance(td.get("primary"), dict) else td.get("rr")
+        _record(buckets["by_action"][action], llm_outcome, llm_rr)
+        _record(buckets["by_selected_from_engine"][sel_key], llm_outcome, llm_rr)
 
     report = {
         "snapshots_scanned": seen,

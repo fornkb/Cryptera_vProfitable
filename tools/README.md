@@ -20,8 +20,9 @@ snapshot timestamp. Marks the `trade_decision` (and `forward_scenario` when
 present) as:
 
 * `triggered` / `not_triggered`
-* `tp_first` / `sl_first` / `timeout`
-* `mfe_pct`, `mae_pct`, `realized_rr`
+* `tp_first` / `sl_first` / `timeout` / `intrabar_unknown` (order unknowable even at 1m)
+* `mfe_pct`, `mae_pct`, `mfe_r` (MFE in R — an excursion), `end_rr` (close-at-horizon in R)
+* `entry_time` / `exit_time` / `resolution_used` / `label_version`
 
 Writes the result back into the snapshot under `outcome`. Only labels
 snapshots whose horizon window has fully elapsed.

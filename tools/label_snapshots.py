@@ -16,7 +16,8 @@ the entry must fill before any exit is counted. Recorded per trade:
   * not_triggered:        entry never filled
   * mfe / mae (pct):      max favourable / adverse excursion FROM THE FILL onward
                           (no pre-fill credit on the entry bar)
-  * realized_rr:          MFE expressed in R (excursion, not PnL -- reworked in B4.0)
+  * mfe_r:                MFE expressed in R (an EXCURSION, not PnL -- named honestly so
+                          it can never be mistaken for a win rate; B4.0)
   * end_rr:               close-at-horizon in R (terminal state; feeds B4.0/B15.0)
   * entry_time / exit_time / resolution_used: chronology + how the exit order was decided
 
@@ -360,7 +361,7 @@ def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame,
     elif outcome == "sl_first":
         mae = min(mae, -sl_dist_pct)
 
-    realized_rr = round((mfe / 100) * entry / risk, 3) if risk > 0 else None
+    mfe_r = round((mfe / 100) * entry / risk, 3) if risk > 0 else None
     last_close = float(df.iloc[-1]["close"])
     end_move = (last_close - entry) if side == "long" else (entry - last_close)
     end_rr = round(end_move / risk, 3) if risk > 0 else None
@@ -374,7 +375,7 @@ def _label_one(side: str, entry: float, sl: float, tp: float, df: pd.DataFrame,
         "bars_to_close": (int(bars_to_close) if bars_to_close is not None else None),
         "mfe_pct": round(mfe, 3),
         "mae_pct": round(mae, 3),
-        "realized_rr": realized_rr,
+        "mfe_r": mfe_r,
         "end_rr": end_rr,
         "entry_time": _ts_iso(entry_time),
         "exit_time": _ts_iso(exit_time),

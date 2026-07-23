@@ -46,8 +46,11 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - [ ] **B3.0 / I2.0** — deterministic `validate_and_normalize_analysis` after every model
       response (price/ID membership, gates recomputed engine-side, DOA, HOLD-null,
       `selected_from_engine` derived, `contract_violations[]`).
-- [ ] **B4.0** — win-rate semantics: blend excursion+terminal (`end_rr`), rename MFE fraction
-      (no `win_rate`/`realized_rr` may be an excursion), `ENTRY_ATR_CAP`.
+- [x] **B4.0** — `_soft_label` timeout credit blends `mfe_r` + `end_rr` (0.5/0.5 vs target_rr),
+      so give-back timeouts stop scoring 0.75; labeler field `realized_rr`→`mfe_r` (honest
+      excursion name); `ENTRY_ATR_CAP=1.5` on entry candidates (stale far OB no longer becomes
+      the primary). Deferred to I9.0/W4: 3-quantity model, per-component trigger-rate
+      diagnostics, shadow market-entry label, Brier/reliability.
 - [x] **B5.0** — `_c4_momentum` reads slope in bias-relative space (`rel_slope`); mirror
       test proves bearish+falling==bullish+rising. Was inverted for every short.
 - [x] **B6.0** — shared `_zone_distance` (0 inside zone, else nearest boundary) for both OB
@@ -55,8 +58,11 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - [ ] **B10.0** — PDH/PDL/PWH/PWL/weekly_open by calendar identity vs explicit UTC now.
 - [x] **B13.0** — `_c1_trend`: full conflict → 0 (+`tf_conflict` note), one-TF-directional → 5,
       both-neutral → 0, aligned → ADX tiering. Prompt already frames C1 on "agreement".
-- [ ] **B15.0** — eval integrity: engine universe reads `strategies.*`; bucket by
-      `setup_direction`; realized-R expectancy.
+- [x] **B15.0** — eval engine universe reads `strategies.*` exclusively (never `header.*`);
+      `by_bias` buckets by `setup_direction` (fallback trend_bias); `_realized_r` +
+      `expectancy_r` (realized R: +target_rr/−1R/end_rr, net `ROUND_TRIP_COST_R`) replaces the
+      excursion `expectancy_pct` (kept, deprecated); `avg_realized_rr`→`avg_mfe_r`. Deferred to
+      W2/W4: policy-universe separation + paired `by_verdict` (rides with I1.0).
 - [x] **B16.0** — `compute_regime_with_hysteresis` takes `bar_id`; re-processing one closed
       15m bar is idempotent (`last_bar_id`), so restarts/`--once`/CLI-alongside-monitor can't
       advance the flip counter with no new data. `apply_regime_hysteresis` + call site pass it.
@@ -110,4 +116,8 @@ independent of the labeler); B1.0 is the measurement ground truth.
 - 2026-07-23 — **Wave 1 B2.0 + B16.0 landed** (`strategies.py` MR + geometry, `indicators.py`
   /`main.py` hysteresis). `_is_naked_breakout` + sign-aware M1 + universal DOA guard;
   bar-keyed idempotent hysteresis. New `tests/test_mr_and_regime.py`. 111/111 tests.
-  Remaining Wave 1: B10.0, B3.0/I2.0, B4.0, B15.0, riders B26/B27.
+- 2026-07-23 — **Wave 1 B4.0 + B15.0 landed** (`calibrate.py`, `eval_engine.py`,
+  `label_snapshots.py`, `strategies.py`/`config.py`). Timeout soft-label blend, `mfe_r`
+  rename, `ENTRY_ATR_CAP`; eval reads strategies.* only, `setup_direction` bucket, realized-R
+  `expectancy_r`. 118/118 tests. P0s B1.0 + B2.0 + B4.0 done; **B3.0/I2.0 (post-LLM
+  validator) is the last remaining P0.** Remaining Wave 1: B10.0, B3.0/I2.0, riders B26/B27.

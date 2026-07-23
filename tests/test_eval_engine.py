@@ -45,7 +45,7 @@ def test_engine_only_narrated_and_unlabelled_snapshots(monkeypatch, tmp_path):
         "volatility_regime": {"15m": {"regime": "normal"}},
         "event_guard": {"active": False},
         "outcome": {"engine_trade_outcome": {"triggered": True, "outcome": "tp_first",
-                                              "mfe_pct": 1.2, "mae_pct": -0.3, "realized_rr": 2.1}},
+                                              "mfe_pct": 1.2, "mae_pct": -0.3, "mfe_r": 2.1}},
     })
 
     # 2. narrated: carries both engine_trade_outcome and trade_decision_outcome.
@@ -60,9 +60,9 @@ def test_engine_only_narrated_and_unlabelled_snapshots(monkeypatch, tmp_path):
                      "trade_decision": {"trade_management": {"selected_from_engine": True}}},
         "outcome": {
             "engine_trade_outcome": {"triggered": True, "outcome": "tp_first",
-                                      "mfe_pct": 2.0, "mae_pct": -0.5, "realized_rr": 2.5},
+                                      "mfe_pct": 2.0, "mae_pct": -0.5, "mfe_r": 2.5},
             "trade_decision_outcome": {"triggered": True, "outcome": "sl_first",
-                                        "mfe_pct": 0.5, "mae_pct": -1.0, "realized_rr": None},
+                                        "mfe_pct": 0.5, "mae_pct": -1.0, "mfe_r": None},
         },
     })
 
@@ -96,7 +96,7 @@ def test_persisting_setup_collapses_to_one_episode(monkeypatch, tmp_path):
             "volatility_regime": {"15m": {"regime": "normal"}},
             "event_guard": {"active": False},
             "outcome": {"engine_trade_outcome": {"triggered": True, "outcome": "tp_first",
-                                                  "mfe_pct": 3.0, "mae_pct": -0.2, "realized_rr": 2.0}},
+                                                  "mfe_pct": 3.0, "mae_pct": -0.2, "mfe_r": 2.0}},
         })
     # a genuinely distinct SOL setup, one snapshot only
     _write(tmp_path, "snapshot_SOL_USDT_20260101_000000.json", {
@@ -108,7 +108,7 @@ def test_persisting_setup_collapses_to_one_episode(monkeypatch, tmp_path):
         "volatility_regime": {"15m": {"regime": "normal"}},
         "event_guard": {"active": False},
         "outcome": {"engine_trade_outcome": {"triggered": True, "outcome": "sl_first",
-                                              "mfe_pct": 0.1, "mae_pct": -1.0, "realized_rr": None}},
+                                              "mfe_pct": 0.1, "mae_pct": -1.0, "mfe_r": None}},
     })
 
     report = _run(monkeypatch, tmp_path)
@@ -119,3 +119,35 @@ def test_persisting_setup_collapses_to_one_episode(monkeypatch, tmp_path):
     assert report["overall"]["snapshots"] == 2
     assert report["overall"]["tp_first"] == 1             # the BTC episode's single outcome
     assert report["overall"]["sl_first"] == 1
+
+
+# ---------------- B15.0: realized-R economics ---------------- #
+
+def test_realized_r_economics():
+    c = ee.ROUND_TRIP_COST_R
+    assert ee._realized_r({"outcome": "tp_first"}, 2.0) == 2.0 - c
+    assert ee._realized_r({"outcome": "sl_first"}, 2.0) == -1.0 - c
+    assert ee._realized_r({"outcome": "timeout", "end_rr": 0.5}, 2.0) == 0.5 - c
+    assert ee._realized_r({"outcome": "intrabar_unknown"}, 2.0) is None   # never counted
+    assert ee._realized_r({"outcome": "tp_first"}, None) is None          # no target -> excluded
+
+
+def test_engine_universe_ignores_header_and_buckets_by_setup_direction(monkeypatch, tmp_path):
+    """B15.0: the engine bucket must read strategies.* (score 50, MR fade SELL), never the
+    LLM header (score 90/BULLISH/HARD_GATE). And direction buckets by setup_direction."""
+    _write(tmp_path, "snapshot_BTC_USDT_20260101_000000.json", {
+        "symbol": "BTC/USDT",
+        "engine_trade": {"rr": 2.0, "direction": "SELL"},
+        "strategies": {"confluence_score": 50, "score_mode": "ranging", "trend_bias": "bullish",
+                        "setup_direction": "bearish", "volume_gate": {"state": "CLEAR"}},
+        "volatility_regime": {"15m": {"regime": "normal"}},
+        "event_guard": {"active": False},
+        "analysis": {"header": {"score": 90, "bias": "BULLISH", "volume_gate": "HARD_GATE"}},
+        "outcome": {"engine_trade_outcome": {"triggered": True, "outcome": "tp_first",
+                                             "mfe_pct": 2.0, "mae_pct": -0.3, "mfe_r": 2.0, "end_rr": 1.8}},
+    })
+    report = _run(monkeypatch, tmp_path)
+    assert "45-59" in report["by_score"] and "75+" not in report["by_score"]   # strategies, not header
+    assert "BEARISH" in report["by_bias"]                                       # setup_direction, not trend_bias
+    assert report["by_volume_gate"]["CLEAR"]["snapshots"] == 1                  # strategies gate, not HARD_GATE
+    assert report["overall"]["expectancy_r"] == round(2.0 - ee.ROUND_TRIP_COST_R, 3)  # realized R, not excursion

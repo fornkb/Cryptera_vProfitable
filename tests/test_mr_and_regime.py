@@ -107,3 +107,26 @@ def test_hysteresis_same_bucket_direction_change_is_immediate():
     prior = {"effective": BULL, "candidate": None, "candidate_runs": 0, "last_bar_id": 1}
     eff, _ = compute_regime_with_hysteresis("Trending Bearish", prior, runs=2, bar_id=2)
     assert eff == "Trending Bearish"
+
+
+# ---------------- B4.0: ENTRY_ATR_CAP on entry candidates ---------------- #
+
+def _trend_geo(ob_top, ob_bottom, price=100.0, atr_abs=1.0):
+    smc = {"15m": {"order_blocks": {"bullish": [{"top": ob_top, "bottom": ob_bottom}]},
+                   "fvg": {}, "dealing_range": {},
+                   "liquidity_levels": {"buy_side": [116.0], "sell_side": [95.0]}}}
+    pa = {"value_area_1h": {"vah": 102.0, "val": 98.0, "poc": 100.0}}
+    return compute_trade_geometry("bullish", price, smc, pa, atr_abs=atr_abs,
+                                  regime="Trending Bullish", score_mode="trend", atr_1h=None)
+
+
+def test_stale_ob_beyond_cap_falls_back_to_market_entry():
+    out = _trend_geo(ob_top=90.5, ob_bottom=89.5)   # OB mid 90 = 10 ATR from price 100
+    assert out["valid"] is True
+    assert out["entry"] == 100.0                    # market fallback, not the stale 90 OB
+
+
+def test_ob_within_cap_is_used_as_entry():
+    out = _trend_geo(ob_top=99.5, ob_bottom=99.0)   # OB mid 99.25 = 0.75 ATR from price
+    assert out["valid"] is True
+    assert abs(out["entry"] - 99.25) < 1e-6
