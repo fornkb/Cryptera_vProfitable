@@ -96,8 +96,14 @@ independent of the labeler); B1.0 is the measurement ground truth.
       below the gate it emits `_deterministic_analysis` (a clean engine HOLD, `verdict:
       "NO_CALL"`) with ZERO Gemini spend. Monitor left unchanged (its active-transition
       gate strictly implies the predicate). `test_should_call_llm.py` (9). 150/150.
-- [ ] `engine_case` block; schema v2 AGREE/UPDATE/REJECT + `level_id` resolution in the
-      validator; `by_verdict` eval; shadow rollout.
+- [x] **`engine_case` block** — `main._build_engine_case(snapshot)` assembles the engine's
+      structured argument (thesis / for[] / against[] / vetoes_or_caps / uncertainty) from
+      `confluence_breakdown`+`notes`, `order_flow_notes`, gate flags, and win-rate;
+      `_data_degraded` flags missing orderbook/funding/OI/cvd-proxy. Injected into
+      `_build_llm_view`. The system-instruction rewrite that consumes it rides with schema v2.
+      `test_engine_case.py` (9). 159/159.
+- [ ] Schema v2 AGREE/UPDATE/REJECT + `level_id` resolution in the validator; `by_verdict`
+      eval; shadow rollout.
 
 ## Wave 3 — structure & menus (semantics-changing; land before collection restarts)
 
@@ -158,3 +164,6 @@ independent of the labeler); B1.0 is the measurement ground truth.
   `LLM_CALL_THRESHOLD`=45; CLI/web `run_analysis` now calls Gemini only above the gate,
   else a deterministic engine HOLD (`verdict:"NO_CALL"`, zero spend). Monitor unchanged.
   New `test_should_call_llm.py` (9). 150/150.
+- 2026-07-23 — **Wave 2 `engine_case` block landed** (`main.py`). `_build_engine_case`
+  builds thesis/for/against/vetoes_or_caps/uncertainty from data the engine already computes;
+  attached to the LLM view. New `test_engine_case.py` (9). 159/159.

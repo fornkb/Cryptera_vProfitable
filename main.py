@@ -1077,6 +1077,91 @@ def _round_floats(node, ndigits: int = 6):
     return node
 
 
+def _data_degraded(snapshot: dict) -> list:
+    """Names of inputs currently missing/degraded so the adjudicator can discount evidence
+    built on them — a lightweight stand-in until the I12.0 data_quality block lands."""
+    degraded = []
+    if not ((snapshot.get("orderbook") or {}).get("depth_bins")):
+        degraded.append("orderbook")
+    if (snapshot.get("funding") or {}).get("percentile_window") is None:
+        degraded.append("funding")
+    if (snapshot.get("open_interest") or {}).get("value") is None:
+        degraded.append("open_interest")
+    if ((snapshot.get("windowed_indicators") or {}).get("15m") or {}).get("cvd_is_real") is False:
+        degraded.append("cvd_proxy")   # CVD is a volume-sign proxy, not real taker flow
+    return degraded
+
+
+def _build_engine_case(snapshot: dict) -> dict:
+    """I1.0 — the engine's structured argument for the adjudicator, assembled from data the
+    engine already computes (confluence breakdown + notes, order-flow notes, gate flags,
+    win-rate). ~300 tokens, near-zero new computation: the engine finally *argues its case*
+    instead of dumping numbers, which is what a model adjudicates well. `for`/`against` split
+    the scored rubric components by whether they contributed points; `vetoes_or_caps` lists
+    the bounds already applied; `uncertainty` carries the calibrated win-rate + degraded
+    inputs so the model knows how much to trust the read."""
+    strat = snapshot.get("strategies") or {}
+    et = strat.get("engine_trade") or {}
+    breakdown = strat.get("confluence_breakdown") or {}
+    notes = strat.get("confluence_notes") or {}
+    mode = strat.get("score_mode")
+    score = strat.get("confluence_score")
+    direction = strat.get("setup_direction") or "neutral"
+    trend_bias = strat.get("trend_bias") or "neutral"
+
+    # for / against from the scored rubric (skip the location_composite meta note -- it's not
+    # a scored component, just a cap annotation).
+    for_, against = [], []
+    for comp, pts in breakdown.items():
+        row = {"component": comp, "pts": pts, "note": notes.get(comp, "")}
+        (for_ if pts > 0 else against).append(row)
+
+    # order flow: one folded row (its notes are already signed for/against in the text).
+    of_notes = strat.get("order_flow_notes") or []
+    of_mod = int(strat.get("order_flow_modifier") or 0)
+    if of_notes:
+        of_row = {"source": "order_flow", "pts": of_mod,
+                  "note": "; ".join(of_notes) if isinstance(of_notes, list) else str(of_notes)}
+        (against if of_mod < 0 else for_).append(of_row)
+
+    # vetoes / caps already bounding the trade.
+    vetoes = []
+    if (snapshot.get("event_guard") or {}).get("active"):
+        vetoes.append("event_guard (caps at CONDITIONAL, -15 confidence)")
+    if strat.get("cvd_absorption_warning"):
+        vetoes.append("cvd_absorption_warning (-10 confidence)")
+    if (strat.get("volume_gate") or {}).get("state") == "LOW_VOL_WARNING":
+        vetoes.append("LOW_VOL_WARNING (50% size, +1 confluence required)")
+    if (direction in ("bullish", "bearish") and trend_bias in ("bullish", "bearish")
+            and direction != trend_bias):
+        vetoes.append(f"counter_structure ({direction} vs {trend_bias} 4H bias)")
+
+    # thesis: one line from the traded geometry + the two strongest supports.
+    top = sorted((r for r in for_ if "component" in r),
+                 key=lambda r: r["pts"], reverse=True)[:2]
+    supports = ", ".join(r["component"] for r in top)
+    if et.get("valid") and direction in ("bullish", "bearish"):
+        thesis = (f"{et.get('direction')} {direction} @ {et.get('entry')} "
+                  f"(SL {et.get('stop_loss')}, TP {et.get('take_profit')}, RR {et.get('rr')}); "
+                  f"{mode} rubric, score {score}"
+                  + (f"; strongest: {supports}" if supports else ""))
+    else:
+        thesis = f"no valid structural trade ({mode} rubric, score {score})"
+
+    return {
+        "thesis": thesis,
+        "for": for_,
+        "against": against,
+        "vetoes_or_caps": vetoes,
+        "uncertainty": {
+            "win_rate": strat.get("empirical_win_rate"),
+            "win_rate_source": strat.get("win_rate_source"),
+            "sample_support": None,   # populated once calibration exposes per-bucket n (I9.0/W4)
+            "data_degraded": _data_degraded(snapshot),
+        },
+    }
+
+
 def _build_llm_view(snapshot: dict) -> dict:
     """
     Token-lean copy of the snapshot for the LLM prompt (audit §4). The full
@@ -1167,6 +1252,9 @@ def _build_llm_view(snapshot: dict) -> dict:
     st = view.get("supertrend")
     if isinstance(st, dict):
         st.pop("level", None)
+    # I1.0: the engine's structured argument the model adjudicates (built from the full
+    # snapshot's already-computed fields, so trim order above is irrelevant to it).
+    view["engine_case"] = _build_engine_case(snapshot)
     return _round_floats(view)
 
 
