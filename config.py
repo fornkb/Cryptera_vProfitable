@@ -16,10 +16,12 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
 REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
 SNAPSHOT_INDEX_PATH = os.path.join(DATA_DIR, "snapshot_index.json")
 
-SCHEMA_VERSION = "3.4.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
-                          # 3.4.0: I1.0 adjudicator — candidate level_id menu +
-                          # analysis.verdict (AGREE/UPDATE/REJECT). Relabel+recalibrate
-                          # on deploy; the pre-fix corpus is archive-only (invariant 5).
+SCHEMA_VERSION = "3.5.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+                          # 3.5.0: I3.0 structure state machine — per-TF `structure_state`,
+                          # TRANSITION label, mutually-exclusive BOS/CHoCH, origin/break
+                          # indices on both. 3.4.0: I1.0 adjudicator (level_id menu +
+                          # analysis.verdict). Relabel+recalibrate on deploy; the pre-fix
+                          # corpus is archive-only (invariant 5).
 
 # ---------------- market / timeframes ---------------- #
 MARKET = "binance-usdm"          # single namespace (BUG-01) — never mix spot/futures
@@ -41,6 +43,13 @@ CACHE_TTL_SECONDS = {"1d": 900, "4h": 300, "1h": 120, "15m": 20}
 # ---------------- swing detection (shared by smc.py / indicators.py / price_action.py) ---------------- #
 SWING_WIDTHS = {"1d": (4, 4), "4h": (5, 5), "1h": (4, 3), "15m": (3, 2)}
 DEFAULT_WIDTH = (3, 3)
+
+# ---------------- structure state machine (I3.0) ---------------- #
+# A CHoCH opens a `transition` state; the trend label only flips on a confirming BOS in
+# the new direction (with displacement, or a second confirming break). If neither the new
+# direction confirms nor the old trend reasserts within this many bars OF THAT TF, the
+# transition decays to `neutral` rather than latching a permanent no-trade state.
+TRANSITION_EXPIRY_BARS = 24
 
 # ---------------- regime ---------------- #
 ADX_TREND_FLOOR = 20.0            # 4H ADX must clear this for a "Trending" classification (BUG-08)

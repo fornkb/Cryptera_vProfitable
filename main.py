@@ -725,6 +725,13 @@ cite `order_flow_notes` in the sentiment reasoning. `funding.current` is a decim
 (0.0001 = 0.01%), not a percentage — do not misread it. `price_action.avwap` holds anchored-VWAP
 dynamic S/R from the last swing high/low; cite it as a level when relevant.
 
+Structure is a state machine: per TF, `structure` is HH/HL (bullish), LH/LL (bearish),
+TRANSITION (a change of character has broken the protected swing and the new direction has NOT
+yet confirmed — treat continuation setups there as unproven), or a raw swing progression when
+neither. `bos` and `choch` are mutually exclusive per break; `bos.displacement` is certified
+inside the breaking impulse only. `structure_state.protected_high/protected_low` are the levels
+whose break would change character — the natural invalidation anchors.
+
 HTF draws: `smc_context.1d` gives daily structure/BOS and daily liquidity pools; `price_action`
 carries `pwh`/`pwl` (previous-week high/low), `weekly_open`, and `untested_pocs_1d`. These are the
 higher-timeframe targets the geometry menu draws toward — the strongest runners sit at daily pools.
@@ -1257,6 +1264,15 @@ def _build_llm_view(snapshot: dict) -> dict:
             ctx["bos"] = None
         if not (ctx.get("choch") or {}).get("detected"):
             ctx["choch"] = None
+        # I3.0: `state`/`trend` are fully encoded by the `structure` label; keep only the
+        # protected levels (invalidation anchors) plus transition detail when it applies.
+        ss = ctx.get("structure_state")
+        if isinstance(ss, dict):
+            ss.pop("state", None)
+            ss.pop("trend", None)
+            if not ss.get("pending_direction"):
+                ss.pop("pending_direction", None)
+                ss.pop("bars_in_state", None)
         wtf = windowed.get(tf)
         if isinstance(wtf, dict):
             wtf.pop("current_price", None)

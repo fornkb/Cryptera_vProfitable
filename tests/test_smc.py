@@ -58,7 +58,7 @@ def test_get_market_structure_bull_bos():
     ]
     closes = [90, 100, 96, 102, 105, 99, 108, 110, 103, 112]
     df = _close_df(closes)
-    structure, bos, choch = get_market_structure(confirmed_highs, confirmed_lows, df, recent_bars=12)
+    structure, bos, choch, _ = get_market_structure(confirmed_highs, confirmed_lows, df, recent_bars=12)
     assert structure == "HH/HL"
     assert bos["direction"] == "BULLISH"
     assert bos["level"] == 110.0
@@ -66,7 +66,9 @@ def test_get_market_structure_bull_bos():
 
 def test_get_market_structure_bear_choch():
     # HH/HL structure, then price closes below the last confirmed higher-low
-    # -> bearish CHoCH (counter-trend break of the protected swing).
+    # -> bearish CHoCH (counter-trend break of the protected swing). I3.0/B8.0: the
+    # label moves to TRANSITION instead of still claiming an uptrend, and stays there
+    # until a confirming BOS (or the old trend reasserting).
     confirmed_highs = [
         {"idx": 1, "ts": "t1", "price": 100.0},
         {"idx": 4, "ts": "t4", "price": 105.0},
@@ -77,15 +79,17 @@ def test_get_market_structure_bear_choch():
     ]
     closes = [90, 100, 96, 102, 105, 99, 97, 96]  # idx 6 closes below 98 (last HL)
     df = _close_df(closes)
-    structure, bos, choch = get_market_structure(confirmed_highs, confirmed_lows, df, recent_bars=12)
-    assert structure == "HH/HL"
+    structure, bos, choch, state = get_market_structure(confirmed_highs, confirmed_lows, df,
+                                                        recent_bars=12)
+    assert structure == "TRANSITION"
+    assert state["state"] == "transition" and state["pending_direction"] == "bearish"
     assert choch["detected"] is True
     assert choch["direction"] == "BEARISH"
     assert choch["level"] == 98.0
 
 
 def test_get_market_structure_needs_at_least_two_swings_per_side():
-    structure, bos, choch = get_market_structure(
+    structure, bos, choch, _ = get_market_structure(
         [{"idx": 1, "ts": "t1", "price": 100.0}], [], df=None)
     assert structure == "NEUTRAL"
     assert bos["level"] is None
@@ -147,7 +151,7 @@ def test_flat_tape_structure_is_not_bearish():
     from strategies import _structure_bias
     flat_h = [{"idx": i, "ts": f"t{i}", "price": 100.0} for i in (1, 4, 7)]
     flat_l = [{"idx": i, "ts": f"t{i}", "price": 99.0} for i in (2, 5, 8)]
-    structure, _, _ = get_market_structure(flat_h, flat_l, df=None)
+    structure, _, _, _ = get_market_structure(flat_h, flat_l, df=None)
     assert "LH" not in structure and "LL" not in structure
     assert _structure_bias(structure) not in ("bullish", "bearish")
 

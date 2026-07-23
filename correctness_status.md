@@ -133,7 +133,20 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
 
 ## Wave 3 — structure & menus (semantics-changing; land before collection restarts)
 
-- [ ] **I3.0** structural event state machine (absorbs B7.0/B8.0/B16.0 full).
+- [x] **I3.0 (machine)** — `smc.structural_state_machine` walks closed bars holding
+      (state, trend, protected swings) and emits MUTUALLY EXCLUSIVE trend-conditioned
+      events (B7.0): in a bullish trend a break of the last swing high is a BOS, a break
+      of the protected low is a bearish CHoCH — never both from one bar. A CHoCH opens a
+      `transition` state; the label only flips on a confirming BOS with displacement (or a
+      2nd confirming break), a BOS in the old direction cancels it, and it decays to
+      neutral after `TRANSITION_EXPIRY_BARS`. Displacement certified inside the breaking
+      impulse only (`_impulse_origin`), events carry `origin_idx`/`origin_price`/
+      `break_idx` (I6.0's OTE anchor). `structure` label now sourced from the machine
+      (HH/HL · LH/LL · TRANSITION · progression) so it no longer lags a CHoCH by several
+      swings (B8.0); per-TF `structure_state` in the snapshot; `get_market_structure`
+      returns a 4-tuple. `SCHEMA_VERSION` 3.4.0→3.5.0. New `test_structure_machine.py`
+      (11 golden scenarios, **every one asserted on both mirrored sides**) + 24-check
+      offline pipeline smoke. 183/183. *Counter-CHoCH veto + 4-state router = I3.0b.*
 - [ ] **I4.0** sequential setup detectors + expiry (absorbs rest of B2.0/B18.0).
 - [ ] **I5.0** typed liquidity & sweep quality (B12.0).
 - [ ] **I6.0** OTE anchored to displacement leg (B9.0).
@@ -215,3 +228,7 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
 - 2026-07-24 — **Wave 3 B17.0 landed** (`smc.py`). Plateau dedup in the shared swing mask +
   ATR-scaled equality tolerance + neutral `EQ` structure token on a tie. `test_smc.py` +3.
   172/172. Swing layer cleaned before the I3.0 state machine reads it.
+- 2026-07-24 — **Wave 3 I3.0 (state machine) landed** (`smc.py`, `config.py`, `main.py`).
+  Mutually-exclusive trend-conditioned BOS/CHoCH + transition state + impulse-anchored
+  displacement; `structure` label sourced from the machine; `structure_state` per TF.
+  SCHEMA 3.5.0. New `test_structure_machine.py` (11, all mirrored). 183/183.

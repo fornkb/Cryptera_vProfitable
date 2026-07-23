@@ -11,7 +11,7 @@ Adaptive thresholds scale with ATR-as-a-fraction-of-price.
 import pandas as pd
 import numpy as np
 
-from config import SWING_WIDTHS, DEFAULT_WIDTH
+from config import SWING_WIDTHS, DEFAULT_WIDTH, TRANSITION_EXPIRY_BARS
 
 
 def _atr_pct(df: pd.DataFrame, fallback: float = 0.005) -> float:
@@ -191,97 +191,227 @@ def _hl_label(prices, up_tok, dn_tok) -> str:
     return "EQ"
 
 
+def _seed_trend(highs, lows):
+    """Trend seed from swing progression — only a clean HH/HL or LH/LL seeds the machine."""
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    hs = _hl_label([h["price"] for h in highs], "HH", "LH")
+    ls = _hl_label([l["price"] for l in lows], "HL", "LL")
+    if hs == "HH" and ls == "HL":
+        return "bullish"
+    if hs == "LH" and ls == "LL":
+        return "bearish"
+    return None
+
+
+def _impulse_origin(highs, lows, ref_idx, break_idx, direction):
+    """
+    Origin of the BREAKING impulse: the most recent opposite-side pivot between the
+    broken swing and the break bar (the pullback the move launched from); falls back to
+    the last one at/before the broken swing. Displacement is certified inside this span
+    only (B7.0) — an unrelated FVG dozens of bars before the actual impulse no longer
+    counts as displacement.
+    """
+    pool = lows if direction == "BULLISH" else highs
+    inside = [p for p in pool if ref_idx < p["idx"] < break_idx]
+    if inside:
+        return inside[-1]
+    before = [p for p in pool if p["idx"] <= ref_idx]
+    return before[-1] if before else None
+
+
+def _event(kind, direction, ref, break_idx, highs, lows, df, n, recent_bars):
+    """Build one structural event with impulse-anchored displacement."""
+    origin = _impulse_origin(highs, lows, ref["idx"], break_idx, direction)
+    origin_idx = origin["idx"] if origin else ref["idx"]
+    return {
+        "type": kind,
+        "direction": direction,
+        "level": float(ref["price"]),
+        "ref_idx": int(ref["idx"]),
+        "break_idx": int(break_idx),
+        "origin_idx": int(origin_idx),
+        "origin_price": float(origin["price"]) if origin else None,
+        "bars_ago": int(n - 1 - break_idx),
+        "fresh": (n - 1 - break_idx) <= recent_bars,
+        "displacement": _has_displacement_fvg(df, origin_idx, break_idx, direction),
+    }
+
+
+def structural_state_machine(confirmed_highs, confirmed_lows, df, recent_bars=12,
+                             expiry_bars=TRANSITION_EXPIRY_BARS):
+    """
+    Chronological structure state machine (I3.0, absorbing B7.0/B8.0).
+
+    Walks closed bars once, holding (state, trend, protected swings) and emitting
+    MUTUALLY EXCLUSIVE, trend-conditioned events — the same break can no longer be
+    reported as both BOS and CHoCH:
+
+      * in a bullish trend, a close above the last swing high is a bullish **BOS**
+        (continuation) and a close below the protected low is a bearish **CHoCH**;
+        mirrored for bearish. One close cannot be both.
+      * a CHoCH opens a **transition** state. The trend label does NOT flip until a
+        confirming BOS in the new direction arrives WITH displacement (or a second
+        confirming break — the market has decided even if the impulse was untidy).
+      * while in transition, a BOS in the OLD trend direction cancels it (failed
+        change of character); after `expiry_bars` with neither, it decays to neutral.
+      * displacement is certified inside the breaking impulse only (`_impulse_origin`).
+
+    Reference levels float to the most recent confirmed swing on each side, so the
+    protected low ratchets up as new higher-lows form. Break detection can never look
+    ahead: a fractal swing high has no higher high inside its own right window, so the
+    first close beyond it necessarily lands after the swing is confirmable.
+
+    Returns {"state","trend","pending_direction","protected_high","protected_low",
+             "bars_in_state","events"} — `events` chronological.
+    """
+    n = 0 if df is None else len(df)
+    if n == 0 or len(confirmed_highs) < 2 or len(confirmed_lows) < 2:
+        return {"state": "neutral", "trend": None, "pending_direction": None,
+                "protected_high": None, "protected_low": None,
+                "bars_in_state": None, "events": []}
+
+    closes = df["close"].to_numpy()
+    trend, state, pending = None, "neutral", None
+    state_since = 0
+    confirm_runs = 0
+    consumed = set()          # (side, swing idx) already spent as an event reference
+    events = []
+    hi_ptr = lo_ptr = 0
+    last_high = last_low = None
+
+    for i in range(n):
+        while hi_ptr < len(confirmed_highs) and confirmed_highs[hi_ptr]["idx"] < i:
+            last_high = confirmed_highs[hi_ptr]
+            hi_ptr += 1
+        while lo_ptr < len(confirmed_lows) and confirmed_lows[lo_ptr]["idx"] < i:
+            last_low = confirmed_lows[lo_ptr]
+            lo_ptr += 1
+        if last_high is None or last_low is None:
+            continue
+
+        # Seed the trend from swing progression until the first event fires, so a window
+        # that opens mid-trend reads its first counter-break as a CHoCH, not a BOS.
+        if not events and state == "neutral":
+            seeded = _seed_trend(confirmed_highs[:hi_ptr], confirmed_lows[:lo_ptr])
+            if seeded:
+                trend, state, state_since = seeded, "trending", i
+
+        c = float(closes[i])
+        up = c > last_high["price"] and ("H", last_high["idx"]) not in consumed
+        dn = c < last_low["price"] and ("L", last_low["idx"]) not in consumed
+        if up and dn:
+            # degenerate (last low above last high): keep the trend-consistent read
+            if trend == "bearish":
+                up = False
+            else:
+                dn = False
+        if not (up or dn):
+            if state == "transition" and (i - state_since) > expiry_bars:
+                state, trend, pending, confirm_runs, state_since = "neutral", None, None, 0, i
+            continue
+
+        direction = "BULLISH" if up else "BEARISH"
+        ref = last_high if up else last_low
+        side = "H" if up else "L"
+
+        if state == "transition":
+            if direction.lower() == pending:
+                confirm_runs += 1
+                ev = _event("BOS", direction, ref, i, confirmed_highs[:hi_ptr],
+                            confirmed_lows[:lo_ptr], df, n, recent_bars)
+                if ev["displacement"] or confirm_runs >= 2:
+                    trend, state, pending, confirm_runs, state_since = pending, "trending", None, 0, i
+            else:
+                # the old trend reasserts itself — the change of character failed
+                ev = _event("BOS", direction, ref, i, confirmed_highs[:hi_ptr],
+                            confirmed_lows[:lo_ptr], df, n, recent_bars)
+                state, pending, confirm_runs, state_since = "trending", None, 0, i
+        elif trend is None:
+            ev = _event("BOS", direction, ref, i, confirmed_highs[:hi_ptr],
+                        confirmed_lows[:lo_ptr], df, n, recent_bars)
+            trend = "bullish" if up else "bearish"
+            state, state_since = "trending", i
+        elif direction.lower() == trend:
+            ev = _event("BOS", direction, ref, i, confirmed_highs[:hi_ptr],
+                        confirmed_lows[:lo_ptr], df, n, recent_bars)
+        else:
+            ev = _event("CHOCH", direction, ref, i, confirmed_highs[:hi_ptr],
+                        confirmed_lows[:lo_ptr], df, n, recent_bars)
+            state, pending, confirm_runs, state_since = "transition", ("bullish" if up else "bearish"), 0, i
+
+        consumed.add((side, ref["idx"]))
+        events.append(ev)
+
+    return {
+        "state": state,
+        "trend": trend,
+        "pending_direction": pending,
+        "protected_high": float(last_high["price"]) if last_high else None,
+        "protected_low": float(last_low["price"]) if last_low else None,
+        "bars_in_state": int(n - 1 - state_since),
+        "events": events,
+    }
+
+
 def get_market_structure(confirmed_highs, confirmed_lows, df=None, recent_bars=12):
     """
-    Determine structure label plus event-based BOS and CHoCH.
+    Structure label + event-based BOS / CHoCH / state, from the I3.0 state machine.
 
-    confirmed_highs / confirmed_lows: ordered lists of {idx, ts, price}.
-    Structure label is derived from the last 3-4 confirmed swings on each side
-    (majority progression, BUG-08) rather than the last two only.
-    BOS  = first close beyond the most recent confirmed swing in the trend
-           direction (continuation), flagged 'fresh' if within recent_bars.
-    CHoCH = first counter-trend close beyond the last protected swing.
+    Returns (structure, bos, choch, structure_state). The label is now sourced from
+    the machine (`HH/HL` bullish, `LH/LL` bearish, `TRANSITION`, else the swing
+    progression), so it no longer lags a change of character by several swings
+    (B8.0); `bos` and `choch` are the latest event of each type and are mutually
+    exclusive per break (B7.0).
     """
-    neutral = (
-        "NEUTRAL",
-        {"level": None, "direction": None, "fresh": False, "displacement": False, "bars_ago": None},
-        {"detected": False, "direction": None, "level": None, "fresh": False, "bars_ago": None},
-    )
+    empty_state = {"state": "neutral", "trend": None, "pending_direction": None,
+                   "protected_high": None, "protected_low": None,
+                   "bars_in_state": None, "events": []}
+    bos = {"level": None, "direction": None, "fresh": False, "displacement": False,
+           "bars_ago": None, "origin_idx": None, "origin_price": None, "break_idx": None}
+    choch = {"detected": False, "direction": None, "level": None, "fresh": False,
+             "bars_ago": None, "confirmed": False, "origin_idx": None,
+             "origin_price": None, "break_idx": None}
     if len(confirmed_highs) < 2 or len(confirmed_lows) < 2:
-        return neutral
+        return "NEUTRAL", bos, choch, empty_state
 
     high_prices = [h["price"] for h in confirmed_highs]
     low_prices = [l["price"] for l in confirmed_lows]
-    high_state = _hl_label(high_prices, "HH", "LH")
-    low_state = _hl_label(low_prices, "HL", "LL")
-    structure = f"{high_state}/{low_state}"
-
-    bos = {"level": None, "direction": None, "fresh": False, "displacement": False, "bars_ago": None}
-    choch = {"detected": False, "direction": None, "level": None, "fresh": False, "bars_ago": None}
+    progression = f"{_hl_label(high_prices, 'HH', 'LH')}/{_hl_label(low_prices, 'HL', 'LL')}"
 
     if df is None or df.empty:
-        return structure, bos, choch
+        return progression, bos, choch, empty_state
 
-    closes = df["close"].to_numpy()
-    n = len(df)
+    st = structural_state_machine(confirmed_highs, confirmed_lows, df, recent_bars)
 
-    last_high = confirmed_highs[-1]
-    last_low = confirmed_lows[-1]
+    last_bos = next((e for e in reversed(st["events"]) if e["type"] == "BOS"), None)
+    last_choch = next((e for e in reversed(st["events"]) if e["type"] == "CHOCH"), None)
+    if last_bos:
+        bos = {"level": last_bos["level"], "direction": last_bos["direction"],
+               "fresh": bool(last_bos["fresh"]), "displacement": bool(last_bos["displacement"]),
+               "bars_ago": last_bos["bars_ago"], "origin_idx": last_bos["origin_idx"],
+               "origin_price": last_bos["origin_price"], "break_idx": last_bos["break_idx"]}
+    if last_choch:
+        # 'confirmed' = the machine has since flipped the trend to the CHoCH direction.
+        confirmed = (st["state"] == "trending" and st["trend"] == last_choch["direction"].lower())
+        choch = {"detected": True, "direction": last_choch["direction"],
+                 "level": last_choch["level"], "fresh": bool(last_choch["fresh"]),
+                 "bars_ago": last_choch["bars_ago"], "confirmed": bool(confirmed),
+                 "origin_idx": last_choch["origin_idx"],
+                 "origin_price": last_choch["origin_price"],
+                 "break_idx": last_choch["break_idx"]}
 
-    # --- BOS: first close beyond the most recent confirmed swing (continuation) ---
-    # Bullish BOS: first close above last confirmed swing high after it formed.
-    after_h = closes[last_high["idx"] + 1:]
-    break_pos_up = None
-    for k, c in enumerate(after_h):
-        if c > last_high["price"]:
-            break_pos_up = last_high["idx"] + 1 + k
-            break
+    if st["state"] == "trending" and st["trend"] == "bullish":
+        structure = "HH/HL"
+    elif st["state"] == "trending" and st["trend"] == "bearish":
+        structure = "LH/LL"
+    elif st["state"] == "transition":
+        structure = "TRANSITION"
+    else:
+        structure = progression
 
-    after_l = closes[last_low["idx"] + 1:]
-    break_pos_dn = None
-    for k, c in enumerate(after_l):
-        if c < last_low["price"]:
-            break_pos_dn = last_low["idx"] + 1 + k
-            break
-
-    # Choose the more recent break as the active BOS
-    if break_pos_up is not None and (break_pos_dn is None or break_pos_up >= break_pos_dn):
-        bos = {
-            "level": last_high["price"],
-            "direction": "BULLISH",
-            "fresh": (n - 1 - break_pos_up) <= recent_bars,
-            "bars_ago": int(n - 1 - break_pos_up),
-            "displacement": _has_displacement_fvg(df, last_high["idx"], break_pos_up, "BULLISH"),
-        }
-    elif break_pos_dn is not None:
-        bos = {
-            "level": last_low["price"],
-            "direction": "BEARISH",
-            "fresh": (n - 1 - break_pos_dn) <= recent_bars,
-            "bars_ago": int(n - 1 - break_pos_dn),
-            "displacement": _has_displacement_fvg(df, last_low["idx"], break_pos_dn, "BEARISH"),
-        }
-
-    # --- CHoCH: counter-trend break of the last protected swing ---
-    # In an up-leg (HH/HL) a close below the last higher-low = bearish CHoCH.
-    if structure == "HH/HL":
-        after = closes[last_low["idx"] + 1:]
-        for k, c in enumerate(after):
-            if c < last_low["price"]:
-                pos = last_low["idx"] + 1 + k
-                choch = {"detected": True, "direction": "BEARISH", "level": last_low["price"],
-                         "fresh": (n - 1 - pos) <= recent_bars, "bars_ago": int(n - 1 - pos)}
-                break
-    elif structure == "LH/LL":
-        after = closes[last_high["idx"] + 1:]
-        for k, c in enumerate(after):
-            if c > last_high["price"]:
-                pos = last_high["idx"] + 1 + k
-                choch = {"detected": True, "direction": "BULLISH", "level": last_high["price"],
-                         "fresh": (n - 1 - pos) <= recent_bars, "bars_ago": int(n - 1 - pos)}
-                break
-
-    return structure, bos, choch
+    st = {k: v for k, v in st.items() if k != "events"}
+    return structure, bos, choch, st
 
 
 # ---------------- order blocks ---------------- #
@@ -553,7 +683,7 @@ def build_smc_context(df_4h, df_1h, df_15m, df_1d=None, value_areas: dict = None
         sh = [(h["ts"], h["price"]) for h in confirmed_highs][-5:]
         sl = [(l["ts"], l["price"]) for l in confirmed_lows][-5:]
 
-        struct, bos, choch = get_market_structure(confirmed_highs, confirmed_lows, df)
+        struct, bos, choch, struct_state = get_market_structure(confirmed_highs, confirmed_lows, df)
 
         va = value_areas.get(tf) or get_value_area(df)
         obs = find_order_blocks(df, va)
@@ -574,6 +704,7 @@ def build_smc_context(df_4h, df_1h, df_15m, df_1d=None, value_areas: dict = None
         context[tf] = {
             "current_price": current_price,
             "structure": struct,
+            "structure_state": struct_state,
             "bos": bos,
             "choch": choch,
             "order_blocks": obs,
