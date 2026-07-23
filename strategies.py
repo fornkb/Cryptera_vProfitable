@@ -820,9 +820,10 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     """
     Deterministic trade geometry. Emits a single reproducible PRIMARY entry/SL/TP
     (for backtesting/calibration) PLUS a ranked set of REAL candidate levels
-    (entries / stops / targets, each with source and R:R). The LLM selects and
-    manages a trade FROM this candidate menu — it never invents prices. Returns a
-    dict; 'valid' False when no sound structural trade exists.
+    (entries / stops / targets, each with source, R:R, and a stable `level_id`).
+    The LLM adjudicator selects and manages a trade FROM this candidate menu by
+    level_id (I1.0) — the engine owns every price, so it never invents one. Returns
+    a dict; 'valid' False when no sound structural trade exists.
     """
     out = {"valid": False, "direction": None, "entry": None, "stop_loss": None,
            "take_profit": None, "rr": None, "rr_passed": False,

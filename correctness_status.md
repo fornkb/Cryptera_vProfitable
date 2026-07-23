@@ -120,9 +120,16 @@ independent of the labeler); B1.0 is the measurement ground truth.
       → `float(dict)`) via a shared `_plan_rr` unwrap. Promotion decision is Wave-4
       measurement-gated (needs clean corpus + ≥50 UPDATE episodes). `test_eval_engine.py` +2.
       169/169.
-- [ ] Shadow rollout: build machinery now (verdict persisted, `by_verdict` readout); the
-      promotion decision defers to Wave 4 (clean corpus). CLAUDE.md invariant #1 + geometry
-      note relaxed in the final docs commit.
+- [x] **Shadow-rollout machinery + docs** — the adjudicated plan is persisted
+      (`analysis.verdict` + normalized `final_plan` + untouched `engine_trade`) and read out
+      paired via `by_verdict`; the **promotion decision defers to Wave 4** (needs the clean
+      corpus + ≥50 UPDATE episodes with a non-negative paired delta). CLAUDE.md invariant #1
+      relaxed to "engine proposes, LLM adjudicates" (bounded UPDATE-by-`level_id`); pipeline
+      note + file map + `compute_trade_geometry` geometry note updated.
+
+**Wave 2 COMPLETE** (6 commits): level_id menu · `should_call_llm` gate · `engine_case` ·
+schema v2 verdict + id resolution · `by_verdict` eval · docs. 169/169 pytest. Nothing
+deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit are Wave 4.
 
 ## Wave 3 — structure & menus (semantics-changing; land before collection restarts)
 
@@ -195,3 +202,8 @@ independent of the labeler); B1.0 is the measurement ground truth.
   AGREE/UPDATE vs engine primary (`paired_delta_r`) + REJECT rejection-quality readout;
   shared `_plan_rr` unwrap also fixes a latent `by_action` `float(dict)` crash.
   `test_eval_engine.py` +2. 169/169. Promotion decision deferred to Wave 4.
+- 2026-07-23 — **Wave 2 docs close-out → WAVE 2 COMPLETE** (`CLAUDE.md`, `strategies.py`
+  docstring). Invariant #1 relaxed to "engine proposes, LLM adjudicates" (bounded
+  UPDATE-by-`level_id`); pipeline note + file map (`trade_validation.py`, `should_call_llm`,
+  `LLM_CALL_THRESHOLD`) + geometry note updated. Full I1.0 adjudicator landed on the I2.0
+  validator. **Next: Wave 3 (structure & menus) — all before the collection restart.**
