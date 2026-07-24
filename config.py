@@ -16,7 +16,8 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
 REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
 SNAPSHOT_INDEX_PATH = os.path.join(DATA_DIR, "snapshot_index.json")
 
-SCHEMA_VERSION = "3.6.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+SCHEMA_VERSION = "3.7.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+                          # 3.7.0: I4.0 `strategies.setup_sequence` (ordered stages+expiry).
                           # 3.6.0: I5.0 typed liquidity (`liquidity_levels.pools` +
                           # `swing_levels`) + I6.0 impulse-leg OTE (`leg_source`).
                           # 3.5.0: I3.0 structure state machine — per-TF `structure_state`,
@@ -63,6 +64,15 @@ POOL_MIN_SEPARATION_BARS = 3  # two touches closer than this are one pivot, not 
 SWEEP_SCAN_BARS = 16          # 15m bars scanned for a sweep+reclaim (was 5)
 SWEEP_FRESH_BARS = 5          # beyond this an HTF sweep demotes and a 15m sweep expires
 SWEEP_MIN_PENETRATION_ATR = 0.15   # x ATR(15m): a graze is not a stop run
+
+# ---------------- sequential setups (I4.0) ---------------- #
+# Setups are ORDERED, and they expire: a London sweep setup is not the same pending order
+# next session. Expiries are counted in 15m bars from the trigger event.
+BALANCE_MIN_ROTATIONS = 2          # traversals of the value area before it is "balance"
+BALANCE_LOOKBACK_BARS = 60         # 15m bars searched for those rotations (~15h)
+MR_RAID_WINDOW_BARS = 16           # 15m bars in which the raid must have happened
+MR_SETUP_EXPIRY_BARS = 12          # a completed raid->MSS setup stays actionable ~3h
+CONTINUATION_SETUP_EXPIRY_BARS = 24
 
 # ---------------- regime ---------------- #
 ADX_TREND_FLOOR = 20.0            # 4H ADX must clear this for a "Trending" classification (BUG-08)

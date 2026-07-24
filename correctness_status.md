@@ -161,7 +161,20 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
       opposing 1H/4H CHoCH (+ `counter_choch_warning` → engine_case veto), `bos.displacement`
       is finally consumed (bounded +5 to C1 in the bias direction; a displaced break keeps
       disqualifying M6 after `fresh` ages out). New `test_regime_router.py` (21). 204/204.
-- [ ] **I4.0** sequential setup detectors + expiry (absorbs rest of B2.0/B18.0).
+- [x] **I4.0** — setups are ORDERED sequences with an expiry, in `strategies.setup_sequence`.
+      MR: `_count_rotations` (≥`BALANCE_MIN_ROTATIONS` traversals = established balance) →
+      `_detect_raid` (ATR-scaled penetration of the edge, closing back inside) →
+      `_detect_mss` (15m I3.0 event in the fade direction AFTER the raid) → expiry
+      (`MR_SETUP_EXPIRY_BARS`). **No sweep/MSS ⇒ no MR trade regardless of additive score** —
+      `mr_dir` is killed exactly like a naked breakout. `stage` names what the tape still
+      owes (`no_balance`/`awaiting_raid`/`awaiting_mss`/`expired`/`ready`), so a HOLD can say
+      why. Continuation: displacement break → pullback (off I6.0's leg bounds) →
+      return-to-zone, recorded as evidence, not gated (a second unmeasured frequency cut is
+      a Wave 4 call). **B18.0**: `_m3_cvd_absorption` now separates true absorption (flow
+      AGAINST the fade while the edge holds → 15) from initiative flow (with the fade → 10),
+      which is what it used to pay 15 for while asserting "absorption" to the LLM. Sequence
+      surfaced in `engine_case` for/against + the prompt. New `test_setup_sequences.py` (18).
+      SCHEMA 3.7.0. 242/242.
 - [x] **I5.0** — `find_liquidity_levels` rebuilt as a typed layer (B12.0): `pools` require
       ≥`POOL_MIN_TOUCHES` DISTINCT touches (≥`POOL_MIN_SEPARATION_BARS` apart, so two bars of
       one pivot aren't two tests) and carry `{price, side, touches, first_idx, last_idx,
@@ -277,3 +290,7 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
   Typed pools with touches/age/swept state + `swing_levels`; sweep needs typed pools,
   ATR-scaled penetration, 16-bar scan with age decay. SCHEMA 3.6.0.
   New `test_liquidity_pools.py` (12). 224/224.
+- 2026-07-24 — **Wave 3 I4.0 + B18.0 landed** (`strategies.py`, `config.py`, `main.py`).
+  Ordered MR sequence (balance→raid→MSS) as a HARD gate + continuation sequence as evidence,
+  both with expiry; absorption vs initiative relabel. SCHEMA 3.7.0.
+  New `test_setup_sequences.py` (18). 242/242.

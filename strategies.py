@@ -22,7 +22,8 @@ from config import (LOCATION_CAP, LOCATION_KEYS, SL_ATR_CAP, ENTRY_ATR_CAP,
                     VOLUME_HARD_GATE, VOLUME_LOW_VOL_WARNING,
                     MAX_TARGET_ATR_1H_MULTIPLE, CONDITIONAL_ENTRY_THRESHOLD,
                     DISPLACED_BREAK_MEMORY_BARS, SWEEP_SCAN_BARS, SWEEP_FRESH_BARS,
-                    SWEEP_MIN_PENETRATION_ATR)
+                    SWEEP_MIN_PENETRATION_ATR, BALANCE_MIN_ROTATIONS, BALANCE_LOOKBACK_BARS,
+                    MR_RAID_WINDOW_BARS, MR_SETUP_EXPIRY_BARS, CONTINUATION_SETUP_EXPIRY_BARS)
 from indicators import regime_bucket
 
 _CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "calibration.json")
@@ -426,6 +427,170 @@ def _c8_stoch(windowed, bias):
     return 0, f"K {k:.1f} neutral"
 
 
+# ---------------- sequential setup detectors (I4.0) ---------------- #
+
+def _count_rotations(df_15m, va, lookback=BALANCE_LOOKBACK_BARS):
+    """
+    How many times price has traversed the value area recently. Balance is a tape that
+    ROTATES between its edges; one touch of VAH is not a range, it is a level.
+    """
+    vah, val = (va or {}).get("vah"), (va or {}).get("val")
+    if df_15m is None or df_15m.empty or not vah or not val or vah <= val:
+        return 0
+    span = vah - val
+    hi_band, lo_band = vah - 0.25 * span, val + 0.25 * span
+    zone, rotations = None, 0
+    for c in df_15m["close"].tail(lookback):
+        z = "hi" if c >= hi_band else ("lo" if c <= lo_band else None)
+        if z and z != zone:
+            if zone is not None:
+                rotations += 1
+            zone = z
+    return rotations
+
+
+def _detect_raid(df_15m, edge, mr_dir, atr_15m, window=MR_RAID_WINDOW_BARS):
+    """
+    Most recent bar that RAIDED the edge — penetrated it by >= the ATR-scaled minimum and
+    closed back inside. Returns (absolute idx, raid extreme) or (None, None).
+    """
+    if df_15m is None or df_15m.empty or edge is None or mr_dir not in ("bullish", "bearish"):
+        return None, None
+    min_pen = SWEEP_MIN_PENETRATION_ATR * (atr_15m or 0.0)
+    n = len(df_15m)
+    found = (None, None)
+    for i in range(max(0, n - window), n):
+        row = df_15m.iloc[i]
+        high, low, close = float(row["high"]), float(row["low"]), float(row["close"])
+        if mr_dir == "bearish":
+            if (high - edge) >= min_pen and close < edge:
+                found = (i, high)
+        else:
+            if (edge - low) >= min_pen and close > edge:
+                found = (i, low)
+    return found
+
+
+def _detect_mss(smc_context, direction, after_idx):
+    """
+    15m market-structure shift in the fade direction AFTER the raid — the confirmation
+    that the raid was rejected rather than being the start of a breakout. Reads the I3.0
+    events (BOS or CHoCH), which already carry the break bar and displacement.
+    """
+    ctx = smc_context.get("15m") or {}
+    want = "BULLISH" if direction == "bullish" else "BEARISH"
+    best = None
+    for ev in (ctx.get("bos"), ctx.get("choch")):
+        if not ev or ev.get("break_idx") is None:
+            continue
+        if ev is ctx.get("choch") and not ev.get("detected"):
+            continue
+        if (ev.get("direction") or "").upper() != want:
+            continue
+        if after_idx is not None and ev["break_idx"] <= after_idx:
+            continue
+        if best is None or ev["break_idx"] > best["break_idx"]:
+            best = ev
+    return best
+
+
+def detect_mr_sequence(df_15m, smc_context, mr_dir, edge, va, atr_15m):
+    """
+    The mean-reversion setup as an ORDERED sequence with an expiry (I4.0), not a bag of
+    co-occurring features: established balance -> raid of the edge -> 15m MSS in the fade
+    direction. An additive score can otherwise reach ACTIVE on location + oscillators with
+    nothing having actually happened, which is how the fade rubric fades breakouts.
+
+    `stage` names how far the tape has got, so a HOLD can say what it is waiting for.
+    """
+    seq = {"kind": "mean_revert", "valid": False, "stage": "none", "rotations": 0,
+           "raid_extreme": None, "mss": False, "displacement": False,
+           "bars_since_mss": None, "expires_in_bars": None, "note": "no fade location"}
+    if mr_dir not in ("bullish", "bearish") or edge is None:
+        return seq
+
+    seq["rotations"] = _count_rotations(df_15m, va)
+    if seq["rotations"] < BALANCE_MIN_ROTATIONS:
+        seq.update(stage="no_balance",
+                   note=f"value area has rotated {seq['rotations']}x - not established balance")
+        return seq
+
+    raid_idx, raid_extreme = _detect_raid(df_15m, edge, mr_dir, atr_15m)
+    if raid_idx is None:
+        seq.update(stage="awaiting_raid", note="balance established, edge not yet raided")
+        return seq
+    seq["raid_extreme"] = raid_extreme
+
+    mss = _detect_mss(smc_context, mr_dir, raid_idx)
+    if not mss:
+        seq.update(stage="awaiting_mss",
+                   note="edge raided, no 15m structure shift confirming rejection yet")
+        return seq
+
+    ago = mss.get("bars_ago")
+    seq.update(mss=True, displacement=bool(mss.get("displacement")), bars_since_mss=ago)
+    if ago is not None and ago > MR_SETUP_EXPIRY_BARS:
+        seq.update(stage="expired", note=f"raid->MSS completed {ago} bars ago - setup expired")
+        return seq
+    seq.update(valid=True, stage="ready",
+               expires_in_bars=(None if ago is None else MR_SETUP_EXPIRY_BARS - ago),
+               note=f"balance -> raid @ {raid_extreme} -> 15m MSS {ago} bars ago"
+                    + (" (displaced)" if mss.get("displacement") else ""))
+    return seq
+
+
+def _in_bias_zone(price, smc_context, bias):
+    """True when price is inside an unfilled OB or FVG on the bias side (return-to-zone)."""
+    side = "bullish" if bias == "bullish" else "bearish"
+    for tf in ("15m", "1h"):
+        ctx = smc_context.get(tf) or {}
+        for ob in ((ctx.get("order_blocks") or {}).get(side) or []):
+            if _zone_distance(price, ob.get("top"), ob.get("bottom")) == 0:
+                return True
+        gap = (ctx.get("fvg") or {}).get(f"nearest_{side}_fvg")
+        if gap and not gap.get("filled", True) and _zone_distance(price, gap.get("top"),
+                                                                 gap.get("bottom")) == 0:
+            return True
+    return False
+
+
+def detect_continuation_sequence(smc_context, bias, price):
+    """
+    The continuation setup as an ordered sequence: displacement BOS -> pullback ->
+    return-to-zone, with the same expiry discipline. Recorded as EVIDENCE (stage + expiry)
+    rather than a hard gate — unlike the MR path, the trend rubric already requires
+    structure, and cutting continuation frequency further is a Wave 4 measurement call.
+    """
+    seq = {"kind": "continuation", "valid": False, "stage": "none", "displacement": False,
+           "retracement_pct": None, "expires_in_bars": None, "note": "no directional bias"}
+    if bias not in ("bullish", "bearish"):
+        return seq
+    bos = (smc_context.get("1h") or {}).get("bos") or {}
+    ago = bos.get("bars_ago")
+    if (bos.get("direction") or "").lower() != bias or ago is None:
+        seq.update(stage="no_break", note="no 1H break in the bias direction")
+        return seq
+    if ago > CONTINUATION_SETUP_EXPIRY_BARS:
+        seq.update(stage="expired", note=f"1H break {ago} bars ago - stale")
+        return seq
+    seq.update(displacement=bool(bos.get("displacement")),
+               expires_in_bars=CONTINUATION_SETUP_EXPIRY_BARS - ago, stage="break",
+               note=f"1H {bias} break {ago} bars ago")
+
+    pdz = (smc_context.get("1h") or {}).get("premium_discount") or {}
+    hi, lo = pdz.get("leg_high"), pdz.get("leg_low")
+    if str(pdz.get("leg_source") or "").endswith("_impulse") and hi and lo and hi > lo:
+        pct = ((hi - price) / (hi - lo)) if bias == "bullish" else ((price - lo) / (hi - lo))
+        seq["retracement_pct"] = round(max(0.0, min(1.0, pct)) * 100, 1)
+        if pct >= 0.236:
+            seq.update(stage="pullback", note=f"{seq['note']}, pulled back {seq['retracement_pct']}%")
+    if seq["stage"] == "pullback" and (_in_bias_zone(price, smc_context, bias)
+                                       or pdz.get("in_ote")):
+        seq.update(valid=True, stage="return_to_zone",
+                   note=f"{seq['note']}, price back in the {bias} zone")
+    return seq
+
+
 # ---------------- mean-reversion components (ranging regime) ---------------- #
 
 def _mr_setup(price, pa_context, smc_context):
@@ -494,14 +659,40 @@ def _m2_edge_sweep(df_15m, smc_context, pdh, pdl, mr_dir, pwh=None, pwl=None):
     return (15 if pts >= 10 else (10 if pts >= 6 else 0)), f"edge sweep: {note}"
 
 
-def _m3_cvd_absorption(windowed, mr_dir):
-    """Reward CVD absorption at the edge (delta opposing the prior push)."""
+def _m3_cvd_absorption(windowed, mr_dir, df_15m=None, edge=None):
+    """
+    Two different mechanisms, scored and NAMED separately (B18.0).
+
+    Absorption at a range low is *negative* delta — aggressive selling into passive bids
+    that hold the level. The component used to pay 15 for POSITIVE delta and call it
+    absorption; that is initiative buying, also bullish but a different (and weaker,
+    unconfirmed) mechanism, and genuine absorption scored 0. The snapshot, the dashboard
+    and the prompt all asserted absorption that never happened.
+
+    Absorption (delta against the fade while price holds the edge — no new extreme in the
+    last 3 closes) pays 15; initiative flow with the fade pays 10; neither pays 0.
+    """
+    if mr_dir not in ("bullish", "bearish"):
+        return 0, "no fade direction"
     d15 = _sign(windowed.get("15m", {}).get("cvd_window_delta", 0))
-    target = 1 if mr_dir == "bullish" else -1  # we want buyers absorbing at lows / sellers at highs
-    if d15 == target:
-        return 15, "CVD absorption supports fade"
+    with_fade = 1 if mr_dir == "bullish" else -1
+
+    holding = None
+    if df_15m is not None and not df_15m.empty and len(df_15m) >= 4 and edge is not None:
+        tail = df_15m.tail(3)
+        prior = df_15m.iloc[-4]
+        holding = (float(tail["low"].min()) >= float(prior["low"])
+                   if mr_dir == "bullish" else
+                   float(tail["high"].max()) <= float(prior["high"]))
+
+    if d15 == -with_fade and holding:
+        return 15, "absorption: flow against the fade, price holding the edge"
+    if d15 == with_fade:
+        return 10, "initiative flow with the fade (not absorption)"
     if d15 == 0:
         return 5, "flat CVD"
+    if d15 == -with_fade:
+        return 0, "flow against the fade, edge not holding"
     return 0, "CVD against fade"
 
 
@@ -1114,6 +1305,8 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         notes = {"regime": f"{market_regime} - no rubric applies (structure unresolved)"}
         base, absorption, mr_edge = 0, False, None
         geo_bias = "neutral"
+        sequence = {"kind": "none", "valid": False, "stage": "no_rubric",
+                    "note": f"{market_regime}: structure unresolved"}
     elif is_ranging:
         score_mode = "mean_revert"
         mr_dir, mr_edge, va = _mr_setup(price, pa_context, smc_context)
@@ -1129,6 +1322,12 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
             reclaimed = m2 > 0
             if _is_naked_breakout(mr_dir, price, va, atr_map.get("1h"), reclaimed):
                 mr_dir, mr_edge = None, None
+        # I4.0: the fade is an ORDERED sequence — balance, then a raid of the edge, then a
+        # 15m MSS confirming the raid failed. No sweep/MSS means no MR trade no matter what
+        # the additive score reached; location + oscillators are not a setup.
+        sequence = detect_mr_sequence(df_15m, smc_context, mr_dir, mr_edge, va, atr_abs)
+        if mr_dir is not None and not sequence["valid"]:
+            mr_dir, mr_edge = None, None
         direction = mr_dir or "neutral"
         if mr_dir is None:
             # Canonical component keys even with no fade setup (FA-07) — short
@@ -1142,7 +1341,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         else:
             m1, n1 = _m1_edge_distance(price, mr_edge, va, mr_dir, reclaimed)
             # m2, n2 already computed above for the naked-breakout check
-            m3, n3 = _m3_cvd_absorption(windowed_indicators, mr_dir)
+            m3, n3 = _m3_cvd_absorption(windowed_indicators, mr_dir, df_15m, mr_edge)
             m4, n4 = _m4_stoch_extreme(windowed_indicators, mr_dir)
             m5, n5 = _m5_rejection(pa_context, mr_dir)
             m6, n6 = _m6_range_confirmed(smc_context)
@@ -1180,6 +1379,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
                  "location_composite": f"C2+C5+C6 = {loc_total}/{LOCATION_CAP} (capped)"}
         base = sum(breakdown.values())
         geo_bias = trend_bias
+        sequence = detect_continuation_sequence(smc_context, trend_bias, price)
 
     base = max(0, min(100, base))
 
@@ -1233,6 +1433,7 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
         # may fit on — fitting on the weighted one feeds each refit its own output.
         "confluence_breakdown_raw": raw,
         "confluence_notes": notes,
+        "setup_sequence": sequence,
         "engine_trade": geometry,
         "empirical_win_rate": win_rate,
         "win_rate_source": win_rate_source,

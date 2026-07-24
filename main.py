@@ -737,6 +737,12 @@ whose break would change character — the natural invalidation anchors. `premiu
 is measured on the bracketing dealing range; `ote_zone`/`in_ote` are drawn on the impulse leg of
 the last break (`leg_source`), and are absent when that leg has been fully retraced.
 
+Setups are ORDERED and they expire — `strategies.setup_sequence` carries `stage` (how far the
+tape actually got), `valid`, and `expires_in_bars`. A fade requires balance -> raid of the edge
+-> 15m MSS in the fade direction; without that whole sequence the engine proposes no fade at
+all, whatever the components add up to. Continuation carries the same sequence as evidence
+(displacement break -> pullback -> return-to-zone) without gating on it.
+
 Liquidity is typed: `liquidity_levels.pools` are levels with >=2 distinct touches (engineered
 EQH/EQL — `touches` is how many times the level has been tested), already filtered to unswept
 draws on the correct side of price. `buy_side`/`sell_side` are the ranked draw menu.
@@ -1153,6 +1159,13 @@ def _build_engine_case(snapshot: dict) -> dict:
     for comp, pts in breakdown.items():
         row = {"component": comp, "pts": pts, "note": notes.get(comp, "")}
         (for_ if pts > 0 else against).append(row)
+
+    # I4.0: the setup is a sequence, so where it got to is evidence in its own right — a
+    # complete raid->MSS argues FOR, an incomplete one names what the tape still owes.
+    seq = strat.get("setup_sequence") or {}
+    if seq.get("stage") and seq["stage"] not in ("none", "no_rubric"):
+        row = {"source": f"setup_sequence:{seq['stage']}", "pts": 0, "note": seq.get("note", "")}
+        (for_ if seq.get("valid") else against).append(row)
 
     # order flow: one folded row (its notes are already signed for/against in the text).
     of_notes = strat.get("order_flow_notes") or []
