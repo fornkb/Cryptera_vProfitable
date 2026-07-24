@@ -21,7 +21,8 @@ import pandas as pd
 from config import (LOCATION_CAP, LOCATION_KEYS, SL_ATR_CAP, ENTRY_ATR_CAP,
                     VOLUME_HARD_GATE, VOLUME_LOW_VOL_WARNING,
                     MAX_TARGET_ATR_1H_MULTIPLE, CONDITIONAL_ENTRY_THRESHOLD,
-                    DISPLACED_BREAK_MEMORY_BARS)
+                    DISPLACED_BREAK_MEMORY_BARS, SWEEP_SCAN_BARS, SWEEP_FRESH_BARS,
+                    SWEEP_MIN_PENETRATION_ATR)
 from indicators import regime_bucket
 
 _CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "calibration.json")
@@ -130,11 +131,16 @@ def _sign(x) -> int:
 def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: float,
                      trend_bias: str, pwh: float = None, pwl: float = None) -> tuple[int, str, str]:
     """
-    Scan the last 5 closed 15m candles for a sweep + reclaim of a liquidity pool
-    drawn from ALL timeframes (1D/4H/1H/15M pools + PDH/PDL + PWH/PWL). HTF sweeps
-    score the full 10; a 15m-only sweep scores 6. Returns (points, note, tier).
-    The 1D pools and previous-week high/low are the highest-conviction draws added
-    by v3.3 (IMP-2) — the exact levels whose sweeps matter most.
+    Scan the recent closed 15m candles for a sweep + reclaim of a liquidity pool drawn
+    from ALL timeframes (1D/4H/1H/15M pools + PDH/PDL + PWH/PWL). HTF sweeps score the
+    full 10; a 15m-only sweep scores 6. Returns (points, note, tier).
+
+    I5.0 raises the quality bar three ways: pools come from the TYPED layer (>=2 touches —
+    a single noisy pivot is no longer sweep evidence), the spike must penetrate the pool
+    by at least `SWEEP_MIN_PENETRATION_ATR` x ATR(15m) (a one-tick graze is not a stop
+    run), and the scan reaches back `SWEEP_SCAN_BARS` for HTF pools while the score decays
+    with age — an HTF sweep older than `SWEEP_FRESH_BARS` demotes to the lower tier and a
+    stale 15m sweep stops counting at all.
     """
     if df_15m is None or df_15m.empty or len(df_15m) < 6 or trend_bias not in ("bullish", "bearish"):
         return 0, "no sweep", "none"
@@ -144,10 +150,15 @@ def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: f
     tier_rank = {"1d": 4, "4h": 3, "1h": 2, "pd": 2, "pw": 2, "15m": 1}
     for tf in ("1d", "4h", "1h", "15m"):
         liq = smc_context.get(tf, {}).get("liquidity_levels", {}) or {}
-        for lvl in liq.get("buy_side", []) or []:
-            pools.append((lvl, "buy", tf, tier_rank[tf]))
-        for lvl in liq.get("sell_side", []) or []:
-            pools.append((lvl, "sell", tf, tier_rank[tf]))
+        typed = liq.get("pools")
+        if typed is not None:
+            for p in typed:
+                pools.append((p["price"], p["side"], tf, tier_rank[tf]))
+        else:   # legacy context (replayed snapshots) — price lists only
+            for lvl in liq.get("buy_side", []) or []:
+                pools.append((lvl, "buy", tf, tier_rank[tf]))
+            for lvl in liq.get("sell_side", []) or []:
+                pools.append((lvl, "sell", tf, tier_rank[tf]))
     if pdh:
         pools.append((pdh, "buy", "pd", tier_rank["pd"]))
     if pdl:
@@ -165,10 +176,12 @@ def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: f
     # the rejection wick beyond the pool to be >= 40% of the candle range (P4) so slow
     # "acceptance" reclaims with tiny wicks don't qualify.
     WICK_FRAC = 0.40
-    recent = df_15m.tail(5)
-    best_rank = 0
-    best_tier = "none"
-    for _, candle in recent.iterrows():
+    min_pen = SWEEP_MIN_PENETRATION_ATR * (_atr_abs(df_15m) or 0.0)
+    recent = df_15m.tail(SWEEP_SCAN_BARS)
+    n = len(recent)
+    best_rank, best_tier, best_ago = 0, "none", None
+    for pos, (_, candle) in enumerate(recent.iterrows()):
+        bars_ago = n - 1 - pos
         c_high, c_low = float(candle["high"]), float(candle["low"])
         c_open, c_close = float(candle["open"]), float(candle["close"])
         rng = c_high - c_low
@@ -179,21 +192,30 @@ def detect_mtf_sweep(df_15m: pd.DataFrame, smc_context: dict, pdh: float, pdl: f
             if lower_wick < WICK_FRAC * rng:
                 continue  # weak reclaim, not an aggressive sweep
             for price, side, tier, rank in pools:
-                if side == "sell" and c_low < price and c_close > price and rank > best_rank:
-                    best_rank, best_tier = rank, tier
+                if (side == "sell" and c_close > price
+                        and (price - c_low) >= max(min_pen, 0.0) and c_low < price
+                        and rank >= best_rank):
+                    best_rank, best_tier, best_ago = rank, tier, bars_ago
         else:
             upper_wick = c_high - max(c_open, c_close)
             if upper_wick < WICK_FRAC * rng:
                 continue
             for price, side, tier, rank in pools:
-                if side == "buy" and c_high > price and c_close < price and rank > best_rank:
-                    best_rank, best_tier = rank, tier
+                if (side == "buy" and c_close < price
+                        and (c_high - price) >= max(min_pen, 0.0) and c_high > price
+                        and rank >= best_rank):
+                    best_rank, best_tier, best_ago = rank, tier, bars_ago
 
+    if best_rank == 0:
+        return 0, "no aggressive sweep", "none"
+    stale = best_ago is not None and best_ago > SWEEP_FRESH_BARS
     if best_rank >= 2:
-        return 10, f"HTF sweep+reclaim, wick-confirmed ({best_tier})", best_tier
-    if best_rank == 1:
-        return 6, "15m sweep+reclaim, wick-confirmed", "15m"
-    return 0, "no aggressive sweep", "none"
+        if stale:
+            return 6, f"stale HTF sweep+reclaim ({best_tier}, {best_ago} bars ago)", best_tier
+        return 10, f"HTF sweep+reclaim, wick-confirmed ({best_tier}, {best_ago} bars ago)", best_tier
+    if stale:
+        return 0, f"15m sweep too old ({best_ago} bars)", "none"
+    return 6, f"15m sweep+reclaim, wick-confirmed ({best_ago} bars ago)", "15m"
 
 
 # ---------------- trend-continuation components (C1-C8) ---------------- #

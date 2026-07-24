@@ -16,7 +16,9 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
 REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
 SNAPSHOT_INDEX_PATH = os.path.join(DATA_DIR, "snapshot_index.json")
 
-SCHEMA_VERSION = "3.5.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+SCHEMA_VERSION = "3.6.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+                          # 3.6.0: I5.0 typed liquidity (`liquidity_levels.pools` +
+                          # `swing_levels`) + I6.0 impulse-leg OTE (`leg_source`).
                           # 3.5.0: I3.0 structure state machine — per-TF `structure_state`,
                           # TRANSITION label, mutually-exclusive BOS/CHoCH, origin/break
                           # indices on both. 3.4.0: I1.0 adjudicator (level_id menu +
@@ -54,6 +56,13 @@ TRANSITION_EXPIRY_BARS = 24
 # out (B8.0): an impulsive break is a different event from a drift through a level, and
 # the range it broke does not reform just because the freshness window elapsed.
 DISPLACED_BREAK_MEMORY_BARS = 24
+
+# ---------------- liquidity & sweep quality (I5.0 / B12.0) ---------------- #
+POOL_MIN_TOUCHES = 2          # a pool is engineered liquidity (EQH/EQL), not any pivot
+POOL_MIN_SEPARATION_BARS = 3  # two touches closer than this are one pivot, not two tests
+SWEEP_SCAN_BARS = 16          # 15m bars scanned for a sweep+reclaim (was 5)
+SWEEP_FRESH_BARS = 5          # beyond this an HTF sweep demotes and a 15m sweep expires
+SWEEP_MIN_PENETRATION_ATR = 0.15   # x ATR(15m): a graze is not a stop run
 
 # ---------------- regime ---------------- #
 ADX_TREND_FLOOR = 20.0            # 4H ADX must clear this for a "Trending" classification (BUG-08)

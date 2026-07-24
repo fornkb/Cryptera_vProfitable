@@ -162,7 +162,17 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
       is finally consumed (bounded +5 to C1 in the bias direction; a displaced break keeps
       disqualifying M6 after `fresh` ages out). New `test_regime_router.py` (21). 204/204.
 - [ ] **I4.0** sequential setup detectors + expiry (absorbs rest of B2.0/B18.0).
-- [ ] **I5.0** typed liquidity & sweep quality (B12.0).
+- [x] **I5.0** — `find_liquidity_levels` rebuilt as a typed layer (B12.0): `pools` require
+      ≥`POOL_MIN_TOUCHES` DISTINCT touches (≥`POOL_MIN_SEPARATION_BARS` apart, so two bars of
+      one pivot aren't two tests) and carry `{price, side, touches, first_idx, last_idx,
+      swept_idx, tf, strength}`; wick-consumed pools are retired as draws but KEPT as sweep
+      history; single-touch extremes move to `swing_levels` (valid structure/stop anchors,
+      explicitly not liquidity) and only fill the draw menu while unswept. Sweep quality:
+      `detect_mtf_sweep` reads the TYPED pools (a lone pivot can no longer manufacture sweep
+      evidence), requires ≥`SWEEP_MIN_PENETRATION_ATR`×ATR15m penetration, scans
+      `SWEEP_SCAN_BARS`=16 (was 5) and decays with age (HTF demotes past
+      `SWEEP_FRESH_BARS`, a stale 15m-only sweep expires). New `test_liquidity_pools.py`
+      (12). SCHEMA 3.6.0. 224/224. *Menu still singleton-filled for geometry until I7.0.*
 - [x] **I6.0** — `smc.impulse_leg_ote` draws OTE on the impulse leg of the LAST structural
       break (`_latest_event` → origin swing → the extreme that leg reached), records
       `leg_source` (`bos_impulse`/`choch_impulse`/`dealing_range`), and returns nothing when
@@ -263,3 +273,7 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
 - 2026-07-24 — **Wave 3 I6.0 + B9.0 landed** (`smc.py`, `main.py`). OTE moved onto the
   impulse leg of the last break with `leg_source`; re-bracketed dealing range re-derives its
   leg and reports none when price is outside all structure. New `test_ote_leg.py` (8). 212/212.
+- 2026-07-24 — **Wave 3 I5.0 landed** (`smc.py`, `strategies.py`, `config.py`, `main.py`).
+  Typed pools with touches/age/swept state + `swing_levels`; sweep needs typed pools,
+  ATR-scaled penetration, 16-bar scan with age decay. SCHEMA 3.6.0.
+  New `test_liquidity_pools.py` (12). 224/224.

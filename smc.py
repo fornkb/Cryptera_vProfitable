@@ -11,7 +11,8 @@ Adaptive thresholds scale with ATR-as-a-fraction-of-price.
 import pandas as pd
 import numpy as np
 
-from config import SWING_WIDTHS, DEFAULT_WIDTH, TRANSITION_EXPIRY_BARS
+from config import (SWING_WIDTHS, DEFAULT_WIDTH, TRANSITION_EXPIRY_BARS,
+                    POOL_MIN_TOUCHES, POOL_MIN_SEPARATION_BARS)
 
 
 def _atr_pct(df: pd.DataFrame, fallback: float = 0.005) -> float:
@@ -553,46 +554,140 @@ def find_fvg(df: pd.DataFrame, lookback=50):
 
 # ---------------- liquidity pools ---------------- #
 
-def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002, current_price: float = None):
+def _normalize_swings(swings):
+    """Accept confirmed-swing dicts or legacy (ts, price) tuples."""
+    out = []
+    for s in swings or []:
+        if isinstance(s, dict):
+            out.append({"idx": s.get("idx"), "price": float(s["price"])})
+        else:
+            out.append({"idx": None, "price": float(s[1])})
+    return out
+
+
+def _cluster_touches(swings, tol, take_max, min_separation):
     """
-    Cluster swings within an ATR-scaled tolerance into BSL / SSL pools. Keep the
-    3 pools NEAREST to current price on each side (BUG-11) — those are the ones
-    that actually get swept and targeted — rather than the 3 most extreme, which
-    truncated away the actionable near-price levels. Resting liquidity is
-    side-dependent: BSL only exists ABOVE price and SSL only BELOW it — a swing
-    high price has already closed beyond is swept, not a draw — so pools on the
-    wrong side are dropped instead of burning the 3 slots (they previously
-    crowded out actionable same-side pools from the target menu and could leave
-    the BUG-06 SL search empty). Falls back to the extremes when current price
-    is unknown.
+    Group swing extremes within `tol` (relative) into one level and count DISTINCT
+    touches — separate tests of the same level, not bars of the same pivot. Returns
+    [{price, touches, first_idx, last_idx}].
+    """
+    pts = sorted(swings, key=lambda s: s["price"])
+    out, used = [], set()
+    for i, a in enumerate(pts):
+        if i in used:
+            continue
+        members = [a]
+        for j in range(i + 1, len(pts)):
+            if j in used:
+                continue
+            if a["price"] > 0 and (pts[j]["price"] - a["price"]) / a["price"] <= tol:
+                members.append(pts[j])
+                used.add(j)
+        idxs = sorted(m["idx"] for m in members if m["idx"] is not None)
+        touches, last_counted = (1 if idxs else len(members)), None
+        for k in idxs:
+            if last_counted is None:
+                last_counted = k
+            elif k - last_counted >= min_separation:
+                touches += 1
+                last_counted = k
+        out.append({
+            "price": max(m["price"] for m in members) if take_max
+            else min(m["price"] for m in members),
+            "touches": int(touches),
+            "first_idx": idxs[0] if idxs else None,
+            "last_idx": idxs[-1] if idxs else None,
+        })
+    return out
+
+
+def _swept_idx(df, price, after_idx, side):
+    """First bar after the last touch whose WICK took the level (liquidity consumed)."""
+    if df is None or df.empty or after_idx is None:
+        return None
+    start = int(after_idx) + 1
+    if start >= len(df):
+        return None
+    series = (df["high"] if side == "buy" else df["low"]).to_numpy()[start:]
+    hit = np.flatnonzero(series > price if side == "buy" else series < price)
+    return int(start + hit[0]) if hit.size else None
+
+
+def find_liquidity_levels(swing_highs, swing_lows, atr_pct: float = 0.002,
+                          current_price: float = None, df=None, tf: str = None,
+                          min_touches: int = POOL_MIN_TOUCHES,
+                          min_separation: int = POOL_MIN_SEPARATION_BARS):
+    """
+    Typed liquidity pools (I5.0 / B12.0). Resting liquidity in the SMC sense is
+    ENGINEERED equal highs/lows — plural touches of the same level — not any fractal
+    pivot. Every single-touch swing used to qualify, so one noisy pivot simultaneously
+    became sweep evidence, a "protected" stop anchor and a liquidity target; and a pool
+    a wick had already consumed stayed on the menu as a future draw.
+
+    Emits three layers:
+      * `pools`     — {price, side, touches, first_idx, last_idx, swept_idx, tf, strength}
+                      for levels with >= `min_touches` distinct touches (separated by
+                      >= `min_separation` bars). Swept pools are KEPT here, flagged, so
+                      sweep history stays available to C3/M2 — they are just not draws.
+      * `swing_levels` — single-touch extremes. Still valid structure (stop anchors),
+                      explicitly NOT liquidity.
+      * `buy_side` / `sell_side` — the draw menu, unswept and on the correct side of
+                      price (BSL only above, SSL only below), pools ranked first.
+
+    `strength` is a provisional ranking aid (touch count + timeframe), not a gate; Wave 4
+    calibration is what should decide its weight.
     """
     tolerance = max(0.001, min(0.01, atr_pct * 0.5))
-    high_prices = sorted([s[1] for s in swing_highs])
-    low_prices = sorted([s[1] for s in swing_lows])
+    tf_rank = {"1d": 4, "4h": 3, "1h": 2, "15m": 1}.get(tf or "", 1)
+    highs = _normalize_swings(swing_highs)
+    lows = _normalize_swings(swing_lows)
 
-    def _cluster(prices, take_max):
-        levels, used = [], set()
-        for i, p1 in enumerate(prices):
-            if i in used:
+    pools, singles = [], {"highs": [], "lows": []}
+    for swings, side, take_max, bucket in ((highs, "buy", True, "highs"),
+                                           (lows, "sell", False, "lows")):
+        for cl in _cluster_touches(swings, tolerance, take_max, min_separation):
+            if cl["touches"] < min_touches:
+                singles[bucket].append({"price": round(cl["price"], 6),
+                                        "last_idx": cl["last_idx"]})
                 continue
-            cl = [p1]
-            for j, p2 in enumerate(prices[i + 1:]):
-                idx = i + 1 + j
-                if idx in used:
-                    continue
-                if p1 > 0 and (p2 - p1) / p1 <= tolerance:
-                    cl.append(p2)
-                    used.add(idx)
-            levels.append(max(cl) if take_max else min(cl))
-        return levels
+            pools.append({
+                "price": round(cl["price"], 6),
+                "side": side,
+                "touches": cl["touches"],
+                "first_idx": cl["first_idx"],
+                "last_idx": cl["last_idx"],
+                "swept_idx": _swept_idx(df, cl["price"], cl["last_idx"], side),
+                "tf": tf,
+                "strength": round(min(1.0, 0.15 * min(cl["touches"], 4) + 0.1 * tf_rank), 3),
+            })
 
-    bsl = _cluster(high_prices, take_max=True)
-    ssl = _cluster(low_prices, take_max=False)
-    if current_price is not None:
-        buy = sorted((p for p in bsl if p > current_price))[:3]
-        sell = sorted((p for p in ssl if p < current_price), reverse=True)[:3]
-        return {"buy_side": buy, "sell_side": sell}
-    return {"buy_side": sorted(bsl, reverse=True)[:3], "sell_side": sorted(ssl)[:3]}
+    def _draws(side, above):
+        cands = [p["price"] for p in pools if p["side"] == side and p["swept_idx"] is None]
+        # Single-touch extremes still fill the draw menu, but only while unswept: a level
+        # a wick has already taken is liquidity that no longer exists. (I7.0 moves the
+        # menu onto the typed layer proper.)
+        extra = [s["price"] for s in singles["highs" if above else "lows"]
+                 if _swept_idx(df, s["price"], s["last_idx"], side) is None]
+        if current_price is None:
+            return sorted(set(cands + extra), reverse=above)[:3]
+        keep = [p for p in cands if (p > current_price) == above and p != current_price]
+        fill = [p for p in extra if (p > current_price) == above and p != current_price]
+        seen, out = set(), []
+        for p in sorted(keep, reverse=not above) + sorted(fill, reverse=not above):
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out[:3]
+
+    return {
+        "buy_side": _draws("buy", above=True),
+        "sell_side": _draws("sell", above=False),
+        "pools": sorted(pools, key=lambda p: -p["strength"])[:6],
+        "swing_levels": {
+            "highs": sorted((s["price"] for s in singles["highs"]), reverse=True)[:3],
+            "lows": sorted(s["price"] for s in singles["lows"])[:3],
+        },
+    }
 
 
 def get_premium_discount(swing_high, swing_low, current_price, leg_direction="bullish"):
@@ -754,7 +849,8 @@ def build_smc_context(df_4h, df_1h, df_15m, df_1d=None, value_areas: dict = None
         va = value_areas.get(tf) or get_value_area(df)
         obs = find_order_blocks(df, va)
         fvgs = find_fvg(df)
-        liq = find_liquidity_levels(sh, sl, atr_pct=_atr_pct(df), current_price=current_price)
+        liq = find_liquidity_levels(confirmed_highs, confirmed_lows, atr_pct=_atr_pct(df),
+                                    current_price=current_price, df=df, tf=tf)
 
         dealing_high, dealing_low, leg_dir, brackets = _current_dealing_range(
             confirmed_highs, confirmed_lows, current_price=current_price)

@@ -737,6 +737,10 @@ whose break would change character — the natural invalidation anchors. `premiu
 is measured on the bracketing dealing range; `ote_zone`/`in_ote` are drawn on the impulse leg of
 the last break (`leg_source`), and are absent when that leg has been fully retraced.
 
+Liquidity is typed: `liquidity_levels.pools` are levels with >=2 distinct touches (engineered
+EQH/EQL — `touches` is how many times the level has been tested), already filtered to unswept
+draws on the correct side of price. `buy_side`/`sell_side` are the ranked draw menu.
+
 HTF draws: `smc_context.1d` gives daily structure/BOS and daily liquidity pools; `price_action`
 carries `pwh`/`pwl` (previous-week high/low), `weekly_open`, and `untested_pocs_1d`. These are the
 higher-timeframe targets the geometry menu draws toward — the strongest runners sit at daily pools.
@@ -1273,6 +1277,14 @@ def _build_llm_view(snapshot: dict) -> dict:
             ctx["choch"] = None
         # I3.0: `state`/`trend` are fully encoded by the `structure` label; keep only the
         # protected levels (invalidation anchors) plus transition detail when it applies.
+        liq = ctx.get("liquidity_levels")
+        if isinstance(liq, dict):
+            # I5.0: swept pools are sweep HISTORY (C3/M2 read them), never draws — and
+            # the model only needs what makes a pool credible: where it is and how many
+            # times it has been tested. `swing_levels` is a geometry input, not context.
+            liq.pop("swing_levels", None)
+            liq["pools"] = [{"price": p["price"], "side": p["side"], "touches": p["touches"]}
+                            for p in (liq.get("pools") or []) if p.get("swept_idx") is None]
         pdz = ctx.get("premium_discount")
         if isinstance(pdz, dict):
             # I6.0: the OTE band itself is the actionable part; the raw leg bounds are
