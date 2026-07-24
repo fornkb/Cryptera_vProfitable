@@ -208,36 +208,48 @@ def calculate_previous_day(df: pd.DataFrame, now: datetime = None):
         return float(df["high"].max()), float(df["low"].min()), float(df["close"].iloc[-1])
 
 
-def find_untested_pocs(df: pd.DataFrame, n_sessions: int = 4, session_bars: int = 50) -> list:
+def find_untested_pocs(df: pd.DataFrame, n_sessions: int = 4, session_bars: int = 50,
+                       period: str = "D") -> list:
     """
-    True non-overlapping session POCs that have not been re-tested since they
-    formed. The most-recent (still-developing) window is skipped because it has
-    no post-formation data to test against (fixes B2). Returns up to 5 magnets
-    sorted by proximity to current price.
+    Session POCs (uniform intra-bar volume spread — an approximation) that have not been
+    re-tested since they formed. Returns up to 5 magnets sorted by proximity to price.
+
+    B22.0: windows are anchored to CALENDAR periods (UTC days by default, or ISO weeks),
+    not to blocks of N bars counted back from the newest one. Tail-anchored blocks shifted
+    every boundary on every new candle, so a "naked POC" was a different level from one
+    cycle to the next — unstable targets in the menu, magnets appearing and disappearing on
+    the dashboard, and perturbed episode identity. A calendar period gives a POC an
+    identity that survives the next bar. The developing (current) period is skipped: it has
+    no post-formation data to test against.
+
+    The retest band scales with the profile's own volatility (0.25x period ATR proxy)
+    instead of a flat 0.5%, so a quiet day and a violent one are not judged alike.
     """
-    if df is None or df.empty:
+    if df is None or df.empty or "timestamp" not in df.columns:
         return []
-    n = len(df)
     current_price = float(df["close"].iloc[-1])
+    ts = pd.to_datetime(df["timestamp"])
+    keys = ts.dt.strftime("%G-W%V") if period == "W" else ts.dt.strftime("%Y-%m-%d")
+    ordered = list(dict.fromkeys(keys.tolist()))
+    closed = ordered[:-1]                      # drop the developing period
     out = []
-    # session s spans [n - (s+1)*bars, n - s*bars); s=0 is the developing window -> skip
-    for s in range(1, n_sessions + 1):
-        end = n - s * session_bars
-        start = end - session_bars
-        if start < 0 or end <= start:
-            break
-        window = df.iloc[start:end]
-        if window.empty:
+    for key in reversed(closed[-n_sessions:]):
+        mask = (keys == key).to_numpy()
+        window = df[mask]
+        if window.empty or len(window) < 2:
             continue
-        poc = get_poc(window, lookback=session_bars)
+        poc = get_poc(window, lookback=len(window))
+        end = int(np.flatnonzero(mask)[-1]) + 1
         post = df.iloc[end:]
-        band = max(poc * 0.005, 1e-6)
+        rng = float(window["high"].max() - window["low"].min())
+        band = max(0.25 * rng / max(len(window), 1) * 3, poc * 0.001, 1e-6)
         tested = (not post.empty) and ((post["high"] >= poc - band) & (post["low"] <= poc + band)).any()
         if not tested:
-            ts = window["timestamp"].iloc[-1]
+            t = window["timestamp"].iloc[-1]
             out.append({
                 "poc": float(poc),
-                "session_end_ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "period": key,
+                "session_end_ts": t.isoformat() if hasattr(t, "isoformat") else str(t),
                 "distance_pct": round(abs(current_price - poc) / current_price * 100, 3) if current_price > 0 else None,
             })
     # de-dup near-identical POCs and sort by proximity
@@ -346,9 +358,11 @@ def build_pa_context(df_1h, df_15m, df_4h=None, df_1d=None, value_areas: dict = 
     pdh, pdl, pdc = calculate_previous_day(df_1h) if df_1h is not None and not df_1h.empty \
         else (current_price, current_price, current_price)
 
-    untested_pocs_4h = find_untested_pocs(df_4h) if df_4h is not None and not df_4h.empty else []
-    # Daily untested POCs use weekly windows (5 daily bars) as HTF magnets/targets.
-    untested_pocs_1d = find_untested_pocs(df_1d, n_sessions=6, session_bars=5) \
+    # B22.0: calendar-anchored windows — 4H bars profile UTC DAYS, daily bars profile ISO
+    # WEEKS, so a naked POC keeps its identity from one cycle to the next.
+    untested_pocs_4h = find_untested_pocs(df_4h, period="D") \
+        if df_4h is not None and not df_4h.empty else []
+    untested_pocs_1d = find_untested_pocs(df_1d, n_sessions=6, period="W") \
         if df_1d is not None and not df_1d.empty else []
     weekly = weekly_levels(df_1d) if df_1d is not None and not df_1d.empty \
         else {"pwh": None, "pwl": None, "weekly_open": None}

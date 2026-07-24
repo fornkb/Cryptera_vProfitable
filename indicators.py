@@ -6,11 +6,13 @@ column is present (see main.fetch_futures_klines); otherwise it falls back to a
 labelled candle-position proxy.
 """
 
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
 
-from config import ADX_TREND_FLOOR, KILL_ZONES
+from config import ADX_TREND_FLOOR, KILL_ZONES, KILL_ZONES_LOCAL
 
 
 def calculate_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
@@ -298,8 +300,29 @@ def compute_regime_with_hysteresis(raw_regime: str, prior_state: dict, runs: int
 
 # ---------------- session-aware volume + ICT kill zones ---------------- #
 
-def kill_zone(hour_utc: int) -> str:
-    """ICT kill-zone tag for a UTC hour (fixed windows, config.KILL_ZONES)."""
+def _local_hour(ts, tz_name: str):
+    """Hour-of-day in `tz_name` for a tz-aware UTC timestamp (DST-correct via zoneinfo)."""
+    try:
+        return ts.astimezone(ZoneInfo(tz_name)).hour
+    except Exception:
+        return None
+
+
+def kill_zone(hour_utc: int, ts=None) -> str:
+    """
+    ICT kill-zone tag. Kill zones are defined by LOCAL session opens, so fixed UTC windows
+    mislabel London for the whole of BST and New York for months at a time — the
+    highest-liquidity windows of the day, feeding both the volume gate context and the LLM
+    (B21.0). With a timestamp we resolve the windows in their own exchange timezone via
+    stdlib `zoneinfo`; without one we fall back to the fixed UTC windows.
+    """
+    if ts is not None:
+        stamp = pd.Timestamp(ts)
+        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        for tz_name, (start, end), name in KILL_ZONES_LOCAL:
+            h = _local_hour(stamp, tz_name)
+            if h is not None and start <= h < end:
+                return name
     for start, end, name in KILL_ZONES:
         if start <= hour_utc < end:
             return name
@@ -308,27 +331,43 @@ def kill_zone(hour_utc: int) -> str:
 
 def session_volume_context(df_15m: pd.DataFrame) -> dict:
     """
-    Session-aware relative volume: compare the last closed 15m bar's volume to the
-    mean volume of bars sharing its UTC hour-of-day over the available history,
-    instead of the trailing-30-bar mean. This removes the time-of-day bias that
-    made the flat-lookback gate flag normal Asia-session bars as LOW_VOL. Also
-    tags the current ICT kill zone. Falls back gracefully on thin data.
+    Session-aware relative volume: compare the last closed 15m bar's volume to a baseline
+    built from the bars that actually resemble it, instead of the trailing-30-bar mean
+    (which flagged normal Asia-session bars as LOW_VOL).
+
+    B21.0 sharpens the baseline three ways: the slot is the exact MINUTE-OF-DAY (the :00
+    bar carries post-close flow that the :45 bar never does — pooling all four bars of an
+    hour compares the wrong ones), weekday and weekend are separated (crypto trades
+    through, but the weekend distribution is different), and the statistic is the MEDIAN,
+    so one news spike in the history cannot depress today's ratio. `slot_samples` is
+    reported so a gate that can halve position size is not driven by two observations.
     """
-    out = {"session_relative_volume": None, "kill_zone": "OFF", "hour_utc": None, "slot_samples": 0}
+    out = {"session_relative_volume": None, "kill_zone": "OFF", "hour_utc": None,
+           "slot_samples": 0, "slot_minute": None, "slot_is_weekend": None}
     if df_15m is None or df_15m.empty or "volume" not in df_15m.columns:
         return out
     ts = pd.to_datetime(df_15m["timestamp"])
-    hours = ts.dt.hour.to_numpy()
+    minute_of_day = (ts.dt.hour * 60 + ts.dt.minute).to_numpy()
+    is_weekend = (ts.dt.dayofweek >= 5).to_numpy()
     vols = df_15m["volume"].to_numpy(dtype=float)
-    last_hour = int(hours[-1])
+    last_slot, last_weekend = int(minute_of_day[-1]), bool(is_weekend[-1])
     last_vol = float(vols[-1])
-    same = vols[:-1][hours[:-1] == last_hour] if len(vols) > 1 else vols[:0]
-    base = float(same.mean()) if same.size else float(vols.mean() if vols.size else 1.0)
+
+    if len(vols) > 1:
+        match = (minute_of_day[:-1] == last_slot) & (is_weekend[:-1] == last_weekend)
+        same = vols[:-1][match]
+        if same.size < 3:      # thin slot -> widen to the same minute across all days
+            same = vols[:-1][minute_of_day[:-1] == last_slot]
+    else:
+        same = vols[:0]
+    base = float(np.median(same)) if same.size else float(vols.mean() if vols.size else 1.0)
     srel = round(last_vol / max(base, 1e-9), 2) if base > 0 else None
     out.update({
         "session_relative_volume": srel,
-        "kill_zone": kill_zone(last_hour),
-        "hour_utc": last_hour,
+        "kill_zone": kill_zone(int(ts.dt.hour.iloc[-1]), ts.iloc[-1]),
+        "hour_utc": int(ts.dt.hour.iloc[-1]),
         "slot_samples": int(same.size),
+        "slot_minute": last_slot,
+        "slot_is_weekend": last_weekend,
     })
     return out

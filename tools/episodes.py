@@ -30,6 +30,13 @@ from datetime import datetime, timezone
 # First default -- validate against real within-episode drift once the corpus matures (raw
 # entry/SL/TP stay on each snapshot precisely so this can be re-tuned WITHOUT re-labelling).
 PRICE_SIG_FIGS = 3
+# B23.0: episode identity is DISTANCE-based, not rounded-bucket. Significant-figure
+# buckets have hard edges — verified: entries 104.4 and 104.6 (0.19% apart, one setup
+# drifting with ATR) fell in different buckets and double-counted one physical trade,
+# which re-inflates exactly the pseudo-replication this module exists to remove. A
+# snapshot joins the open episode when symbol+side match and entry/SL/TP are ALL within
+# this relative tolerance of that episode's representative geometry.
+EPISODE_PRICE_TOL = 0.004
 # Same episode_id after a silence longer than this = a new episode (a level that recurs
 # days later is a new trade, not the same one). Conservative-large by design: for the
 # pseudo-replication bug, under-counting (merging) is far less harmful than the many-fold
@@ -54,14 +61,41 @@ def _side(direction) -> str:
     return "?"
 
 
-def episode_id(snapshot: dict) -> str:
-    """Same symbol + side + rounded engine geometry (entry/SL/TP) => the same physical trade."""
+def _geometry(snapshot: dict):
+    """(symbol, side, entry, stop, target) — the identity inputs, unrounded."""
     s = snapshot.get("strategies") or {}
     et = snapshot.get("engine_trade") or s.get("engine_trade") or {}
-    sym = snapshot.get("symbol") or "?"
-    side = _side(et.get("direction") or s.get("setup_direction"))
-    return "|".join(str(x) for x in
-                    (sym, side, _sig(et.get("entry")), _sig(et.get("stop_loss")), _sig(et.get("take_profit"))))
+    return (snapshot.get("symbol") or "?",
+            _side(et.get("direction") or s.get("setup_direction")),
+            et.get("entry"), et.get("stop_loss"), et.get("take_profit"))
+
+
+def _close(a, b, tol: float = EPISODE_PRICE_TOL) -> bool:
+    """Relative closeness that treats a missing price as matching only another missing one."""
+    if a is None or b is None:
+        return a is None and b is None
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return False
+    return abs(a - b) <= max(abs(b), 1e-9) * tol
+
+
+def same_episode(snap_a: dict, snap_b: dict, tol: float = EPISODE_PRICE_TOL) -> bool:
+    """Same symbol+side and all three of entry/SL/TP within `tol` of each other (B23.0)."""
+    sym_a, side_a, *geo_a = _geometry(snap_a)
+    sym_b, side_b, *geo_b = _geometry(snap_b)
+    if (sym_a, side_a) != (sym_b, side_b):
+        return False
+    return all(_close(x, y, tol) for x, y in zip(geo_a, geo_b))
+
+
+def episode_id(snapshot: dict) -> str:
+    """
+    Coarse bucket key: symbol + side + rounded geometry. Kept for diagnostics and as the
+    pre-filter for grouping; membership itself is decided by `same_episode` distance, so a
+    setup drifting across a rounding boundary is no longer split in two.
+    """
+    sym, side, entry, sl, tp = _geometry(snapshot)
+    return "|".join(str(x) for x in (sym, side, _sig(entry), _sig(sl), _sig(tp)))
 
 
 def row_time(snapshot: dict, name: str = "") -> float:
@@ -87,22 +121,34 @@ def row_time(snapshot: dict, name: str = "") -> float:
     return 0.0
 
 
-def collapse_to_episodes(items, gap_hours: float = EPISODE_GAP_HOURS):
+def collapse_to_episodes(items, gap_hours: float = EPISODE_GAP_HOURS,
+                         tol: float = EPISODE_PRICE_TOL):
     """items: iterable of (name, snapshot, outcome). Returns ONE representative per episode --
-    the EARLIEST snapshot of each contiguous same-id run (the honest 'setup first appeared'
-    moment). A gap between consecutive same-id snapshots longer than `gap_hours` starts a NEW
-    episode. Output is time-then-name sorted for stable, reproducible downstream ordering."""
+    the EARLIEST snapshot of each run (the honest 'setup first appeared' decision point).
+
+    B23.0: rows are grouped per (symbol, side) and walked chronologically against the OPEN
+    episode's representative geometry rather than bucketed by a rounded key, so a setup
+    whose levels drift a few tenths of a percent with ATR stays ONE trade instead of
+    splitting at a rounding boundary. A snapshot starts a new episode when its geometry is
+    outside `tol` of the representative, or when it arrives more than `gap_hours` after the
+    previous snapshot of that episode (a level recurring days later is a new trade).
+
+    Output is time-then-name sorted for stable, reproducible downstream ordering."""
     buckets: dict = defaultdict(list)
     for name, snap, outcome in items:
-        buckets[episode_id(snap)].append((row_time(snap, name), name, snap, outcome))
+        sym, side, *_ = _geometry(snap)
+        buckets[(sym, side)].append((row_time(snap, name), name, snap, outcome))
+
     reps = []
     gap_s = gap_hours * 3600.0
     for rows in buckets.values():
         rows.sort(key=lambda r: r[0])
-        prev_t = None
+        open_rep, prev_t = None, None
         for t, name, snap, outcome in rows:
-            if prev_t is None or (t - prev_t) > gap_s:
-                reps.append((name, snap, outcome))   # first snapshot of a new run = the episode
+            if (open_rep is None or (t - prev_t) > gap_s
+                    or not same_episode(snap, open_rep, tol)):
+                reps.append((name, snap, outcome))
+                open_rep = snap
             prev_t = t
     reps.sort(key=lambda r: (row_time(r[1], r[0]), r[0]))
     return reps

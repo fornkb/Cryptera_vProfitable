@@ -216,8 +216,24 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
       gains a relative `tol` fed by `_equal_tol(df)` (ATR%·0.25, ≤20bps) so "equal" is the
       cluster tolerance, not float equality; `_hl_label` tie → neutral `EQ` token (flat tape
       no longer reads LH/LL → no more shorting chop). 3 tests. 172/172.
-- [ ] **B21.0** DST kill zones; **B22.0** stable POC windows;
-      **B23.0** distance-based episode identity.
+- [x] **B21.0** — `KILL_ZONES_LOCAL` resolves London/NY/Asia in their own tz via stdlib
+      `zoneinfo`, so the highest-liquidity windows stop being ~1h wrong for months at a time
+      (fixed-UTC kept as the hour-only fallback). `session_volume_context` baselines the
+      exact MINUTE-of-day slot (not the pooled hour), splits weekday/weekend, and uses the
+      MEDIAN so one news spike can't depress today's ratio; `slot_minute`/`slot_is_weekend`
+      reported alongside `slot_samples`.
+- [x] **B22.0** — `find_untested_pocs` anchors windows to CALENDAR periods (`period="D"` for
+      4H bars, `"W"` for daily) instead of tail-anchored N-bar blocks, so a naked POC keeps
+      its identity across cycles (it shifted every boundary on every new candle); retest band
+      scales with the window's own range instead of a flat 0.5%; each POC carries `period`.
+- [x] **B23.0** — episode identity is DISTANCE-based (`same_episode`, `EPISODE_PRICE_TOL`
+      =0.4%): rows group per (symbol, side) and are walked chronologically against the open
+      episode's representative geometry, so the audit's 104.4-vs-104.6 drift (0.19%) no
+      longer splits one physical trade across a rounding boundary. `episode_id` kept for
+      diagnostics. Consumers re-checked: `eval_engine`, `calibrate`, `ab_thinking` all route
+      through `collapse_to_episodes`. *The 24h-gap merge direction is left alone on purpose
+      — under-counting is the safe direction; tune on the clean corpus in Wave 4.*
+      New `test_sessions_and_episodes.py` (15). SCHEMA 3.9.0. 275/275.
 
 ## DEPLOY EVENT
 
@@ -313,3 +329,14 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
   protected swing and never clipped inside invalidation (`size_class`), live price demoted
   to `tf:"live"`, tick quantization, B19.0 menu enrichment. SCHEMA 3.8.0.
   New `test_geometry_menu.py` (17). 260/260.
+- 2026-07-24 — **Wave 3 riders B21.0 + B22.0 + B23.0 landed → WAVE 3 COMPLETE**
+  (`indicators.py`, `config.py`, `price_action.py`, `tools/episodes.py`,
+  `tools/eval_engine.py`). DST-correct kill zones + minute-slot median volume baseline;
+  calendar-anchored POC windows; distance-based episode identity. SCHEMA 3.9.0.
+  New `test_sessions_and_episodes.py` (15). 275/275.
+
+**Wave 3 COMPLETE** (8 commits): B17.0 · I3.0 · I3.0b/B8.0 · I6.0/B9.0 · I5.0/B12.0 ·
+I4.0/B18.0 · I7.0/B11.0/B19.0 · riders B21/B22/B23. 275/275 pytest, SCHEMA 3.4.0→3.9.0.
+Nothing deployed; the VM is still collecting the pre-fix corpus. **Next: the DEPLOY EVENT**
+— stop the monitor + label timer, archive `snapshots/`, deploy this branch, restart clean
+under the new schema + label_version. Then Wave 4 (measurement-gated, needs the new corpus).

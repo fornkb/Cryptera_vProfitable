@@ -16,7 +16,9 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
 REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
 SNAPSHOT_INDEX_PATH = os.path.join(DATA_DIR, "snapshot_index.json")
 
-SCHEMA_VERSION = "3.8.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+SCHEMA_VERSION = "3.9.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+                          # 3.9.0: B21.0 session slot fields (`slot_minute`,
+                          # `slot_is_weekend`) + B22.0 calendar-anchored POC `period`.
                           # 3.8.0: I7.0 candidate-first geometry — `size_class`,
                           # `sl_atr_multiple`, merged stop menu (tf/confluence/risk_atr).
                           # 3.7.0: I4.0 `strategies.setup_sequence` (ordered stages+expiry).
@@ -80,7 +82,15 @@ CONTINUATION_SETUP_EXPIRY_BARS = 24
 ADX_TREND_FLOOR = 20.0            # 4H ADX must clear this for a "Trending" classification (BUG-08)
 REGIME_HYSTERESIS_RUNS = 2        # consecutive raw runs required before a rubric flip (BUG-08)
 
-# ICT kill-zone UTC hour windows (start, end, name) — first match wins, else "OFF".
+# ICT kill zones are defined by LOCAL session opens, so they are resolved in the exchange's
+# own timezone and shift with DST (B21.0). (tz, (start_hour_local, end_hour_local), name) —
+# first match wins, else "OFF".
+KILL_ZONES_LOCAL = (
+    ("Europe/London", (7, 10), "LONDON"),
+    ("America/New_York", (8, 11), "NEWYORK"),
+    ("Asia/Tokyo", (9, 13), "ASIA"),
+)
+# Fixed-UTC fallback for callers with only an hour (no timestamp to localize).
 KILL_ZONES = (
     (7, 10, "LONDON"),
     (12, 15, "NEWYORK"),

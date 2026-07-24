@@ -22,7 +22,8 @@ quality). Promotion of the adjudicated plan to headline is Wave-4 measurement-ga
 Pseudo-replication fix (tools.episodes): the cheap pass scores every watched symbol
 every 15m, so ONE persisting setup (same entry/SL/TP unchanged for hours) produces many
 near-identical `engine_trade_outcome` rows. Before bucketing, these are collapsed to one
-representative episode per `tools.episodes.episode_id` (symbol+side+rounded geometry) --
+representative episode by `tools.episodes.collapse_to_episodes` (symbol+side, geometry
+within a relative tolerance of the open episode's representative -- B23.0 distance-based) --
 otherwise a single setup's outcome gets counted N times and every hit-rate/expectancy
 number below is biased toward whatever that one setup happened to do. `engine_universe_raw_rows`
 reports the pre-collapse count so the dedup ratio is visible. The LLM-secondary cuts are
