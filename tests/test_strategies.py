@@ -1,42 +1,48 @@
 """
-Unit tests for strategies.py: structural TP selection (never invents a price)
-and protected-swing SL geometry (BUG-06 — nearest pool, not widest, with an
-ATR cap).
+Unit tests for strategies.py: primary target selection from the merged candidate menu
+(never invents a price, honest sub-2R) and protected-swing SL geometry (B11.0 — the stop
+anchors on structural invalidation and is never clipped inside it).
 """
 
 import pytest
 
-from strategies import _select_structural_tp, compute_trade_geometry, _rank_targets
+from strategies import (_rank_targets, _select_primary_target, compute_trade_geometry)
 from config import MAX_TARGET_ATR_1H_MULTIPLE
 
 
-# ---------------- _select_structural_tp ---------------- #
+# ---------------- primary target selection (from the merged menu) ---------------- #
 
-def test_select_structural_tp_prefers_nearest_2r_level():
-    cands = [103, 108, 112, 130]  # entry=100, risk=5 -> 2R target = 110
-    tp, note = _select_structural_tp(cands, entry=100, risk=5, direction="bullish")
-    assert tp == 112
-    assert "2R" in note
+def _menu(prices, entry, risk, direction):
+    return _rank_targets([(p, "15m pool") for p in prices], entry, risk, direction)
 
 
-def test_select_structural_tp_falls_back_to_farthest_when_no_2r_level():
-    cands = [102, 104, 106]  # none reach 110 (2R)
-    tp, note = _select_structural_tp(cands, entry=100, risk=5, direction="bullish")
-    assert tp == 106
-    assert "honest" in note
+def test_primary_target_prefers_nearest_2r_level():
+    menu = _menu([103, 108, 112, 130], entry=100, risk=5, direction="bullish")
+    row = _select_primary_target(menu, risk=5, score_mode="trend")
+    assert row["price"] == 112          # first candidate reaching 2R (110)
+    assert row["rr"] >= 2.0
 
 
-def test_select_structural_tp_bearish_direction():
-    cands = [97, 92, 88, 70]  # entry=100, risk=5 -> 2R target = 90
-    tp, note = _select_structural_tp(cands, entry=100, risk=5, direction="bearish")
-    assert tp == 88
-    assert "2R" in note
+def test_primary_target_falls_back_to_farthest_with_honest_sub_2r():
+    menu = _menu([102, 104, 106], entry=100, risk=5, direction="bullish")
+    row = _select_primary_target(menu, risk=5, score_mode="trend")
+    assert row["price"] == 106
+    assert row["rr"] < 2.0              # reported honestly, never inflated (invariant 3)
 
 
-def test_select_structural_tp_no_candidates_returns_none():
-    tp, note = _select_structural_tp([], entry=100, risk=5, direction="bullish")
-    assert tp is None
-    assert note is None
+def test_primary_target_bearish_direction():
+    menu = _menu([97, 92, 88, 70], entry=100, risk=5, direction="bearish")
+    row = _select_primary_target(menu, risk=5, score_mode="trend")
+    assert row["price"] == 88
+
+
+def test_primary_target_none_without_candidates():
+    assert _select_primary_target([], risk=5, score_mode="trend") is None
+
+
+def test_mean_reversion_takes_the_nearest_draw():
+    menu = _menu([103, 108, 112], entry=100, risk=5, direction="bullish")
+    assert _select_primary_target(menu, risk=5, score_mode="mean_revert")["price"] == 103
 
 
 # ---------------- compute_trade_geometry SL selection (BUG-06) ---------------- #
@@ -57,8 +63,10 @@ def test_geometry_sl_uses_nearest_protected_swing_not_widest_pool_long():
         "15m": {
             "order_blocks": {"bullish": [], "bearish": []},
             "fvg": {"nearest_bullish_fvg": None, "nearest_bearish_fvg": None},
-            "liquidity_levels": {"sell_side": [90.0, 80.0, 70.0], "buy_side": [115.0, 130.0]},
+            "liquidity_levels": {"sell_side": [95.0], "buy_side": [115.0, 130.0],
+                                 "swing_levels": {"lows": [90.0, 70.0], "highs": []}},
             "dealing_range": {"low": 75.0, "high": 105.0},
+            "structure_state": {"protected_low": 90.0, "protected_high": 105.0},
         },
         "1h": {"liquidity_levels": {"buy_side": [], "sell_side": []}},
     }
@@ -67,8 +75,11 @@ def test_geometry_sl_uses_nearest_protected_swing_not_widest_pool_long():
         atr_abs=20.0, regime="Trending Bullish", score_mode="trend",
     )
     assert result["valid"] is True
-    assert result["stop_loss"] == pytest.approx(80.0)  # nearest pool (90) - buffer(10), not 70/130
-    assert "nearest protected" in result["stop_loss_source"]
+    # B11.0: the stop anchors on the PROTECTED SWING (90) - buffer(10), not on the 95 pool
+    # (pools are targets, never stop anchors) and not on the widest swing (70).
+    assert result["stop_loss"] == pytest.approx(80.0)
+    assert "protected swing low" in result["stop_loss_source"]
+    assert all(c["price"] != pytest.approx(85.0) for c in result["candidates"]["stops"])
 
 
 def test_geometry_sl_uses_nearest_protected_swing_not_widest_pool_short():
@@ -76,8 +87,10 @@ def test_geometry_sl_uses_nearest_protected_swing_not_widest_pool_short():
         "15m": {
             "order_blocks": {"bullish": [], "bearish": []},
             "fvg": {"nearest_bullish_fvg": None, "nearest_bearish_fvg": None},
-            "liquidity_levels": {"buy_side": [110.0, 120.0, 130.0], "sell_side": [50.0, 35.0]},
+            "liquidity_levels": {"buy_side": [105.0], "sell_side": [50.0, 35.0],
+                                 "swing_levels": {"highs": [110.0, 130.0], "lows": []}},
             "dealing_range": {"low": 95.0, "high": 125.0},
+            "structure_state": {"protected_high": 110.0, "protected_low": 95.0},
         },
         "1h": {"liquidity_levels": {"buy_side": [], "sell_side": []}},
     }
@@ -86,29 +99,37 @@ def test_geometry_sl_uses_nearest_protected_swing_not_widest_pool_short():
         atr_abs=20.0, regime="Trending Bearish", score_mode="trend",
     )
     assert result["valid"] is True
-    assert result["stop_loss"] == pytest.approx(120.0)  # nearest pool (110) + buffer(10), not 130
-    assert "nearest protected" in result["stop_loss_source"]
+    assert result["stop_loss"] == pytest.approx(120.0)  # protected swing (110) + buffer(10)
+    assert "protected swing high" in result["stop_loss_source"]
 
 
-def test_geometry_sl_respects_atr_cap():
-    """BUG-06: a pool farther than SL_ATR_CAP x ATR must be capped, not used raw."""
+def test_geometry_never_clips_the_stop_inside_invalidation():
+    """
+    B11.0: a structural stop wider than SL_ATR_CAP used to be slid to `entry - cap` — a
+    volatility stop sitting in the noise band IN FRONT of the level whose breach actually
+    invalidates the thesis, so the trade died on ordinary rotation while the setup was
+    still valid. The honest wide stop is kept and the setup is downsized instead.
+    """
     smc_context = {
         "15m": {
             "order_blocks": {"bullish": [], "bearish": []},
             "fvg": {"nearest_bullish_fvg": None, "nearest_bearish_fvg": None},
-            "liquidity_levels": {"sell_side": [10.0], "buy_side": [115.0]},
+            "liquidity_levels": {"sell_side": [], "buy_side": [115.0]},
             "dealing_range": {"low": 5.0, "high": 105.0},
+            "structure_state": {"protected_low": 90.0, "protected_high": 105.0},
         },
         "1h": {"liquidity_levels": {"buy_side": [], "sell_side": []}},
     }
-    # atr_abs=1.0 -> sl_cap = 3.0 * 1.0 = 3.0; the only pool (10) is ~90 away -> must be capped.
+    # atr_abs=1.0 -> sl_cap = 3.0; the protected swing is 10 away, far wider than the cap.
     result = compute_trade_geometry(
         "bullish", price=100.0, smc_context=smc_context, pa_context=_pa_context(),
         atr_abs=1.0, regime="Trending Bullish", score_mode="trend",
     )
     assert result["valid"] is True
-    assert result["stop_loss"] == pytest.approx(97.0)  # entry(100) - sl_cap(3.0)
-    assert "ATR-capped" in result["stop_loss_source"]
+    assert result["stop_loss"] == pytest.approx(89.5)     # protected low (90) - buffer(0.5)
+    assert result["stop_loss"] < 97.0                     # NOT clipped to entry - cap
+    assert result["size_class"] == "reduced"
+    assert result["sl_atr_multiple"] == pytest.approx(10.5)
 
 
 # ---------------- AVWAP confluence labels ---------------- #

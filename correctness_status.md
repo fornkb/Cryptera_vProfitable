@@ -196,7 +196,21 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
       `leg=None` when price is beyond all confirmed structure → no OTE rather than a guess.
       New `test_ote_leg.py` (8, incl. the audit's verified 100/105/95/98 case + a mirrored
       bearish leg). 212/212.
-- [ ] **I7.0** candidate-first geometry & menu enrichment (B11.0/B19.0).
+- [x] **I7.0** — geometry is candidate-FIRST: build typed rows → merge → select the primary
+      **from the merged menu** (`_select_primary_entry`/`_select_primary_stop`/
+      `_select_primary_target`), so menu membership and one canonical R:R are invariants,
+      not coincidences (B11.0 defect 3). **The ATR cap no longer clips the stop inside
+      invalidation** — the honest wide stop is kept with `size_class:"reduced"` +
+      `sl_atr_multiple` (defect 1). Stops anchor on the **protected swing** (I3.0
+      `structure_state`) / `swing_levels`, never on liquidity pools — and the primary is the
+      tightest candidate strictly BEYOND the invalidation anchor (raid extreme for a fade,
+      protected swing for continuation) (defect 2). `_tf_of_source("current price")→"live"`
+      (rank 0), unknown→None (defect 4). Tick quantization (`_tick_decimals`, magnitude-
+      scaled) on every emitted level. **B19.0** menu enrichment: PDH/PDL, S/R zones, 1H OB
+      entries, and an MR menu that reaches POC → opposite edge → external liquidity with the
+      stop beyond the raid extreme. Superseded `_select_structural_tp`/`_nearest_level`
+      deleted (their tests ported onto the live selector). New `test_geometry_menu.py` (17);
+      the two BUG-06 SL regression tests rewritten for the new contract. SCHEMA 3.8.0. 260/260.
 - [x] **B17.0** — `_dedup_plateau` collapses a run of equal extremes inside one fractal
       half-window to its LAST bar (a flat stretch is one pivot, not N); `fractal_swing_mask`
       gains a relative `tol` fed by `_equal_tol(df)` (ATR%·0.25, ≤20bps) so "equal" is the
@@ -294,3 +308,8 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
   Ordered MR sequence (balance→raid→MSS) as a HARD gate + continuation sequence as evidence,
   both with expiry; absorption vs initiative relabel. SCHEMA 3.7.0.
   New `test_setup_sequences.py` (18). 242/242.
+- 2026-07-24 — **Wave 3 I7.0 landed** (`strategies.py`, `config.py`, `main.py`).
+  Candidate-first geometry (primary selected from the merged menu), stop anchored on the
+  protected swing and never clipped inside invalidation (`size_class`), live price demoted
+  to `tf:"live"`, tick quantization, B19.0 menu enrichment. SCHEMA 3.8.0.
+  New `test_geometry_menu.py` (17). 260/260.

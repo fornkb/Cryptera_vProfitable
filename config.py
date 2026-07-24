@@ -16,7 +16,9 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.json")
 REGIME_STATE_PATH = os.path.join(DATA_DIR, "regime_state.json")
 SNAPSHOT_INDEX_PATH = os.path.join(DATA_DIR, "snapshot_index.json")
 
-SCHEMA_VERSION = "3.7.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+SCHEMA_VERSION = "3.8.0"  # bump on any snapshot-SHAPE change (CLAUDE.md invariant 5).
+                          # 3.8.0: I7.0 candidate-first geometry — `size_class`,
+                          # `sl_atr_multiple`, merged stop menu (tf/confluence/risk_atr).
                           # 3.7.0: I4.0 `strategies.setup_sequence` (ordered stages+expiry).
                           # 3.6.0: I5.0 typed liquidity (`liquidity_levels.pools` +
                           # `swing_levels`) + I6.0 impulse-leg OTE (`leg_source`).

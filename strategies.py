@@ -925,52 +925,60 @@ def _dist_atr(level, ref_price, atr_abs):
     return None
 
 
-def _nearest_level(cands, entry, direction):
-    """Nearest real structural level beyond entry in the trade direction, or None."""
-    levels = [c for c in cands if c is not None]
-    if direction == "bullish":
-        beyond = [c for c in levels if c > entry]
-        return min(beyond) if beyond else None
-    beyond = [c for c in levels if c < entry]
-    return max(beyond) if beyond else None
-
-
-def _select_structural_tp(cands, entry, risk, direction):
-    """
-    Pick the NEAREST real structural level that yields >= 2R. If none reaches 2R,
-    return the FARTHEST available real level (honest sub-2R R:R). Never invents a
-    price out of thin air (P1 fix). Returns (tp, source_note) or (None, None).
-    """
-    levels = [c for c in cands if c is not None]
-    if direction == "bullish":
-        beyond = sorted(c for c in levels if c > entry)
-    else:
-        beyond = sorted((c for c in levels if c < entry), reverse=True)
-    if not beyond:
-        return None, None
-    for c in beyond:
-        if abs(c - entry) >= 2 * risk:
-            return c, "nearest >=2R structural level"
-    return beyond[-1], "farthest structural level (<2R, honest)"
-
-
 # 4h stays the most significant anchor (intraday system); daily/weekly levels
 # rank above 1h but below 4h so HTF draws don't dominate intraday geometry.
-_TF_RANK = {"4h": 4, "1d": 3, "1h": 2, "15m": 1}
+# `live` (the market price) and unknown sources rank below every real level.
+_TF_RANK = {"4h": 4, "1d": 3, "1h": 2, "15m": 1, "live": 0}
 
 
 def _tf_of_source(src):
-    """Infer the level's timeframe from its source label (VAH/VAL/POC are 1H)."""
+    """
+    Infer the level's timeframe from its source label (VAH/VAL/POC are 1H). B11.0: the
+    live market price is NOT a structural level — it gets `live` and ranks below every
+    real one, and an unrecognised source gets None rather than defaulting to "1h", which
+    used to let "current price" be ranked as a 1H structural level in a menu the model is
+    told to prefer higher timeframes from.
+    """
     s = (src or "").lower()
+    if "current price" in s or "live" in s:
+        return "live"
     if "4h" in s:
         return "4h"
     if "15m" in s:
         return "15m"
     if "1h" in s:
         return "1h"
-    if "1d" in s or "daily" in s or "pw" in s or "weekly" in s:
+    if "1d" in s or "daily" in s or "pw" in s or "pd" in s or "weekly" in s:
         return "1d"
-    return "1h"
+    if "vah" in s or "val" in s or "poc" in s:
+        return "1h"
+    return None
+
+
+def _tick_decimals(price: float) -> int:
+    """
+    Quantization scale for a price (B11.0/I7.0). The engine emitted levels like
+    1799.757 — false precision that no exchange would accept as a resting order and that
+    makes two "identical" levels compare unequal. Scaled by magnitude since the engine is
+    multi-asset (BTC at 60k and a sub-dollar alt need different grids).
+    """
+    p = abs(float(price or 0.0))
+    if p >= 10000:
+        return 1
+    if p >= 1000:
+        return 2
+    if p >= 100:
+        return 3
+    if p >= 1:
+        return 4
+    return 6
+
+
+def _q(price, ref=None):
+    """Quantize a level to the tick grid of `ref` (or of itself)."""
+    if price is None:
+        return None
+    return round(float(price), _tick_decimals(ref if ref is not None else price))
 
 
 def _zone_of(level, dealing_range):
@@ -1004,7 +1012,7 @@ def _merge_confluent(rows, tol=0.0015):
         srcs = m.pop("_sources")
         m["confluence"] = srcs
         m["confluence_count"] = len(srcs)
-        m["tf"] = max((_tf_of_source(s) for s in srcs), key=lambda t: _TF_RANK.get(t, 1))
+        m["tf"] = max((_tf_of_source(s) for s in srcs), key=lambda t: _TF_RANK.get(t or "", 0))
         m["hvn"] = bool(m.pop("_hvn"))
     return merged
 
@@ -1023,6 +1031,86 @@ def _rank_entries(labeled, ref_price, dealing_range, atr_abs=None):
         m["zone"] = _zone_of(m["price"], dealing_range)
         m["dist_from_price_atr"] = _dist_atr(m["price"], ref_price, atr_abs)
     return merged
+
+
+def _rank_stops(labeled, entry, direction, ref_price=None, atr_abs=None):
+    """
+    labeled: [(price, source)] -> confluence-merged stop candidates strictly beyond entry
+    on the invalidation side, TIGHTEST first. Stops go through the same merge as entries
+    and targets so the primary is a menu member by construction (B11.0).
+    """
+    rows = []
+    for p, s in labeled:
+        if p is None:
+            continue
+        if direction == "bullish" and p >= entry:
+            continue
+        if direction == "bearish" and p <= entry:
+            continue
+        rows.append({"price": _q(p, entry), "source": s, "hvn": False})
+    rows.sort(key=lambda x: abs(x["price"] - entry))
+    merged = _merge_confluent(rows)
+    for m in merged:
+        m.pop("hvn", None)
+        m["risk_atr"] = _dist_atr(m["price"], entry, atr_abs)
+        m["dist_from_price_atr"] = _dist_atr(m["price"], ref_price if ref_price is not None
+                                             else entry, atr_abs)
+    return merged
+
+
+def _select_primary_stop(menu, direction, anchor):
+    """
+    Primary stop FROM the merged menu: the TIGHTEST candidate that still sits strictly
+    beyond the invalidation anchor (B11.0) — the protected swing for a continuation trade,
+    the raid extreme for a fade. Tightest-overall is the wrong rule on its own: a stop
+    inside the level whose breach invalidates the thesis (or inside the wick that already
+    ran) is a volatility stop wearing a structural label. Falls back to the widest
+    candidate when nothing clears the anchor, and to the tightest when there is no anchor.
+    """
+    if not menu:
+        return None
+    if anchor is None:
+        return menu[0]
+    beyond = [m for m in menu if (m["price"] < anchor if direction == "bullish"
+                                  else m["price"] > anchor)]
+    if beyond:
+        return beyond[0]           # menu is tightest-first
+    return menu[-1]
+
+
+def _select_primary_entry(menu, price, direction, entry_cap):
+    """
+    Primary entry FROM the merged menu (B11.0): the nearest real structural level on the
+    correct side and within `entry_cap`, else the market entry. Selecting from the menu
+    rather than from raw prices is what makes menu membership an invariant instead of a
+    coincidence.
+    """
+    live = next((m for m in menu if m["tf"] == "live"), None)
+    for m in menu:
+        if m["tf"] == "live":
+            continue
+        p = m["price"]
+        if direction == "bullish" and p <= price * 1.002 and (price - p) <= entry_cap:
+            return m
+        if direction == "bearish" and p >= price * 0.998 and (p - price) <= entry_cap:
+            return m
+    return live
+
+
+def _select_primary_target(menu, risk, score_mode):
+    """
+    Primary target FROM the merged menu. Mean reversion takes the nearest draw; trend
+    takes the nearest candidate reaching 2R, and otherwise the farthest available level
+    with its honest sub-2R R:R (invariant 3 — never inflate the target to reach 2R).
+    """
+    if not menu:
+        return None
+    if score_mode == "mean_revert":
+        return menu[0]
+    for m in menu:
+        if m.get("rr") is not None and m["rr"] >= 2.0:
+            return m
+    return menu[-1]
 
 
 def _rank_targets(labeled, entry, risk, direction, ref_price=None, atr_abs=None, atr_1h=None):
@@ -1076,7 +1164,8 @@ def _assign_level_ids(geometry):
 
 
 def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
-                           regime, score_mode, mr_edge=None, atr_1h=None):
+                           regime, score_mode, mr_edge=None, atr_1h=None,
+                           mr_raid_extreme=None):
     """
     Deterministic trade geometry. Emits a single reproducible PRIMARY entry/SL/TP
     (for backtesting/calibration) PLUS a ranked set of REAL candidate levels
@@ -1117,93 +1206,139 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
             if v:
                 avwap_pairs.append((v, f"{tfk} AVWAP ({label_suffix})"))
 
+    st15 = ctx15.get("structure_state") or {}
+    st1h = (smc_context.get("1h") or {}).get("structure_state") or {}
+    swings15 = (liq15.get("swing_levels") or {})
+    sr = pa.get("sr_levels") or {}
+    pdh, pdl = pa.get("pdh"), pa.get("pdl")
+
+    def _ob_entries(tf, ctx):
+        """OB midpoints + the nearest unfilled FVG midpoint on the bias side of `tf`."""
+        rows = [(( ob["top"] + ob["bottom"]) / 2.0, f"{tf} {direction[:4]} OB mid",
+                 bool(ob.get("high_volume_node")))
+                for ob in ((ctx.get("order_blocks") or {}).get(direction) or [])]
+        gap = (ctx.get("fvg") or {}).get(f"nearest_{direction}_fvg")
+        if gap and not gap.get("filled", True):
+            rows.append(((gap["top"] + gap["bottom"]) / 2.0, f"{tf} {direction[:4]} FVG mid", False))
+        return rows
+
     entry_labeled, stop_labeled, target_labeled = [], [], []
 
     if score_mode == "mean_revert" and mr_edge:
+        opposite = va.get("val") if direction == "bearish" else va.get("vah")
+        edge_label = "VAH (range top)" if direction == "bearish" else "VAL (range bottom)"
+        entry_labeled = [(mr_edge, edge_label, False), (price, "current price", False)]
+        entry_labeled += _ob_entries("15m", ctx15)
+        # B11.0/I4.0: the fade's invalidation is the RAID EXTREME — the level the stop run
+        # actually reached — not a fixed buffer off the value-area edge.
         if direction == "bearish":
-            entry, e_src = mr_edge, "VAH (range top)"
-            sl, sl_src = mr_edge + buf * 2, "above VAH + ATR buffer"
-            entry_labeled = [(mr_edge, "VAH (range top)", False), (price, "current price", False)]
-            stop_labeled = [(sl, sl_src)]
-            target_labeled = [(va.get("poc"), "POC"), (va.get("val"), "VAL")]
-            tp_src = "POC / VAL fade target"
+            if mr_raid_extreme:
+                stop_labeled.append((mr_raid_extreme + buf, "above raid extreme + buffer"))
+            stop_labeled.append((mr_edge + buf * 2, "above VAH + ATR buffer"))
+            dr_hi = ctx15.get("dealing_range", {}).get("high")
+            if dr_hi:
+                stop_labeled.append((dr_hi + buf, "above dealing-range high + buffer"))
         else:
-            entry, e_src = mr_edge, "VAL (range bottom)"
-            sl, sl_src = mr_edge - buf * 2, "below VAL + ATR buffer"
-            entry_labeled = [(mr_edge, "VAL (range bottom)", False), (price, "current price", False)]
-            stop_labeled = [(sl, sl_src)]
-            target_labeled = [(va.get("poc"), "POC"), (va.get("vah"), "VAH")]
-            tp_src = "POC / VAH fade target"
+            if mr_raid_extreme:
+                stop_labeled.append((mr_raid_extreme - buf, "below raid extreme - buffer"))
+            stop_labeled.append((mr_edge - buf * 2, "below VAL + ATR buffer"))
+            dr_lo = ctx15.get("dealing_range", {}).get("low")
+            if dr_lo:
+                stop_labeled.append((dr_lo - buf, "below dealing-range low - buffer"))
+        # B19.0: the fade menu was POC + the opposite edge and nothing else. Rotation
+        # targets the POC first, then the opposite edge, then external liquidity past it.
+        pool_side = "sell_side" if direction == "bearish" else "buy_side"
+        target_labeled = [(va.get("poc"), "POC"), (opposite, "VAL" if direction == "bearish" else "VAH")]
+        target_labeled += [(l, "15m " + ("SSL" if direction == "bearish" else "BSL"))
+                           for l in (liq15.get(pool_side) or [])]
+        target_labeled += [(l, "1h " + ("SSL" if direction == "bearish" else "BSL"))
+                           for l in (liq1h.get(pool_side) or [])]
+        target_labeled += ([(pdl, "PDL")] if direction == "bearish" and pdl else [])
+        target_labeled += ([(pdh, "PDH")] if direction == "bullish" and pdh else [])
+        tp_src = "POC / opposite edge / external liquidity"
     else:
-        # trend continuation: pull back to OB/FVG, target next opposing liquidity
-        obs = ctx15.get("order_blocks", {}).get(direction, []) or []
-        fvg = (ctx15.get("fvg", {}) or {}).get(f"nearest_{direction}_fvg")
+        # trend continuation: pull back to OB/FVG, target next opposing liquidity.
+        # B19.0: 1H order blocks are entry candidates too — C2 scores 1H OB proximity, so
+        # a menu that could only execute 15m OBs contradicted the engine's own evidence.
+        entry_labeled = _ob_entries("15m", ctx15) + _ob_entries("1h", smc_context.get("1h") or {})
+        entry_labeled.append((price, "current price", False))
+        dr = ctx15.get("dealing_range", {}) or {}
         if direction == "bullish":
-            # Enter at OB MIDPOINT rather than the near edge (audit §3.5) — a more
-            # realistic fill than assuming the extreme edge always tags.
-            ob_entries = [((ob["top"] + ob["bottom"]) / 2.0, "15m bull OB mid",
-                           bool(ob.get("high_volume_node"))) for ob in obs]
-            if fvg and not fvg.get("filled", True):
-                ob_entries.append(((fvg["top"] + fvg["bottom"]) / 2.0, "15m bull FVG mid", False))
-            # B4.0: only entries within ENTRY_ATR_CAP of price; a stale OB 4-5 ATR away would
-            # otherwise become the primary and manufacture a never-filled row. Falls back to
-            # the market entry (price) via the default below when nothing qualifies.
-            valid_entries = [(p, s, h) for p, s, h in ob_entries
-                             if p <= price * 1.002 and (price - p) <= entry_cap]
-            entry = max((p for p, _, _ in valid_entries), default=price)
-            e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
-            entry_labeled = valid_entries + [(price, "current price", False)]
-            # Nearest protected swing BELOW entry (BUG-06) — not the widest pool.
-            dr_low = ctx15.get("dealing_range", {}).get("low")
-            ssl_below = [l for l in (liq15.get("sell_side", []) or []) if l and l < entry]
-            swing_low = max(ssl_below) if ssl_below else (dr_low if dr_low and dr_low < entry else None)
-            sl = (swing_low - buf) if swing_low else entry - buf * 3
-            sl_src = "below nearest protected 15m swing low - buffer"
-            if entry - sl > sl_cap:
-                sl = entry - sl_cap
-                sl_src = f"ATR-capped ({SL_ATR_CAP:g}x 15m ATR below entry)"
-            stop_labeled = [(sl, sl_src)]
-            if dr_low and dr_low < entry and abs((dr_low - buf) - sl) / max(sl, 1e-9) > 0.0005:
-                stop_labeled.append((dr_low - buf, "below dealing-range low - buffer"))
+            # B11.0: stops anchor on the PROTECTED SWING whose violation flips structure,
+            # not on a generic pool (pools are targets). Single-touch swing extremes from
+            # the typed layer are valid anchors; liquidity pools are not.
+            for lvl, label in ((st15.get("protected_low"), "below 15m protected swing low"),
+                               (st1h.get("protected_low"), "below 1H protected swing low"),
+                               (dr.get("low"), "below dealing-range low")):
+                if lvl:
+                    stop_labeled.append((lvl - buf, f"{label} - buffer"))
+            for lvl in (swings15.get("lows") or []):
+                stop_labeled.append((lvl - buf, "below 15m swing low - buffer"))
             target_labeled = [(l, "15m BSL") for l in (liq15.get("buy_side", []) or [])] + \
                              [(l, "1h BSL") for l in (liq1h.get("buy_side", []) or [])] + \
                              [(l, "1d BSL") for l in (liq1d.get("buy_side", []) or [])] + \
                              [(l, "untested 4H POC") for l in untested] + \
                              [(l, "untested daily POC") for l in untested_1d] + \
+                             [(z["price"], "1h resistance zone") for z in (sr.get("resistance") or [])] + \
+                             ([(pdh, "PDH")] if pdh else []) + \
                              ([(pwh, "PWH")] if pwh else []) + \
                              avwap_pairs + ([(va.get("vah"), "VAH")] if va.get("vah") else [])
-            tp_src = "BSL / untested POC / PWH / AVWAP / VAH"
+            tp_src = "BSL / untested POC / S-R / PDH / PWH / AVWAP / VAH"
         else:
-            ob_entries = [((ob["top"] + ob["bottom"]) / 2.0, "15m bear OB mid",
-                           bool(ob.get("high_volume_node"))) for ob in obs]
-            if fvg and not fvg.get("filled", True):
-                ob_entries.append(((fvg["top"] + fvg["bottom"]) / 2.0, "15m bear FVG mid", False))
-            # B4.0: cap entry distance (see the bullish branch); market-entry fallback below.
-            valid_entries = [(p, s, h) for p, s, h in ob_entries
-                             if p >= price * 0.998 and (p - price) <= entry_cap]
-            entry = min((p for p, _, _ in valid_entries), default=price)
-            e_src = next((s for p, s, _ in valid_entries if p == entry), "current price")
-            entry_labeled = valid_entries + [(price, "current price", False)]
-            # Nearest protected swing ABOVE entry (BUG-06) — not the widest pool.
-            dr_high = ctx15.get("dealing_range", {}).get("high")
-            bsl_above = [l for l in (liq15.get("buy_side", []) or []) if l and l > entry]
-            swing_high = min(bsl_above) if bsl_above else (dr_high if dr_high and dr_high > entry else None)
-            sl = (swing_high + buf) if swing_high else entry + buf * 3
-            sl_src = "above nearest protected 15m swing high + buffer"
-            if sl - entry > sl_cap:
-                sl = entry + sl_cap
-                sl_src = f"ATR-capped ({SL_ATR_CAP:g}x 15m ATR above entry)"
-            stop_labeled = [(sl, sl_src)]
-            if dr_high and dr_high > entry and abs((dr_high + buf) - sl) / max(sl, 1e-9) > 0.0005:
-                stop_labeled.append((dr_high + buf, "above dealing-range high + buffer"))
+            for lvl, label in ((st15.get("protected_high"), "above 15m protected swing high"),
+                               (st1h.get("protected_high"), "above 1H protected swing high"),
+                               (dr.get("high"), "above dealing-range high")):
+                if lvl:
+                    stop_labeled.append((lvl + buf, f"{label} + buffer"))
+            for lvl in (swings15.get("highs") or []):
+                stop_labeled.append((lvl + buf, "above 15m swing high + buffer"))
             target_labeled = [(l, "15m SSL") for l in (liq15.get("sell_side", []) or [])] + \
                              [(l, "1h SSL") for l in (liq1h.get("sell_side", []) or [])] + \
                              [(l, "1d SSL") for l in (liq1d.get("sell_side", []) or [])] + \
                              [(l, "untested 4H POC") for l in untested] + \
                              [(l, "untested daily POC") for l in untested_1d] + \
+                             [(z["price"], "1h support zone") for z in (sr.get("support") or [])] + \
+                             ([(pdl, "PDL")] if pdl else []) + \
                              ([(pwl, "PWL")] if pwl else []) + \
                              avwap_pairs + ([(va.get("val"), "VAL")] if va.get("val") else [])
-            tp_src = "SSL / untested POC / PWL / AVWAP / VAL"
+            tp_src = "SSL / untested POC / S-R / PDL / PWL / AVWAP / VAL"
+
+    # --- candidate-first selection (B11.0): merge the menus, then pick the primary FROM
+    # them, so the primary is a menu member by construction with one canonical price and
+    # one canonical R:R — instead of being chosen from raw prices and then possibly being
+    # absent from the very menu the adjudicator selects by id from.
+    entry_labeled = [(_q(p, price), s, h) for p, s, h in entry_labeled if p is not None]
+    entries_menu = _rank_entries(entry_labeled, price, ctx15.get("dealing_range", {}),
+                                 atr_abs=atr_abs)
+    if score_mode == "mean_revert" and mr_edge:
+        # A fade is entered AT its edge — the side/distance constraints below are a
+        # continuation concept, and letting the market price stand in for the edge would
+        # quietly turn a rejected dead-on-arrival fade into a market trade.
+        target_entry = _q(mr_edge, price)
+        entry_row = min(entries_menu, key=lambda m: abs(m["price"] - target_entry),
+                        default=None)
+    else:
+        entry_row = _select_primary_entry(entries_menu, price, direction, entry_cap)
+    if entry_row is None:
+        return out
+    entry, e_src = entry_row["price"], entry_row["source"]
+
+    stops_menu = _rank_stops(stop_labeled, entry, direction, ref_price=price, atr_abs=atr_abs)
+    if not stops_menu:
+        # No structural invalidation on the trade side: an ATR stop is a volatility stop,
+        # so it is emitted as the honest fallback rather than dressed up as structure.
+        fallback = entry - buf * 3 if direction == "bullish" else entry + buf * 3
+        stops_menu = _rank_stops([(fallback, "ATR fallback (no structural invalidation)")],
+                                 entry, direction, ref_price=price, atr_abs=atr_abs)
+    if not stops_menu:
+        return out
+    if score_mode == "mean_revert" and mr_edge:
+        invalidation = mr_raid_extreme or mr_edge
+    else:
+        invalidation = (st15.get("protected_low") if direction == "bullish"
+                        else st15.get("protected_high"))
+    stop_row = _select_primary_stop(stops_menu, direction, invalidation)
+    sl, sl_src = stop_row["price"], stop_row["source"]
 
     if entry is None or sl is None or entry == sl:
         return out
@@ -1211,26 +1346,21 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     if risk <= 0:
         return out
 
-    # PRIMARY target — real structural levels only, never invented (P1 fix).
-    # FA-04: the primary honours the same reachability gate as the ranked
-    # candidates menu (_rank_targets), else _select_structural_tp's honest-<2R
-    # branch can pick a 1d pool / PWH unreachable within the horizon — exactly
-    # what the labeler scores. Fail open when atr_1h is unavailable.
-    tp_prices = [p for p, _ in target_labeled if p is not None]
-    if atr_1h:
-        tp_prices = [p for p in tp_prices
-                     if abs(float(p) - price) <= atr_1h * MAX_TARGET_ATR_1H_MULTIPLE]
-    if score_mode == "mean_revert":
-        tp = _nearest_level(tp_prices, entry, direction)
-        tp_note = "nearest fade target"
-    else:
-        tp, tp_note = _select_structural_tp(tp_prices, entry, risk, direction)
-    if tp is None:
-        return out  # no structural target in the trade direction -> no sound trade
-    tp_src = f"{tp_src} [{tp_note}]"
+    # B11.0: the ATR cap must NOT slide the stop inside the level whose breach invalidates
+    # the thesis — that converts a structural stop into a volatility stop sitting in the
+    # noise band, and the trade dies on ordinary rotation while the setup is still valid.
+    # The honest wide stop is kept and the setup is downsized instead.
+    sl_atr = (risk / atr_abs) if atr_abs and atr_abs > 0 else None
+    size_class = "reduced" if risk > sl_cap else "full"
 
-    reward = abs(tp - entry)
-    rr = round(reward / risk, 2) if risk > 0 else None
+    # PRIMARY target from the merged menu, which already applies the reachability gate.
+    targets_menu = _rank_targets(target_labeled, entry, risk, direction,
+                                 ref_price=price, atr_abs=atr_abs, atr_1h=atr_1h)
+    tp_row = _select_primary_target(targets_menu, risk, score_mode)
+    if tp_row is None:
+        return out  # no structural target in the trade direction -> no sound trade
+    tp, rr = tp_row["price"], tp_row["rr"]
+    tp_src = f"{tp_src} [{tp_row['source']}]"
 
     # B2.0 universal dead-on-arrival guard (mode-agnostic): never emit a trade whose stop
     # the LIVE price has already breached — e.g. an MR fade whose SL sits between price and
@@ -1242,23 +1372,18 @@ def compute_trade_geometry(direction, price, smc_context, pa_context, atr_abs,
     out.update({
         "valid": True,
         "direction": "BUY" if direction == "bullish" else "SELL",
-        "entry": round(float(entry), 6),
-        "stop_loss": round(float(sl), 6),
-        "take_profit": round(float(tp), 6),
+        "entry": entry,
+        "stop_loss": sl,
+        "take_profit": tp,
         "rr": rr,
         "rr_passed": bool(rr is not None and rr >= 2.0),
         "sl_width_pct": round(risk / entry * 100, 3) if entry else None,
+        "sl_atr_multiple": round(sl_atr, 2) if sl_atr is not None else None,
+        "size_class": size_class,
         "entry_source": e_src,
         "stop_loss_source": sl_src,
         "take_profit_source": tp_src,
-        "candidates": {
-            "entries": _rank_entries(entry_labeled, price, ctx15.get("dealing_range", {}), atr_abs=atr_abs),
-            "stops": [{"price": round(float(p), 6), "source": s, "tf": _tf_of_source(s),
-                       "dist_from_price_atr": _dist_atr(p, price, atr_abs)}
-                      for p, s in stop_labeled if p is not None],
-            "targets": _rank_targets(target_labeled, entry, risk, direction,
-                                     ref_price=price, atr_abs=atr_abs, atr_1h=atr_1h),
-        },
+        "candidates": {"entries": entries_menu, "stops": stops_menu, "targets": targets_menu},
     })
     return _assign_level_ids(out)
 
@@ -1405,7 +1530,9 @@ def evaluate_strategies(df_4h, df_1h, df_15m, orderbook, funding, sentiment, ope
     geometry = compute_trade_geometry(geo_bias, price, smc_context, pa_context, atr_abs,
                                       market_regime, score_mode,
                                       mr_edge=(mr_edge if is_ranging else None),
-                                      atr_1h=atr_map.get("1h"))
+                                      atr_1h=atr_map.get("1h"),
+                                      mr_raid_extreme=(sequence.get("raid_extreme")
+                                                       if is_ranging else None))
 
     # FA-02: the logistic model is fitted on RAW features (calibrate.py), so
     # inference must consume raw too — the weighted breakdown would drift the

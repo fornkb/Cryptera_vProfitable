@@ -773,7 +773,7 @@ Field definitions
  header.bias : the engine's directional read — `setup_direction` uppercased when not neutral, else `trend_bias`; NEUTRAL only when both are neutral.
  primary.probability : when `strategies.empirical_win_rate` is non-null, anchor to it; otherwise your calibrated estimate from score + confluence quality (0-100).
  confidence_pct : conviction in the overall read. Start near primary.probability, then apply the gate reductions above (event −15, cvd_absorption −10) and reduce for sub-2R geometry or counter-structure trades.
- position_size : "100%" default · "50% low-vol" on LOW_VOL_WARNING · "25% cascade" when two or more risk reducers stack (e.g. low-vol + event guard, or sub-2R + counter-structure) · "reduced - conflict" when order flow contradicts the setup direction. On HOLD emit "100%" (unused).
+ position_size : "100%" default · "50% low-vol" on LOW_VOL_WARNING · "50% wide stop" when `engine_trade.size_class` is "reduced" (the structural invalidation is farther than the ATR cap — the stop is honest and wide, never tightened into the noise band) · "25% cascade" when two or more risk reducers stack (e.g. low-vol + event guard, or sub-2R + counter-structure) · "reduced - conflict" when order flow contradicts the setup direction. On HOLD emit "100%" (unused).
  counter_structure : true when the trade direction opposes the 4H structure.
 
 Field formats
@@ -1181,6 +1181,8 @@ def _build_engine_case(snapshot: dict) -> dict:
         vetoes.append("event_guard (caps at CONDITIONAL, -15 confidence)")
     if strat.get("cvd_absorption_warning"):
         vetoes.append("cvd_absorption_warning (-10 confidence)")
+    if et.get("size_class") == "reduced":
+        vetoes.append(f"wide structural stop ({et.get('sl_atr_multiple')}x 15m ATR) - half size")
     if strat.get("counter_choch_warning"):
         vetoes.append("counter_choch (fresh opposing change of character; score capped)")
     if (strat.get("volume_gate") or {}).get("state") == "LOW_VOL_WARNING":
