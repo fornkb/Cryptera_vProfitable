@@ -1,9 +1,16 @@
 # Cryptera — Correctness → Quality Status (post-v3.3 audit)
 
 Source of truth: `final_improvement_report.md` (2026-07-20, merged & verified). Reference
-findings by ID (**B1.0–B28.0**, **I1.0–I15.0**); do not restate them here. This supersedes
-`current_status.md` (the audit_report.md / BUG-01…24 plan, fully done). Each session: read
-`CLAUDE.md` + this file first, work only its scope, tick boxes, note ≤1-line outcomes.
+findings by ID (**B1.0–B28.0**, **I1.0–I15.0**); do not restate them here. Supersedes the
+earlier remediation docs (`audit_report.md` / `current_status.md` / `final_audit.md`,
+BUG-01…24 + FA-xx — all fully landed; removed from the tree, in git history if needed).
+Each session: read `CLAUDE.md` + this file first, work only its scope, tick boxes, note
+≤1-line outcomes.
+
+> **Status (2026-07-25): Waves 1–3 COMPLETE, on branch `v3.2.4-correctness`, NOT deployed.**
+> 275/275 pytest, `SCHEMA_VERSION` 3.9.0. The Azure VM is still collecting the pre-fix
+> corpus (archive-only at deploy). A full pre-Azure-deploy audit is being commissioned
+> before the DEPLOY EVENT; Wave 4 (I8.0–I15.0, measurement-gated) follows the clean corpus.
 
 ## Corpus discipline (the constraint that shapes everything)
 

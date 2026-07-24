@@ -286,8 +286,9 @@ Top-level keys written to each `snapshots/snapshot_*.json`:
 
 ## Roadmap
 
-All bugs and improvements from the 2026-07-11 audit (see `current_status.md`) and all
-removals are implemented in 3.2. Still open:
+All bugs and improvements from the 2026-07-11 and 2026-07-12 audits are implemented, as
+are the correctness waves tracked in `correctness_status.md` (findings/plan in
+`final_improvement_report.md`). Still open:
 
 - **Tier 2** — closed-candle volume-gate seasonality, BTC-beta gating for alts,
   funding-fade directional bias, naked-POC target wiring, probability calibration

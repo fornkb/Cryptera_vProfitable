@@ -136,7 +136,7 @@ GEMINI_MODEL_NAME = "gemini-3.5-flash"
 # output), which rewards deeper thinking, hence "high". This is the
 # pre-measurement default: tools/ab_thinking.py A/B-tests high vs medium over
 # labeled snapshots; switch to the measured winner once enough labeled
-# snapshots exist (empty corpus as of Phase 2/3 — current_status.md).
+# snapshots exist. No tuning until the post-deploy clean corpus (Wave 4).
 GEMINI_THINKING_LEVEL = "high"
 # Round-robin across GEMINI_API_KEY / GEMINI_API_KEY_2 / GEMINI_API_KEY_3 (.env).
 # On any call error the failing key is benched for this many seconds and the
