@@ -8,10 +8,15 @@ import io
 import json
 import contextlib
 
+import config
 import tools.eval_engine as ee
 
 
 def _write(dir_, name, obj):
+    # Every real snapshot carries its schema_version, and the corpus guard
+    # (tools/corpus.py, invariant 5) now excludes rows from other generations —
+    # so fixtures must be stamped like the real thing or they model nothing.
+    obj.setdefault("schema_version", config.SCHEMA_VERSION)
     with open(dir_ / name, "w") as f:
         json.dump(obj, f)
 
@@ -20,6 +25,7 @@ def _run(monkeypatch, dir_):
     class Args:
         symbol = None
         out = None
+        allow_mixed_schema = False
 
     class FakeParser:
         def add_argument(self, *a, **k):

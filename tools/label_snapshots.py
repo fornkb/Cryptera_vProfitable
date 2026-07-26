@@ -55,11 +55,21 @@ import requests
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
+sys.path.insert(0, ROOT_DIR)   # allow `python tools/label_snapshots.py` (no package context)
 
 # Bump whenever _label_one's semantics change so corpora of mixed label meaning can
 # never be pooled unnoticed. v1 = pre-B1.0 (order-of-events assumed); v2 = chronological
 # state machine + intrabar_unknown + entry-bar excursion fix + strict horizon + end_rr.
-LABEL_VERSION = 2
+# Lives in config.py now (single source of truth) so tools/corpus.py can enforce it
+# without importing this module; re-exported here for the existing callers/tests.
+from config import LABEL_VERSION  # noqa: E402,F401
+
+try:
+    from tools.corpus import (add_cli_flag, is_current_schema, snapshot_generation,
+                              CURRENT_GENERATION)
+except ImportError:  # pragma: no cover - direct-script invocation
+    from corpus import (add_cli_flag, is_current_schema, snapshot_generation,
+                        CURRENT_GENERATION)
 
 
 def _parse_snapshot_time(filename: str) -> datetime | None:
@@ -410,14 +420,22 @@ def _direction_to_side(direction: str) -> str | None:
     return None
 
 
-def label_snapshot_file(path: str, horizon_hours: int, force: bool):
+def label_snapshot_file(path: str, horizon_hours: int, force: bool, allow_mixed: bool = False):
     with open(path, "r") as f:
         snapshot = json.load(f)
+
+    filename = os.path.basename(path)
+
+    # A label is only meaningful against the geometry that produced it. Stamping the
+    # CURRENT label_version onto a snapshot from an older schema generation would make
+    # a pre-fix row look current to calibrate/eval_engine -- the exact pooling this
+    # guard exists to prevent (invariant 5). Skip it and say so.
+    if not allow_mixed and not is_current_schema(snapshot):
+        return "skipped_schema"
 
     if not force and snapshot.get("outcome"):
         return False
 
-    filename = os.path.basename(path)
     snap_time = _snapshot_time(snapshot, filename)
     symbol = snapshot.get("symbol") or _symbol_from_filename(filename)
     if snap_time is None or symbol is None:
@@ -486,6 +504,7 @@ def main():
     p.add_argument("--symbol", default=None, help="restrict to one symbol (e.g. BTC/USDT)")
     p.add_argument("--horizon", type=int, default=24, help="hours of look-forward (default 24)")
     p.add_argument("--force", action="store_true", help="re-label already labelled snapshots")
+    add_cli_flag(p)
     args = p.parse_args()
 
     if not os.path.isdir(SNAPSHOTS_DIR):
@@ -507,14 +526,29 @@ def main():
         return
 
     updated = 0
+    skipped_schema = {}
     for path in targets:
         try:
-            if label_snapshot_file(path, args.horizon, args.force):
+            res = label_snapshot_file(path, args.horizon, args.force, args.allow_mixed_schema)
+            if res == "skipped_schema":
+                with open(path) as f:
+                    gen = snapshot_generation(json.load(f)) or "<none>"
+                skipped_schema[gen] = skipped_schema.get(gen, 0) + 1
+            elif res:
                 updated += 1
                 print(f"[OK] labelled {os.path.basename(path)}")
         except Exception as e:
             print(f"[ERR] {os.path.basename(path)}: {e}")
     print(f"\nDone. Labelled {updated} / {len(targets)} snapshot(s).")
+    if skipped_schema:
+        detail = ", ".join(f"{k}: {v}" for k, v in sorted(skipped_schema.items()))
+        print(f"[corpus] SKIPPED {sum(skipped_schema.values())} snapshot(s) from other schema "
+              f"generations (current {CURRENT_GENERATION}) — {detail}.\n"
+              f"         Labelling them would stamp a current label_version onto pre-fix "
+              f"geometry and let them pool (invariant 5). Archive them out of snapshots/.")
+    if args.allow_mixed_schema:
+        print("[corpus] WARNING: --allow-mixed-schema was ON — labels were written across "
+              "schema generations. Never fit calibration on the result.")
 
 
 if __name__ == "__main__":

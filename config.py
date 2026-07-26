@@ -128,6 +128,14 @@ EVENT_CALENDAR_STALE_DAYS = 14     # data_health_report warns if no calendar ent
 SNAPSHOT_RETENTION = 1000         # per symbol
 HORIZON_HOURS = 24                # forward window the geometry/targets are judged against
 
+# Labeller generation (tools/label_snapshots.py). Bump on ANY change to how an
+# outcome is derived -- old labels then stop pooling with new ones automatically
+# (tools/corpus.py enforces it). 2 = B1.0's PENDING->OPEN->TP|SL|TIMEOUT state
+# machine + 1m intrabar drill + strict horizon. Snapshots carrying an `outcome`
+# with NO label_version field are generation 1 (pre-B1.0, which is what
+# introduced the stamp).
+LABEL_VERSION = 2
+
 # ---------------- Gemini ---------------- #
 # Verified against ai.google.dev (2026-07-26): `gemini-3.6-flash` is GA, supports
 # structured outputs (`response_schema`) and thinking, and keeps the SAME `medium`

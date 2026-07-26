@@ -39,6 +39,7 @@ from tools.label_snapshots import (  # noqa: E402
 )
 from tools.episodes import collapse_to_episodes  # noqa: E402
 from tools.eval_engine import _realized_r  # noqa: E402
+from tools.corpus import GenerationFilter, add_cli_flag  # noqa: E402
 
 SNAPSHOTS_DIR = engine.SNAPSHOTS_DIR
 
@@ -74,6 +75,7 @@ def main():
     p.add_argument("--symbol", default=None)
     p.add_argument("--horizon", type=int, default=24)
     p.add_argument("--limit", type=int, default=None, help="cap number of snapshots evaluated")
+    add_cli_flag(p)
     args = p.parse_args()
 
     if not os.path.isdir(SNAPSHOTS_DIR):
@@ -91,13 +93,21 @@ def main():
     # B26.0: collapse a persisting setup's repeated 15m snapshots to ONE representative
     # BEFORE issuing any (paid) LLM calls -- else the same decision is A/B'd many times and
     # counted as independent trials, exactly the pseudo-replication eval/calibrate fix kills.
+    # Invariant 5 + budget: an old-generation snapshot describes a SHAPE the current
+    # system instruction no longer matches (no structure_state / typed pools /
+    # setup_sequence / size_class), so replaying one buys a garbage answer with a real
+    # paid Gemini call. Filter before spending anything.
+    gen_filter = GenerationFilter(allow_mixed=args.allow_mixed_schema)
     rows = []
     for name in names:
         try:
             with open(os.path.join(SNAPSHOTS_DIR, name)) as f:
-                rows.append((name, json.load(f), None))
+                snap = json.load(f)
         except Exception:
             continue
+        if gen_filter.accept(snap):
+            rows.append((name, snap, None))
+    gen_filter.print_report()
     episodes = collapse_to_episodes(rows)
 
     stats = {lvl: _acc() for lvl in args.levels}

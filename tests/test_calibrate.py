@@ -8,10 +8,16 @@ import json
 
 from pytest import approx
 
+import config
 import tools.calibrate as cal
 
 
 def _write(dir_, name, obj):
+    # Every real snapshot carries its schema_version, and the corpus guard
+    # (tools/corpus.py, invariant 5) now excludes rows from other generations —
+    # so fixtures must be stamped like the real thing or they model nothing.
+    obj.setdefault("schema_version", config.SCHEMA_VERSION)
+    obj.setdefault("outcome", {}).setdefault("label_version", config.LABEL_VERSION)
     with open(dir_ / name, "w") as f:
         json.dump(obj, f)
 

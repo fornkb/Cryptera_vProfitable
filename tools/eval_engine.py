@@ -53,6 +53,11 @@ from collections import defaultdict
 from typing import Iterable
 
 try:
+    from tools.corpus import GenerationFilter, add_cli_flag, CURRENT_GENERATION
+except ImportError:  # allow running as `python tools/eval_engine.py` (no package context)
+    from corpus import GenerationFilter, add_cli_flag, CURRENT_GENERATION
+
+try:
     from tools.episodes import collapse_to_episodes
 except ImportError:  # allow running as `python tools/eval_engine.py` (no package context)
     from episodes import collapse_to_episodes
@@ -84,7 +89,15 @@ def _realized_r(outcome: dict, target_rr):
     return None if r is None else (r - ROUND_TRIP_COST_R)
 
 
-def _iter_snapshots(symbol: str | None) -> Iterable[tuple[str, dict]]:
+def _iter_snapshots(symbol: str | None, gen_filter=None) -> Iterable[tuple[str, dict]]:
+    """Yield (name, snap) for the current corpus generation only.
+
+    Pooling generations here does not corrupt a fit, but it silently corrupts every
+    metric this tool reports -- and those metrics are what Wave 4 promotion decisions
+    are made on. Same guard as calibrate (invariant 5), defaults ON.
+    """
+    if gen_filter is None:
+        gen_filter = GenerationFilter()
     for name in sorted(os.listdir(SNAPSHOTS_DIR)):
         if not name.startswith("snapshot_") or not name.endswith(".json"):
             continue
@@ -95,9 +108,12 @@ def _iter_snapshots(symbol: str | None) -> Iterable[tuple[str, dict]]:
         path = os.path.join(SNAPSHOTS_DIR, name)
         try:
             with open(path) as f:
-                yield name, json.load(f)
+                snap = json.load(f)
         except Exception:
             continue
+        if not gen_filter.accept(snap):
+            continue
+        yield name, snap
 
 
 def _bucket_score(score: int) -> str:
@@ -250,7 +266,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--symbol", default=None)
     p.add_argument("--out", default=None)
+    add_cli_flag(p)
     args = p.parse_args()
+    gen_filter = GenerationFilter(allow_mixed=args.allow_mixed_schema)
 
     buckets = {
         # Engine-primary universe (FA-06) — the collector corpus.
@@ -272,7 +290,7 @@ def main():
     raw_engine_rows = []   # (name, snap, outcome) -- collapsed to episodes below
     llm_rows = []          # (name, snap, outcome) -- NOT collapsed, see note below
     verdict_rows = []      # (name, snap, engine_outcome, llm_outcome, verdict) -- I1.0 by_verdict
-    for name, snap in _iter_snapshots(args.symbol):
+    for name, snap in _iter_snapshots(args.symbol, gen_filter):
         seen += 1
         outcome_block = snap.get("outcome") or {}
         engine_outcome = outcome_block.get("engine_trade_outcome")
@@ -347,6 +365,12 @@ def main():
 
     report = {
         "snapshots_scanned": seen,
+        # Invariant 5 provenance: which engine generation these numbers describe, and
+        # how many rows were held out of them. A metric with no generation stamp is
+        # not interpretable once a schema bump has happened.
+        "schema_generation": CURRENT_GENERATION,
+        "excluded_other_generations": gen_filter.rejected,
+        "excluded_detail": {"schema": gen_filter.by_schema, "label": gen_filter.by_label},
         # FA-06: reported explicitly and separately — the engine universe is
         # the whole collector corpus, the LLM universe is narrated-only and
         # will be much smaller (budget-gated).
@@ -369,6 +393,9 @@ def main():
 
     # I1.0: paired AGREE/UPDATE vs engine primary + REJECT rejection quality.
     report["by_verdict"] = _by_verdict(verdict_rows)
+
+    import sys as _sys
+    gen_filter.print_report(_sys.stderr)   # keep stdout pure JSON for piping
 
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

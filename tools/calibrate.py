@@ -47,8 +47,10 @@ import numpy as np
 
 try:
     from tools.episodes import collapse_to_episodes
+    from tools.corpus import GenerationFilter, add_cli_flag
 except ImportError:  # allow running as `python tools/calibrate.py` (no package context)
     from episodes import collapse_to_episodes
+    from corpus import GenerationFilter, add_cli_flag
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SNAPSHOTS_DIR = os.path.join(ROOT_DIR, "snapshots")
@@ -62,7 +64,16 @@ MR_KEYS = ["m1_edge_distance", "m2_edge_sweep", "m3_cvd_absorption",
 DEFAULT_TARGET_RR = 2.0  # timeout credit blends mfe_r and end_rr against target_rr (B4.0)
 
 
-def _iter_labelled():
+def _iter_labelled(gen_filter=None):
+    """Yield (name, snap, engine_trade_outcome) for fittable rows.
+
+    `gen_filter` (tools.corpus.GenerationFilter) enforces invariant 5: a fit is only
+    ever valid over ONE engine generation, because the score components and the
+    geometry they describe changed meaning between them. Fitting a mixed corpus is
+    the single most damaging thing this tool can do, so the filter defaults ON.
+    """
+    if gen_filter is None:
+        gen_filter = GenerationFilter(require_label=True)
     if not os.path.isdir(SNAPSHOTS_DIR):
         return
     for name in sorted(os.listdir(SNAPSHOTS_DIR)):
@@ -73,13 +84,15 @@ def _iter_labelled():
                 snap = json.load(f)
         except Exception:
             continue
+        if not gen_filter.accept(snap):
+            continue
         outcome = (snap.get("outcome") or {}).get("engine_trade_outcome")
         # Include timeouts (BUG-12): they get partial credit rather than exclusion.
         if outcome and outcome.get("triggered") and outcome.get("outcome") in ("tp_first", "sl_first", "timeout"):
             yield name, snap, outcome
 
 
-def _load_labelled_episodes():
+def _load_labelled_episodes(gen_filter=None):
     """Load labelled engine trades and COLLAPSE overlapping 15m snapshots of one persisting
     setup into a single EPISODE (pseudo-replication fix, tools.episodes). A multi-hour setup
     otherwise yields many near-duplicate rows that calibration would treat as that many
@@ -87,7 +100,7 @@ def _load_labelled_episodes():
     (episodes, n_raw_rows): `episodes` is a list of (name, snap, outcome) -- one EARLIEST
     representative per trade-episode -- and `n_raw_rows` is the pre-collapse row count so the
     caller can report episodes-vs-rows (the honesty metric)."""
-    raw = list(_iter_labelled())
+    raw = list(_iter_labelled(gen_filter))
     return collapse_to_episodes(raw), len(raw)
 
 
@@ -210,11 +223,18 @@ def main():
     p.add_argument("--min-bucket", type=int, default=20,
                    help="minimum trades per score bucket before emitting its win-rate")
     p.add_argument("--dry-run", action="store_true")
+    add_cli_flag(p)
     args = p.parse_args()
+
+    # Invariant 5: a fit is only valid over ONE engine generation. Reject (loudly)
+    # every snapshot from another schema/label generation BEFORE anything is fitted --
+    # the components and the geometry they describe changed meaning between them.
+    gen_filter = GenerationFilter(allow_mixed=args.allow_mixed_schema, require_label=True)
 
     # Collapse overlapping 15m snapshots of one persisting setup into single episodes
     # (tools.episodes -- pseudo-replication fix) BEFORE anything is fitted.
-    episodes, n_raw_rows = _load_labelled_episodes()
+    episodes, n_raw_rows = _load_labelled_episodes(gen_filter)
+    gen_filter.print_report()
 
     trend_rows, mr_rows = [], []      # (breakdown, y_soft, w)
     score_rows = []                   # (score, y_soft, w)

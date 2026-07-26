@@ -20,6 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (SNAPSHOTS_DIR, ACTIVE_TRADE_THRESHOLD,  # noqa: E402
                     CONDITIONAL_ENTRY_THRESHOLD)
 from alerts.controller import engine_gate  # noqa: E402
+from alerts.config import Cfg  # noqa: E402
+from tools.corpus import snapshot_generation, CURRENT_GENERATION  # noqa: E402
+
+HEARTBEAT_PATH = Cfg.heartbeat_path
 
 _PREFIX = "snapshot_"
 _MODE = {"trend": "Trend", "mean_revert": "MeanRev"}
@@ -34,10 +38,40 @@ def _parse(name):
     return parts[0].replace("_", "/"), parts[1] + parts[2]  # sortkey = date+time, lexical == chrono
 
 
+def _print_liveness():
+    """The collector's own progress signal. `systemctl status` reporting `active
+    (running)` proved insufficient on 2026-07-21 -- the process was alive and wedged
+    for five days -- so the FIRST thing an operator sees is cycle progress, not
+    process state."""
+    try:
+        with open(HEARTBEAT_PATH) as f:
+            hb = json.load(f)
+    except Exception:
+        print("Collector: no heartbeat file yet "
+              "(monitor not started since this build, or a pre-liveness build is running)")
+        return
+    try:
+        ts = datetime.fromisoformat((hb.get("updated_at") or "").replace("Z", "+00:00"))
+        age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+        age = f"{age_min:.0f}m ago"
+    except Exception:
+        age_min, age = None, "unknown age"
+    ok = bool(hb.get("alive")) and (age_min is None or age_min < 45)
+    flag = "OK " if ok else "STALE"
+    print(f"Collector [{flag}] last cycle {age} · {hb.get('cycles_completed')} cycle(s) this run "
+          f"· {hb.get('last_snapshots')} snapshot(s) last cycle · pid {hb.get('pid')}")
+    if hb.get("last_error"):
+        print(f"  last cycle error: {hb['last_error']}")
+    if not ok:
+        print("  ^ no recent completed cycle — check `journalctl -u cryptera-monitor -n 100`; "
+              "the systemd watchdog should already be restarting it.")
+
+
 def main():
     files = glob.glob(os.path.join(SNAPSHOTS_DIR, _PREFIX + "*.json"))
     counts = defaultdict(int)
     latest = {}          # sym -> (sortkey, path)
+    generations = defaultdict(int)
     for path in files:
         sym, key = _parse(os.path.basename(path))
         if sym is None:
@@ -47,11 +81,26 @@ def main():
             latest[sym] = (key, path)
 
     total = len(files)
+    _print_liveness()
     print(f"Cryptera corpus: {total} snapshot(s) across {len(latest)} symbol(s)")
     print(f"  ({SNAPSHOTS_DIR})")
     if not latest:
         print("  no snapshots yet — is the monitor running? (systemctl status cryptera-monitor)")
         return
+
+    # Mixed generations in one directory is the deploy-day failure mode: the archived
+    # pre-fix corpus and the clean one must never share a folder (invariant 5).
+    for path in files:
+        try:
+            with open(path) as f:
+                generations[snapshot_generation(json.load(f)) or "<none>"] += 1
+        except Exception:
+            continue
+    if len(generations) > 1:
+        detail = ", ".join(f"{k}: {v}" for k, v in sorted(generations.items()))
+        print(f"  !! MIXED SCHEMA GENERATIONS in snapshots/ — {detail} (engine is "
+              f"{CURRENT_GENERATION}).\n"
+              f"     calibrate/eval_engine will EXCLUDE the others; archive them out.")
 
     now = datetime.now(timezone.utc)
     for sym in sorted(latest):
