@@ -36,6 +36,8 @@ data/calibration.json
 data/snapshot_index.json
 # monitor.py per-symbol alert state + daily Gemini budget counter (regenerated)
 data/telegram_state.json
+# monitor.py liveness heartbeat -- per-process, rewritten every cycle
+data/monitor_heartbeat.json
 
 # ---- tooling / IDE / OS ----
 .vscode/
