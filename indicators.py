@@ -319,10 +319,22 @@ def kill_zone(hour_utc: int, ts=None) -> str:
     if ts is not None:
         stamp = pd.Timestamp(ts)
         stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        resolved = False
         for tz_name, (start, end), name in KILL_ZONES_LOCAL:
             h = _local_hour(stamp, tz_name)
-            if h is not None and start <= h < end:
+            if h is None:
+                continue
+            resolved = True
+            if start <= h < end:
                 return name
+        # A timestamp that resolved in local time and matched nothing IS "OFF". Falling
+        # through to the fixed-UTC windows here re-introduced exactly the error B21.0
+        # removed, in the opposite direction: 12:00 UTC in winter is 07:00 New York --
+        # an hour BEFORE the NY kill zone -- but the fixed window (12-15 UTC) tagged it
+        # NEWYORK, telling the model there was institutional liquidity on 4 bars a day
+        # that were actually off-session. Only a tz lookup FAILURE may fall back.
+        if resolved:
+            return "OFF"
     for start, end, name in KILL_ZONES:
         if start <= hour_utc < end:
             return name

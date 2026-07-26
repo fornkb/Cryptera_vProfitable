@@ -41,6 +41,39 @@ def test_hour_only_callers_still_get_the_fixed_utc_fallback():
     assert kill_zone(22) == "OFF"
 
 
+@pytest.mark.parametrize("stamp,fixed_utc_would_say", [
+    # 12:00 UTC in winter is 07:00 New York — an HOUR BEFORE the NY kill zone — but the
+    # fixed UTC window (12-15) claimed NEWYORK.
+    (pd.Timestamp("2026-01-15T12:30:00Z"), "NEWYORK"),
+    # 09:00 UTC in summer is 10:00 London — just PAST the London window — but the fixed
+    # UTC window (7-10) claimed LONDON.
+    (pd.Timestamp("2026-07-15T09:30:00Z"), "LONDON"),
+])
+def test_a_timestamped_call_never_falls_back_to_the_fixed_utc_windows(stamp, fixed_utc_would_say):
+    """B21.0 regression: with a timestamp the LOCAL resolution is authoritative, and
+    "matched nothing" means OFF. Falling through to the fixed windows re-introduced the
+    same class of error in the opposite direction — one hour a day (4 x 15m bars) tagged
+    as a high-liquidity institutional window while actually off-session, which is a
+    direct input to the volume-gate context and the LLM prompt."""
+    assert kill_zone(stamp.hour, stamp) == "OFF"
+    assert kill_zone(stamp.hour) == fixed_utc_would_say   # hour-only path is unchanged
+
+
+def test_every_utc_hour_agrees_with_the_local_rule_in_both_dst_halves():
+    from config import KILL_ZONES_LOCAL
+    from indicators import _local_hour
+    for day in ("2026-01-15", "2026-07-15"):
+        for h in range(24):
+            ts = pd.Timestamp(f"{day} {h:02d}:00:00", tz="UTC")
+            expected = "OFF"
+            for tz_name, (start, end), name in KILL_ZONES_LOCAL:
+                lh = _local_hour(ts, tz_name)
+                if lh is not None and start <= lh < end:
+                    expected = name
+                    break
+            assert kill_zone(h, ts) == expected, f"{day} {h:02d}:00Z"
+
+
 # ---------------- B21.0: the volume baseline compares the right bars ---------------- #
 
 def _vol_frame(pattern_by_minute, days=8, last_volume=None):
