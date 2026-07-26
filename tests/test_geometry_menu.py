@@ -108,6 +108,55 @@ def test_emitted_levels_are_quantized():
             assert c["price"] == round(c["price"], _tick_decimals(100.0))
 
 
+# The fixture above uses round numbers (104.0, 107.0), so it cannot tell a quantized
+# menu from an unquantized one. This one is built from off-grid inputs at a price
+# magnitude with a COARSER grid, which is what exposed targets still emitting raw
+# 6dp floats (`take_profit` 1878.246813) after entries and stops were fixed.
+_OFF_GRID_PA = {
+    "value_area_1h": {"vah": 1840.123456, "val": 1760.987654, "poc": 1800.0},
+    "pdh": 1856.234567, "pdl": 1735.876543, "pwh": 1912.345678, "pwl": 1688.135791,
+    "sr_levels": {"resistance": [{"price": 1878.246813, "touches": 3, "high_confidence": True}],
+                  "support": [{"price": 1722.864213, "touches": 3, "high_confidence": True}]},
+    "untested_pocs_4h": [], "untested_pocs_1d": [], "avwap": {},
+}
+
+
+def _off_grid_ctx():
+    return {
+        "15m": {
+            "order_blocks": {"bullish": [{"top": 1793.456789, "bottom": 1787.123456,
+                                          "high_volume_node": False}],
+                             "bearish": [{"top": 1812.345678, "bottom": 1806.987654}]},
+            "fvg": {"nearest_bullish_fvg": None, "nearest_bearish_fvg": None},
+            "liquidity_levels": {"buy_side": [1871.357913, 1900.246802],
+                                 "sell_side": [1740.135792, 1710.864197],
+                                 "swing_levels": {"lows": [1755.864209], "highs": [1845.913578]}},
+            "dealing_range": {"low": 1700.0, "high": 1920.0},
+            "structure_state": {"protected_low": 1750.0, "protected_high": 1850.0},
+        },
+        "1h": {"order_blocks": {"bullish": [], "bearish": []},
+               "fvg": {"nearest_bullish_fvg": None, "nearest_bearish_fvg": None},
+               "liquidity_levels": {"buy_side": [1889.024680], "sell_side": [1725.135790]}},
+        "1d": {"liquidity_levels": {"buy_side": [], "sell_side": []}},
+    }
+
+
+@pytest.mark.parametrize("direction", ["bullish", "bearish"])
+def test_off_grid_inputs_are_still_quantized_in_every_menu(direction):
+    g = compute_trade_geometry(direction, price=1800.0, smc_context=_off_grid_ctx(),
+                               pa_context=_OFF_GRID_PA, atr_abs=15.0,
+                               regime="Trending Bullish", score_mode="trend", atr_1h=40.0)
+    assert g["valid"] is True
+    dp = _tick_decimals(1800.0)
+    assert dp == 2
+    for bucket in ("entries", "stops", "targets"):
+        off = [c["price"] for c in g["candidates"][bucket]
+               if c["price"] != round(c["price"], dp)]
+        assert not off, f"{bucket} emitted off-grid prices: {off[:3]}"
+    for key in ("entry", "stop_loss", "take_profit"):
+        assert g[key] == round(g[key], dp), f"primary {key} is off-grid: {g[key]}"
+
+
 # ---------------- B19.0: the menu can execute what the score reasons about ---------------- #
 
 def test_menu_carries_the_classic_intraday_draws():

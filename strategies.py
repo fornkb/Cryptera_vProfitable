@@ -1137,7 +1137,11 @@ def _rank_targets(labeled, entry, risk, direction, ref_price=None, atr_abs=None,
             continue
         if atr_1h and abs(float(p) - ref) > atr_1h * MAX_TARGET_ATR_1H_MULTIPLE:
             continue
-        rows.append({"price": round(float(p), 6), "source": s, "hvn": False})
+        # Same tick grid as entries and stops (I7.0). Targets were the one menu still
+        # emitting raw 6dp floats, so `take_profit` could land at 1878.246813 — the
+        # false precision I7.0 exists to remove, and the one price of the three that
+        # an operator actually places as a resting order.
+        rows.append({"price": _q(p, entry), "source": s, "hvn": False})
     rows.sort(key=lambda x: abs(x["price"] - entry))
     merged = _merge_confluent(rows)
     for m in merged:
