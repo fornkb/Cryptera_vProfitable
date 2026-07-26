@@ -31,6 +31,22 @@ class Cfg:
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     state_path = os.path.join(DATA_DIR, "telegram_state.json")
+    heartbeat_path = os.path.join(DATA_DIR, "monitor_heartbeat.json")
+
+    # ---- unattended liveness bounds (P0, 2026-07-21 five-day silent hang) ---- #
+    # Every one of these is WALL CLOCK, enforced with asyncio.wait_for, and every
+    # one is well under the 900s tick so a stall can never eat the next cycle.
+    # The ordering that matters: corpus collection is bounded SEPARATELY from and
+    # BEFORE narration, so a wedged Gemini call can never cost a single snapshot.
+    # Budget, and it MUST close: request 90 <= gemini call 180 <= narration 380
+    # <= alert phase 450; collect 300 (+30s grace in cycle()) + alert 450 = 780 < 900.
+    narration_deadline_s = int(os.getenv("NARRATION_DEADLINE", "380"))    # one symbol's narrate
+    alert_phase_deadline_s = int(os.getenv("ALERT_PHASE_DEADLINE", "450"))  # whole alert path
+    collect_deadline_s = int(os.getenv("COLLECT_DEADLINE", "300"))        # per symbol, cheap pass
+    # A cycle that has not COMPLETED within this long means the process is wedged:
+    # the watchdog heartbeat stops and systemd restarts us. Must exceed one tick
+    # (900s) plus a full cycle, or a normal quiet period would look like a hang.
+    max_stall_s = int(os.getenv("MAX_STALL_SECONDS", "2700"))             # 45 min = 3 missed ticks
 
     @classmethod
     def usable_budget(cls):

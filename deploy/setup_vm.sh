@@ -90,9 +90,22 @@ sudo tee /etc/systemd/system/cryptera-monitor.service > /dev/null << SERVICEEOF
 Description=Cryptera v3.2.4 collector + Telegram monitor
 After=network-online.target
 Wants=network-online.target
+# A wedge that survives a watchdog restart must not turn into a restart storm.
+# (These are [Unit] keys on systemd >= 229 — putting them in [Service] is silently ignored.)
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec is the P0 fix for the 2026-07-21 five-day silent hang.
+# `Restart=always` only ever saw a LIVE process, because the process WAS live -- it was
+# blocked forever inside a Gemini request that had no timeout. monitor.py now pets this
+# watchdog only while cycles are actually COMPLETING (alerts/liveness.py), so a hang
+# stops the heartbeat and systemd restarts us. WatchdogSec must comfortably exceed one
+# 15m tick plus a full cycle; MAX_STALL_SECONDS (default 2700) is the in-process limit
+# and should stay <= this value.
+Type=notify
+NotifyAccess=main
+WatchdogSec=3600
 WorkingDirectory=${REPO_DIR}
 # CRYPTERA_NO_CHART_SERIES=1 (FA-15): this headless corpus VM never reads chart_series
 # (only the web dashboard does) -- skipping it drops each snapshot from ~340KB to ~45KB.
@@ -104,6 +117,11 @@ Environment=CRYPTERA_RETENTION=0
 ExecStart=${REPO_DIR}/venv/bin/python monitor.py --retention 0 --no-color
 Restart=always
 RestartSec=15
+# On shutdown asyncio.run() JOINS the default thread-pool executor, so a narration
+# thread that is still inside its (now bounded) request delays exit. Cap the wait so a
+# watchdog restart is prompt instead of adding systemd's 90s default on top.
+TimeoutStopSec=30
+KillMode=mixed
 User=${CURRENT_USER}
 StandardOutput=journal
 StandardError=journal

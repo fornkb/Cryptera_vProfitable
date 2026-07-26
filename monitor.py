@@ -19,6 +19,16 @@ Gemini API call attempts (FA-12): `narrate` can retry across keys/schema tiers i
 and `_narrate_with_retry` adds one more outer attempt, all before a single `state.spend()`
 -- on an error-heavy day, real API calls can exceed DAILY_BUDGET while spend() stays low.
 
+LIVENESS (P0, 2026-07-21 -- five days of silent hang behind `active (running)`):
+every phase of a cycle is bounded by WALL CLOCK, not by hope.
+  * The COLLECT phase (cheap pass + persist) is bounded per symbol and produces the
+    corpus. It runs FIRST and is completely independent of Gemini.
+  * The ALERT phase (narrate + Telegram) is bounded per symbol AND as a whole. It can
+    time out, fail, or be skipped entirely without costing a single snapshot.
+  * A cycle that overruns everything still returns, so the 15m cadence loop survives.
+  * `alerts.liveness.Health` + `watchdog_task` convert a hang into a systemd restart,
+    which `Restart=always` alone provably cannot do (the process never died).
+
 Run:  python monitor.py   (24/7 via systemd -- see deploy/setup_vm.sh)
 """
 
@@ -37,6 +47,9 @@ from alerts.config import Cfg
 from alerts.budget import State
 from alerts import controller as C
 from alerts import telegram as T
+from alerts import liveness as L
+
+logger = logging.getLogger("cryptera.monitor")
 
 
 # --------------------------- console output --------------------------- #
@@ -109,34 +122,56 @@ async def _narrate_with_retry(snap):
     `narrate` call is itself not one API call -- it walks up to 3 keys x transient
     retries x 2 schema tiers internally (FA-12) -- so a failed-then-retried attempt here
     can cost several real Gemini calls while `state.spend()` (module docstring) only
-    ever charges 1, on success."""
-    analysis = await asyncio.to_thread(narrate, snap)
-    if isinstance(analysis, dict) and "error" in analysis:
-        await asyncio.sleep(Cfg.min_call_spacing_s)
+    ever charges 1, on success.
+
+    Bounded by `Cfg.narration_deadline_s` of WALL CLOCK (P0). `asyncio.wait_for` cannot
+    kill the worker thread, but it does return control to the cycle -- and the SDK's own
+    request timeout (config.GEMINI_REQUEST_TIMEOUT_SECONDS) guarantees the orphaned
+    thread dies on its own shortly after, so threads cannot accumulate across cycles.
+    """
+    async def _attempt():
         analysis = await asyncio.to_thread(narrate, snap)
-    return analysis
+        if isinstance(analysis, dict) and "error" in analysis:
+            await asyncio.sleep(Cfg.min_call_spacing_s)
+            analysis = await asyncio.to_thread(narrate, snap)
+        return analysis
+
+    try:
+        return await asyncio.wait_for(_attempt(), Cfg.narration_deadline_s)
+    except asyncio.TimeoutError:
+        logger.error(f"narrate timed out after {Cfg.narration_deadline_s}s — "
+                     f"degrading to engine-only for this symbol.")
+        return {"error": f"narrate timeout ({Cfg.narration_deadline_s}s)"}
 
 
 # --------------------------- cycle --------------------------- #
 
-async def cycle(state, rt):
-    # --- cheap pass: score every watched symbol, no API. Parallel across the watchlist so the
-    # order-book persistence wait doesn't serialize per symbol. ---
+async def _collect_phase(rt, out):
+    """Cheap pass + persist. The corpus is the top-priority output, so this phase runs
+    FIRST, touches no Gemini, and writes its results into `out` INCREMENTALLY -- if the
+    phase is cancelled on deadline, everything already persisted still counts.
+
+    Each symbol is bounded independently: one wedged symbol must not cost the others."""
     async def _one(sym):
         try:
-            snap, data = await compute_snapshot_no_llm(sym)
+            snap, data = await asyncio.wait_for(
+                compute_snapshot_no_llm(sym), Cfg.collect_deadline_s)
             return (sym, snap, data, C.engine_gate(snap, Cfg.threshold, Cfg.conditional_threshold))
+        except asyncio.TimeoutError:
+            logger.error(f"[cheap-pass] {sym} exceeded {Cfg.collect_deadline_s}s (skipping this cycle)")
+            return None
         except Exception as e:
             print(f"[cheap-pass] {sym} failed (skipping this cycle): {e}")
             return None
     results = [r for r in await asyncio.gather(*(_one(s) for s in rt.symbols)) if r]
+    out["results"] = results
 
     # --- persist EVERY snapshot FIRST: the corpus (top-priority output) must never depend on
     # the alert path. chart_series is attached here for all (added after any LLM call, never in
     # the prompt). Narrated snaps are re-written in place below so they additionally carry
     # `analysis`. retention <=0 (collector mode) = keep everything. ---
     n_active = 0
-    paths = {}
+    paths = out["paths"]
     for sym, snap, data, d in results:
         # Per-symbol isolation: one bad chart_series/serialization must not skip the rest of the corpus.
         try:
@@ -150,83 +185,120 @@ async def cycle(state, rt):
             print(f"[persist] {sym} failed (skipping): {e}")
     print(_Clr.w(_Clr.GREY, f"  cycle: {len(results)} snapshot(s) saved · {n_active} ACTIVE"))
 
-    # --- alert path: narrate + Telegram on gated transitions (budget-guarded). Skipped
-    # entirely in collect-only / keyless mode. Corpus is already on disk above. ---
-    if rt.alert_mode:
-        eligible = C.rank([t for t in results if C.should_narrate(state.sym(t[0]), t[3], Cfg)])
-        if eligible:
-            print(f"[cycle] {len(eligible)} eligible: " +
-                  ", ".join(f"{s}({d['score']})" for s, _, _, d in eligible))
-        with state.call_lock:                          # <=1 Gemini call in flight
-            for sym, snap, data, d in eligible:
-                # Per-symbol isolation: a finalize/serialization/Telegram failure on ONE symbol
-                # must not unwind the cycle and skip the corpus-persist loop below.
-                try:
-                    if state.can_spend(Cfg.budget_reserve, Cfg.daily_budget):
-                        analysis = await _narrate_with_retry(snap)
-                        if isinstance(analysis, dict) and "error" not in analysis:
-                            state.spend()              # only successful calls consume budget
-                            analysis = finalize_analysis(snap, analysis)
-                            snap["analysis"] = analysis
-                            # re-write the SAME corpus file in place so narrated snaps carry
-                            # `analysis` (needed by eval_engine's LLM-vs-engine A/B). Same
-                            # filename = same labeller row (dedupe is by filename), no
-                            # duplicate corpus entry.
-                            if paths.get(sym):
-                                try:
-                                    with open(paths[sym], "w") as f:
-                                        json.dump(snap, f, separators=(",", ":"))  # FA-14: compact
-                                except Exception as e:
-                                    print(f"[persist] {sym} re-write with analysis failed: {e}")
-                            # Telegram is a synchronous requests call (retries w/ backoff) -- run
-                            # it off the event loop so a slow/down Telegram can't stall the cycle.
-                            sent = await asyncio.to_thread(T.send_message, Cfg, T.format_active(sym, snap, analysis))
-                            if sent:
-                                print(f"[narrate] {sym} sent (budget {state.budget_used()}/{Cfg.usable_budget()})")
-                            else:
-                                print(f"[telegram] send FAILED for {sym} — alert lost, cooldown consumed (budget spent)")
+
+async def _alert_phase(state, rt, results, paths):
+    """narrate + Telegram on gated transitions (budget-guarded). Everything here is
+    OPTIONAL: the corpus is already on disk before this is entered, and the caller bounds
+    the whole phase, so any failure/timeout costs at most one cycle's alerts."""
+    eligible = C.rank([t for t in results if C.should_narrate(state.sym(t[0]), t[3], Cfg)])
+    if eligible:
+        print(f"[cycle] {len(eligible)} eligible: " +
+              ", ".join(f"{s}({d['score']})" for s, _, _, d in eligible))
+    async with state.call_lock:                    # <=1 Gemini call in flight
+        for sym, snap, data, d in eligible:
+            # Per-symbol isolation: a finalize/serialization/Telegram failure on ONE symbol
+            # must not unwind the alert path and skip the remaining symbols.
+            try:
+                if state.can_spend(Cfg.budget_reserve, Cfg.daily_budget):
+                    analysis = await _narrate_with_retry(snap)
+                    if isinstance(analysis, dict) and "error" not in analysis:
+                        state.spend()              # only successful calls consume budget
+                        analysis = finalize_analysis(snap, analysis)
+                        snap["analysis"] = analysis
+                        # re-write the SAME corpus file in place so narrated snaps carry
+                        # `analysis` (needed by eval_engine's LLM-vs-engine A/B). Same
+                        # filename = same labeller row (dedupe is by filename), no
+                        # duplicate corpus entry.
+                        if paths.get(sym):
+                            try:
+                                with open(paths[sym], "w") as f:
+                                    json.dump(snap, f, separators=(",", ":"))  # FA-14: compact
+                            except Exception as e:
+                                print(f"[persist] {sym} re-write with analysis failed: {e}")
+                        # Telegram is a synchronous requests call (retries w/ backoff) -- run
+                        # it off the event loop so a slow/down Telegram can't stall the cycle.
+                        sent = await asyncio.to_thread(T.send_message, Cfg, T.format_active(sym, snap, analysis))
+                        if sent:
+                            print(f"[narrate] {sym} sent (budget {state.budget_used()}/{Cfg.usable_budget()})")
                         else:
-                            await asyncio.to_thread(T.send_message, Cfg, T.format_deterministic(sym, snap, "LLM narration failed — engine geometry only"))
+                            print(f"[telegram] send FAILED for {sym} — alert lost, cooldown consumed (budget spent)")
                     else:
-                        await asyncio.to_thread(T.send_message, Cfg, T.format_deterministic(
-                            sym, snap, f"LLM narration skipped — daily Gemini quota exhausted "
-                                       f"({state.budget_used()}/{Cfg.usable_budget()})"))
-                    state.set_sym(sym, C.new_state(d))
-                except Exception as e:
-                    print(f"[narrate] {sym} failed (skipping, cycle continues): {e}")
-                await asyncio.sleep(Cfg.min_call_spacing_s)
+                        await asyncio.to_thread(T.send_message, Cfg, T.format_deterministic(sym, snap, "LLM narration failed — engine geometry only"))
+                else:
+                    await asyncio.to_thread(T.send_message, Cfg, T.format_deterministic(
+                        sym, snap, f"LLM narration skipped — daily Gemini quota exhausted "
+                                   f"({state.budget_used()}/{Cfg.usable_budget()})"))
+                state.set_sym(sym, C.new_state(d))
+            except Exception as e:
+                print(f"[narrate] {sym} failed (skipping, cycle continues): {e}")
+            await asyncio.sleep(Cfg.min_call_spacing_s)
 
-        # optional CONDITIONAL heads-up: deterministic-only (no Gemini spend), rising edge
-        # into the conditional band, same per-symbol cooldown. Per-symbol isolation: a
-        # State.save() disk error on ONE symbol must not unwind the alert path.
-        if Cfg.alert_on_conditional:
-            for sym, snap, data, d in results:
-                try:
-                    prev = state.sym(sym)
-                    now_t = time.time()
-                    if (d.get("conditional") and not d["active"] and not prev.get("conditional")
-                            and (now_t - prev.get("last_alert_ts", 0)) >= Cfg.min_realert_s):
-                        await asyncio.to_thread(T.send_message, Cfg, T.format_deterministic(
-                            sym, snap, f"CONDITIONAL setup (score {d['score']}/{d['threshold']}) — "
-                                       f"engine-only heads-up, no LLM spent"))
-                        prev.update({"conditional": True, "last_alert_ts": now_t})
-                        state.set_sym(sym, prev)
-                    elif not d.get("conditional") and prev.get("conditional"):
-                        prev["conditional"] = False
-                        state.set_sym(sym, prev)
-                except Exception as e:
-                    print(f"[conditional] {sym} failed (skipping): {e}")
-
-        # re-arm symbols that dropped out of ACTIVE so a future cross fires again
+    # optional CONDITIONAL heads-up: deterministic-only (no Gemini spend), rising edge
+    # into the conditional band, same per-symbol cooldown. Per-symbol isolation: a
+    # State.save() disk error on ONE symbol must not unwind the alert path.
+    if Cfg.alert_on_conditional:
         for sym, snap, data, d in results:
             try:
-                if not d["active"]:
-                    prev = state.sym(sym)
-                    if prev.get("active"):
-                        prev["active"] = False
-                        state.set_sym(sym, prev)
+                prev = state.sym(sym)
+                now_t = time.time()
+                if (d.get("conditional") and not d["active"] and not prev.get("conditional")
+                        and (now_t - prev.get("last_alert_ts", 0)) >= Cfg.min_realert_s):
+                    await asyncio.to_thread(T.send_message, Cfg, T.format_deterministic(
+                        sym, snap, f"CONDITIONAL setup (score {d['score']}/{d['threshold']}) — "
+                                   f"engine-only heads-up, no LLM spent"))
+                    prev.update({"conditional": True, "last_alert_ts": now_t})
+                    state.set_sym(sym, prev)
+                elif not d.get("conditional") and prev.get("conditional"):
+                    prev["conditional"] = False
+                    state.set_sym(sym, prev)
             except Exception as e:
-                print(f"[re-arm] {sym} failed (skipping): {e}")
+                print(f"[conditional] {sym} failed (skipping): {e}")
+
+    # re-arm symbols that dropped out of ACTIVE so a future cross fires again
+    for sym, snap, data, d in results:
+        try:
+            if not d["active"]:
+                prev = state.sym(sym)
+                if prev.get("active"):
+                    prev["active"] = False
+                    state.set_sym(sym, prev)
+        except Exception as e:
+            print(f"[re-arm] {sym} failed (skipping): {e}")
+
+
+async def cycle(state, rt, health=None):
+    """One 15m cycle: bounded COLLECT, then bounded ALERT.
+
+    The two phases are separated so the failure that cost 5 days of corpus is
+    structurally impossible: narration lives entirely downstream of persistence and
+    is bounded independently, so it can hang, fail, or time out without touching the
+    snapshot count. Returns the number of snapshots persisted."""
+    out = {"results": [], "paths": {}}
+    try:
+        await asyncio.wait_for(_collect_phase(rt, out), Cfg.collect_deadline_s + 30)
+    except asyncio.TimeoutError:
+        logger.error(f"[collect] phase exceeded {Cfg.collect_deadline_s + 30}s — "
+                     f"{len(out['paths'])} snapshot(s) persisted before the cut.")
+    except Exception as e:
+        logger.error(f"[collect] phase failed: {e}")
+
+    results, paths = out["results"], out["paths"]
+    if rt.alert_mode and results:
+        try:
+            await asyncio.wait_for(_alert_phase(state, rt, results, paths),
+                                   Cfg.alert_phase_deadline_s)
+        except asyncio.TimeoutError:
+            # The corpus is ALREADY on disk. Losing this cycle's alerts is the
+            # designed-for outcome; losing the corpus is not.
+            logger.error(f"[alert] phase exceeded {Cfg.alert_phase_deadline_s}s — "
+                         f"alerts skipped, corpus unaffected ({len(paths)} snapshot(s)).")
+        except Exception as e:
+            logger.error(f"[alert] phase failed (corpus unaffected): {e}")
+
+    if health is not None:
+        health.cycle_ok(len(paths))
+        L.write_heartbeat(Cfg.heartbeat_path, health, rt.symbols)
+    return len(paths)
 
 
 # --------------------------- entry point --------------------------- #
@@ -295,19 +367,37 @@ async def main():
             f"Watching {', '.join(rt.symbols)} @ score ≥ {Cfg.threshold}\n"
             f"Budget {Cfg.usable_budget()}/day (reset 00:00 UTC) · alerts on threshold crossings only."))
 
+    # P0 liveness: `Restart=always` restarts a process that DIED, and has no opinion
+    # about one that is alive and wedged (2026-07-21: 5 days of that). `health` is the
+    # progress signal; the watchdog task turns a stall into a restart by WITHHOLDING
+    # systemd's heartbeat. Gating on completed cycles -- not on a bare timer -- is what
+    # makes it able to see a hang that lives inside an await on a worker thread.
+    health = L.Health(Cfg.max_stall_s)
+    L.write_heartbeat(Cfg.heartbeat_path, health, rt.symbols)
+    L.sd_notify("READY=1")
+    watchdog = None
+    if not rt.once:
+        watchdog = asyncio.create_task(L.watchdog_task(health))
+
     # immediate first cycle (scores the last CLOSED bar), then align to 15m boundaries
     try:
-        await cycle(state, rt)
+        await cycle(state, rt, health)
     except Exception as e:
+        health.cycle_failed(e)
         print(f"[monitor] cycle error (continuing): {e}")
     if rt.once:
         return
-    while True:
-        await asyncio.sleep(_seconds_to_next_tick(Cfg.poll_second_offset))
-        try:
-            await cycle(state, rt)
-        except Exception as e:
-            print(f"[monitor] cycle error (continuing): {e}")
+    try:
+        while True:
+            await asyncio.sleep(_seconds_to_next_tick(Cfg.poll_second_offset))
+            try:
+                await cycle(state, rt, health)
+            except Exception as e:
+                health.cycle_failed(e)
+                print(f"[monitor] cycle error (continuing): {e}")
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
 
 
 if __name__ == "__main__":

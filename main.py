@@ -32,7 +32,8 @@ from config import (SCHEMA_VERSION, DATA_DIR, SNAPSHOTS_DIR, OI_HISTORY_PATH,
                     EVENT_CALENDAR_STALE_DAYS, LLM_CALL_THRESHOLD,
                     GEMINI_MODEL_NAME, GEMINI_THINKING_LEVEL,
                     GEMINI_KEY_COOLDOWN_SECONDS, GEMINI_TRANSIENT_RETRIES,
-                    GEMINI_TRANSIENT_BACKOFF_SECONDS)
+                    GEMINI_TRANSIENT_BACKOFF_SECONDS,
+                    GEMINI_REQUEST_TIMEOUT_SECONDS, GEMINI_CALL_DEADLINE_SECONDS)
 
 logger = logging.getLogger("cryptera")
 
@@ -1006,9 +1007,20 @@ def _load_gemini_keys() -> "list[str]":
 
 
 def _gemini_client_for_key(api_key: str) -> "genai.Client":
+    """Cached client per key, with an EXPLICIT transport timeout.
+
+    P0 (2026-07-21): the google-genai SDK defaults to no timeout, so a stalled
+    connection blocks the calling thread forever. That is exactly how a Gemini
+    503 episode froze the collector for 5 days behind a systemd `active (running)`.
+    `HttpOptions.timeout` is in MILLISECONDS.
+    """
     client = _GEMINI_CLIENTS.get(api_key)
     if client is None:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(
+                timeout=int(GEMINI_REQUEST_TIMEOUT_SECONDS * 1000)),
+        )
         _GEMINI_CLIENTS[api_key] = client
     return client
 
@@ -1359,18 +1371,26 @@ def _schema_skeleton(node: dict):
 _TRANSIENT_MARKERS = ("503", "unavailable", "overloaded", "high demand")
 
 
-def _call_gemini_with_key(client: "genai.Client", prompt: str) -> "tuple[dict | None, str | None, bool]":
+def _call_gemini_with_key(client: "genai.Client", prompt: str,
+                          deadline: float = None) -> "tuple[dict | None, str | None, str | None]":
     """
     Try schema then plain-json config tiers on a single client. Returns
-    (result, error, is_key_error): `is_key_error` is True only when the SDK
-    call itself raised (rate limit, auth, network, ...) -- the caller should
-    bench that key and fail over. A parsed-but-empty response is not a key
-    problem, so it's surfaced immediately instead of triggering rotation.
+    (result, error, failure_kind) where `failure_kind` is one of:
 
-    Transient model-wide errors (503 UNAVAILABLE / overloaded) get a short
-    in-call backoff retry before failing over: key rotation can't fix an
-    overloaded model, and the snapshot is already computed by call time, so
-    losing the call wastes the whole run.
+      * ``"key"``       -- the SDK call raised something specific to THIS key
+                           (rate limit, auth, network): bench it and fail over.
+      * ``"transient"`` -- a model-wide 503/overloaded that outlived its in-call
+                           backoff. Rotating keys cannot fix an overloaded MODEL,
+                           so the caller degrades immediately instead of walking
+                           the remaining keys into the same wall and benching
+                           every one of them for the next cycle too.
+      * ``"response"``  -- parsed-but-empty / all tiers exhausted / deadline:
+                           not a key problem, surfaced as-is.
+      * ``None``        -- success.
+
+    `deadline` is a `time.monotonic()` instant. It is checked before every
+    attempt AND before every backoff sleep, so this function cannot outlive it
+    by more than one request timeout (P0 liveness).
     """
     for label, include_schema in (("schema", True), ("plain-json", False)):
         contents = prompt if include_schema else (
@@ -1379,6 +1399,8 @@ def _call_gemini_with_key(client: "genai.Client", prompt: str) -> "tuple[dict | 
         )
         error = None
         for attempt in range(1 + GEMINI_TRANSIENT_RETRIES):
+            if deadline is not None and time.monotonic() >= deadline:
+                return None, f"{label}: call deadline exceeded", "response"
             try:
                 response = client.models.generate_content(
                     model=GEMINI_MODEL_NAME,
@@ -1391,22 +1413,24 @@ def _call_gemini_with_key(client: "genai.Client", prompt: str) -> "tuple[dict | 
                     logger.warning(f"Gemini schema rejected ({e}); retrying without schema.")
                     error = "schema rejected"
                     break  # drop to the plain-json tier
-                if (any(m in msg for m in _TRANSIENT_MARKERS)
-                        and attempt < GEMINI_TRANSIENT_RETRIES):
+                is_transient = any(m in msg for m in _TRANSIENT_MARKERS)
+                if is_transient and attempt < GEMINI_TRANSIENT_RETRIES:
                     delay = GEMINI_TRANSIENT_BACKOFF_SECONDS * (attempt + 1)
+                    if deadline is not None and time.monotonic() + delay >= deadline:
+                        return None, f"{label}: {e} (deadline)", "response"
                     logger.warning(f"Gemini transient error ({e}); retrying in {delay}s.")
                     time.sleep(delay)
                     continue
-                return None, f"{label}: {e}", True
+                return None, f"{label}: {e}", ("transient" if is_transient else "key")
 
             result = _extract_response_dict(response)
             if result is None:
-                return None, "empty response", False
-            return result, None, False
+                return None, "empty response", "response"
+            return result, None, None
         if error != "schema rejected":
             break
 
-    return None, "all config tiers failed", False
+    return None, "all config tiers failed", "response"
 
 
 def query_gemini(snapshot: dict) -> dict:
@@ -1419,6 +1443,12 @@ def query_gemini(snapshot: dict) -> dict:
     Rotates across up to 3 API keys (round robin between calls). If a key's
     call raises, that key is benched for GEMINI_KEY_COOLDOWN_SECONDS and the
     next configured key is tried immediately within the same call.
+
+    Bounded by GEMINI_CALL_DEADLINE_SECONDS of wall clock (P0 liveness): the
+    per-request timeout alone does not bound 3 keys x 2 tiers x 3 attempts.
+    A model-wide 503 degrades on the FIRST key rather than benching all of
+    them -- the caller falls back to a deterministic engine-only path, and the
+    corpus (already persisted) is unaffected either way.
     """
     keys = _load_gemini_keys()
     if not keys:
@@ -1428,17 +1458,28 @@ def query_gemini(snapshot: dict) -> dict:
     # tokens on a snapshot this size (audit §4).
     prompt = f"DATA SNAPSHOT:\n{json.dumps(snapshot, separators=(',', ':'))}"
 
+    deadline = time.monotonic() + GEMINI_CALL_DEADLINE_SECONDS
     last_error = "no keys available"
     for index, api_key in _iter_gemini_keys():
+        if time.monotonic() >= deadline:
+            last_error = f"call deadline ({GEMINI_CALL_DEADLINE_SECONDS}s) exceeded"
+            logger.warning(f"Gemini {last_error}; degrading to engine-only.")
+            break
         client = _gemini_client_for_key(api_key)
-        result, error, is_key_error = _call_gemini_with_key(client, prompt)
+        result, error, failure_kind = _call_gemini_with_key(client, prompt, deadline=deadline)
         if result is not None:
             _advance_gemini_rotation(index)
             return result
 
         last_error = error
-        if not is_key_error:
-            break  # parsing/response issue, not a key issue -- rotating won't help
+        if failure_kind == "transient":
+            # Model-wide overload: every remaining key hits the same model. Failing
+            # over would burn ~2 more minutes and bench all three keys for the NEXT
+            # cycle as collateral damage. Degrade now.
+            logger.warning(f"Gemini model-wide transient failure ({error}); degrading to engine-only.")
+            break
+        if failure_kind != "key":
+            break  # parsing/response/deadline issue -- rotating won't help
 
         logger.warning(
             f"Gemini key #{index + 1}/{len(keys)} failed ({error}); cooling down "

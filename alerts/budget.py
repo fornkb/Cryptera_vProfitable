@@ -2,16 +2,20 @@
 per-symbol last-alert state. Single JSON file, atomic writes, crash-safe. One monitor
 process serializes Gemini calls, so a single in-flight lock is sufficient."""
 
+import asyncio
 import json
 import os
-import threading
 from datetime import datetime, timezone
 
 
 class State:
     def __init__(self, path):
         self.path = path
-        self.call_lock = threading.Lock()      # <=1 Gemini call in flight
+        # <=1 Gemini call in flight. asyncio.Lock, NOT threading.Lock: this is held
+        # ACROSS awaits on the single event-loop thread, where a threading.Lock is at
+        # best a no-op and at worst deadlocks the entire loop if it is ever contended
+        # (P0 liveness -- the one thing this process must never do is stop turning).
+        self.call_lock = asyncio.Lock()
         self.data = self._load()
 
     def _load(self):

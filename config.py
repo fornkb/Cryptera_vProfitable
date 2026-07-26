@@ -129,8 +129,12 @@ SNAPSHOT_RETENTION = 1000         # per symbol
 HORIZON_HOURS = 24                # forward window the geometry/targets are judged against
 
 # ---------------- Gemini ---------------- #
-GEMINI_MODEL_NAME = "gemini-3.5-flash"
-# Gemini 3.5 uses string-enum thinking levels instead of numeric budgets:
+# Verified against ai.google.dev (2026-07-26): `gemini-3.6-flash` is GA, supports
+# structured outputs (`response_schema`) and thinking, and keeps the SAME `medium`
+# default thinking level as 3.5 Flash — so GEMINI_RESPONSE_SCHEMA and the
+# `thinking_config.thinking_level` string enum below carry over unchanged.
+GEMINI_MODEL_NAME = "gemini-3.6-flash"
+# Gemini 3.x uses string-enum thinking levels instead of numeric budgets:
 # minimal | low | medium (default) | high. As of v3.3 the LLM must SELECT the
 # best candidate from the engine menu (the highest-stakes decision in the
 # output), which rewards deeper thinking, hence "high". This is the
@@ -146,5 +150,25 @@ GEMINI_KEY_COOLDOWN_SECONDS = 120
 # 503 UNAVAILABLE ("model overloaded") is transient and model-wide — rotating
 # keys doesn't help, but a short in-call backoff usually does, and by call time
 # the snapshot is already fully computed so a lost call wastes the whole run.
+# Once the in-call backoff is exhausted the call DEGRADES (returns an error dict)
+# instead of walking the remaining keys into the same overloaded model.
 GEMINI_TRANSIENT_RETRIES = 2
 GEMINI_TRANSIENT_BACKOFF_SECONDS = 6
+
+# ---- unattended liveness (P0, 2026-07-21 five-day silent hang) ---- #
+# The google-genai SDK defaults to NO transport timeout: a stalled connection
+# blocks the calling thread forever. On 2026-07-21 07:03 UTC a sustained Gemini
+# 503 episode left one request hanging, which froze monitor.cycle() for 5 days
+# while systemd still reported `active (running)`. Every other network call in
+# this repo bounds itself (requests timeout=5..8); this one must too.
+GEMINI_REQUEST_TIMEOUT_SECONDS = 90    # per HTTP request (SDK wants milliseconds)
+# Wall-clock ceiling for ONE query_gemini() across every key x config tier x
+# transient retry. Bounds the compound worst case (3 keys x 2 tiers x 3 attempts
+# = 18 requests + ~108s of backoff sleeps) that the per-request timeout alone
+# does not. Checked before each attempt and before each backoff sleep.
+#
+# The whole chain must fit inside one 15m collector tick, or cycles pile up and
+# the corpus thins out. Budget (tests/test_liveness.py pins it):
+#   request 90 <= gemini call 180 <= narration 380 <= alert phase 450
+#   collect phase 300 (+30 grace) + alert phase 450 = 780 < 900
+GEMINI_CALL_DEADLINE_SECONDS = 180
