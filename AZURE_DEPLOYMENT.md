@@ -219,10 +219,96 @@ to keep the corpus calibration-ready. Confirm it is scheduled with
 
 ---
 
+## 5b. DEPLOY EVENT -- cutting over from the pre-fix corpus
+
+Waves 1-3 changed what a snapshot MEANS (`schema_version` 3.3.1 -> 3.9.0) and what a
+label means (`label_version` 1 -> 2). Old and new snapshots therefore describe two
+different engines and **must never be pooled** (CLAUDE.md invariant 5). The tools now
+enforce this themselves -- `tools/corpus.py` excludes foreign generations from
+`calibrate`, `eval_engine`, `label_snapshots` and `ab_thinking`, and says so loudly --
+but the corpus should still be physically separated, because a directory holding two
+generations is confusing even when the arithmetic is right.
+
+Run this ONCE, on the VM, in order:
+
+```bash
+# 1. Stop collection AND labelling first -- a label pass running mid-archive would
+#    write outcomes into files you are about to move.
+sudo systemctl stop cryptera-monitor
+sudo systemctl stop cryptera-label.timer
+
+# 2. Archive the pre-fix corpus OUT of snapshots/ (never delete it -- it is a valid
+#    bug-repro set, just not a fittable one).
+cd ~/Cryptera-v3
+mkdir -p ~/cryptera-archive
+mv snapshots ~/cryptera-archive/snapshots_pre_waves_$(date -u +%Y%m%d)
+mkdir -p snapshots
+
+# 3. Archive the calibration fitted on it -- it encodes the OLD component meanings.
+#    The engine runs at equal weights when this file is absent, which is correct
+#    until the clean corpus supports a refit.
+mv data/calibration.json ~/cryptera-archive/ 2>/dev/null || true
+
+# 4. Deploy the new code and re-register the unit (it gained Type=notify +
+#    WatchdogSec -- `git pull` alone does NOT update /etc/systemd/system).
+git fetch origin && git checkout v3.2.4-correctness && git pull
+bash deploy/setup_vm.sh
+sudo systemctl daemon-reload
+
+# 5. Smoke-test BEFORE going 24/7.
+source venv/bin/activate && python monitor.py --once
+
+# 6. Back on.
+sudo systemctl start cryptera-monitor
+sudo systemctl start cryptera-label.timer
+cryptera-status        # should show a fresh heartbeat + a clean, single-generation corpus
+```
+
+**Verify the cutover took:**
+
+```bash
+cryptera-status                       # "Collector [OK ]", no MIXED SCHEMA warning
+python -m tools.eval_engine | head -20  # schema_generation 3.9, excluded_other_generations 0
+```
+
+**Then wait.** Do not refit calibration on day one. The order is always
+relabel -> eval -> calibrate, and `calibrate` refuses to emit weights below
+`--min-samples` (default 150 **episodes**, not snapshots -- episode collapsing is what
+stops one persisting setup counting as many trades). At ~3 symbols x 96 bars/day, with
+only a fraction producing valid geometry, expect **several weeks** before a fit is
+honest. Wave 4 (I8.0-I15.0) is gated on that corpus, not on the calendar.
+
+If you ever need to read the archived corpus, point a tool at it explicitly and pass
+`--allow-mixed-schema`. Never do that to produce a `calibration.json`.
+
+---
+
 ## 6. Living with it
 
-**Checking it's alive:** `sudo systemctl status cryptera-monitor` or
-`sudo journalctl -u cryptera-monitor -n 50`.
+**Checking it's alive:** `cryptera-status` is now the first thing to look at -- it
+leads with the collector's own progress heartbeat (last completed cycle, cycles this
+run, snapshots last cycle).
+
+This matters because of what happened on 2026-07-21: a Gemini request with no timeout
+hung, `monitor.cycle()` waited on it forever, and `systemctl status` reported
+`active (running)` for **five days** while zero snapshots were written. `Restart=always`
+restarts a process that DIED; it has no opinion about one that is alive and wedged.
+
+The unit now runs `Type=notify` with `WatchdogSec=3600`, and `monitor.py` pets that
+watchdog **only while cycles are actually completing** -- so a hang now ends in a
+restart instead of silence. `sudo systemctl status cryptera-monitor` still works, but
+treat "active (running)" alone as insufficient evidence; check the heartbeat.
+
+```bash
+cryptera-status                                   # heartbeat + corpus + per-symbol gate
+sudo journalctl -u cryptera-monitor -n 50
+cat data/monitor_heartbeat.json                   # raw liveness record
+```
+
+Tunable via `.env` if a cycle ever legitimately needs longer (all seconds):
+`NARRATION_DEADLINE` (380), `ALERT_PHASE_DEADLINE` (450), `COLLECT_DEADLINE` (300),
+`MAX_STALL_SECONDS` (2700). Their sum must stay under one 15m tick (900s) or cycles
+pile up -- `tests/test_liveness.py` pins that relationship.
 
 **Updating the code:**
 
@@ -233,7 +319,8 @@ sudo systemctl restart cryptera-monitor
 
 **Running calibration tools** against the corpus accumulating in `snapshots/`. Labelling
 already runs daily via `cryptera-label.timer`, so you normally only need eval + calibrate;
-the manual `label_snapshots` call is there to catch up on demand:
+the manual `label_snapshots` call is there to catch up on demand. **Always in this order** --
+a fit on unlabelled or stale-labelled rows is worse than no fit:
 
 ```bash
 cd ~/Cryptera-v3 && source venv/bin/activate
@@ -241,6 +328,11 @@ python -m tools.label_snapshots --horizon 24    # optional -- the timer does thi
 python -m tools.eval_engine
 python -m tools.calibrate
 ```
+
+All four corpus tools refuse to pool snapshots from another schema/label generation and
+print what they excluded. If you see `[corpus] EXCLUDED ...`, something from an older
+engine is sitting in `snapshots/` -- archive it out rather than passing
+`--allow-mixed-schema`, which exists for cross-version archaeology and never for a fit.
 
 Run these on the VM, or `scp`/rsync `snapshots/` and `data/` back to your own machine to
 calibrate locally instead.

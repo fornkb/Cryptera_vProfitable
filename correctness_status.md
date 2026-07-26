@@ -242,10 +242,58 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
       — under-counting is the safe direction; tune on the clean corpus in Wave 4.*
       New `test_sessions_and_episodes.py` (15). SCHEMA 3.9.0. 275/275.
 
+## Wave 3.5 — pre-Azure-deploy audit (2026-07-26)
+
+Full pre-deployment audit of the post-Wave-3 tree. Unattended liveness treated as a
+first-class axis alongside prediction correctness. **Go for deploy** (see the session log).
+
+- [x] **P0 liveness (2026-07-21 five-day silent hang)** — all four diagnosed defects fixed:
+      `genai.Client` now sets `HttpOptions(timeout=…)` (the SDK default is unbounded);
+      `GEMINI_CALL_DEADLINE_SECONDS` bounds one `query_gemini` across keys x tiers x
+      retries; `monitor.cycle()` split into separately-bounded COLLECT and ALERT phases so
+      narration can hang/fail/time out without costing a snapshot; new `alerts/liveness.py`
+      + `Type=notify`/`WatchdogSec=3600` turn a hang into a restart by petting the watchdog
+      **only while cycles complete** (a bare timer would have petted through all five days —
+      the hang lived in an `await` on a worker thread and never blocked the loop).
+      Also: 503 now degrades on the first key instead of benching all three;
+      `State.call_lock` threading.Lock→asyncio.Lock; `TimeoutStopSec=30`.
+      `tests/test_liveness.py` (18).
+- [x] **P0 corpus generation** — `schema_version`/`label_version` were written and read by
+      NOTHING; every tool globbed `snapshots/*.json`. Measured on the real pre-wave archive:
+      `calibrate` accepted **92 of 130** schema-3.3.1 rows at schema 3.9.0, silently. New
+      `tools/corpus.py` (generation = schema major.minor; an `outcome` with no
+      `label_version` IS generation 1) wired defaulting-ON into calibrate / eval_engine /
+      label_snapshots / ab_thinking / status, reporting every exclusion.
+      `--allow-mixed-schema` is the loud opt-out. `tests/test_corpus_generation.py` (13).
+- [x] **B21.0 kill-zone DST regression** — a *timestamped* call fell through to the fixed-UTC
+      windows when no local session matched, re-introducing the error B21.0 removed in the
+      opposite direction: 12:00 UTC in winter reported NEWYORK (NY local 07:00), 09:00 UTC in
+      summer reported LONDON. 4 x 15m bars/day/symbol carried a false high-liquidity tag into
+      the volume-gate context and the prompt. Local resolution is now authoritative.
+- [x] **I7.0 target quantization** — `_rank_targets` still built rows with `round(p, 6)` while
+      entries/stops used `_q`, so `take_profit` escaped the tick grid (1878.246813 at a 2dp
+      magnitude). The existing test passed vacuously on round-number fixtures; replaced with
+      off-grid inputs at a coarser grid, both directions.
+- [x] **GEMINI_MODEL_NAME → `gemini-3.6-flash`** — verified against ai.google.dev 2026-07-26:
+      GA, structured outputs supported, SAME `medium` default thinking level as 3.5 Flash, so
+      `GEMINI_RESPONSE_SCHEMA` + `thinking_config.thinking_level` carry over unchanged.
+- [x] **Verified, no change needed** — I3.0 break detection is look-ahead-free (exact fractal
+      max ⇒ `close[i] ≤ high[j]` inside the right window) and displacement never scans past
+      `break_idx`; `raid_idx` and `break_idx` share one index space (no slicing between
+      producer and consumer); `_build_llm_view` leak-free (12/12 probes); `trade_validation`
+      ran on **32 real Gemini analysis blocks** with 0 crashes while catching real violations;
+      `engine_gate`/web handle old-shape files; 43/44 numerical-robustness probes pass
+      (the miss — all-NaN OHLCV — is unreachable, `fetch_futures_klines` coerces with
+      `float()`); scoring is time-independent apart from correctly `now`-relative calendar levels.
+- [ ] **Deferred to Wave 4, measurement-gated** — `_impulse_origin` may pick a pullback pivot
+      not yet fractal-confirmed at `break_idx` (bounded, conservative-direction: it narrows the
+      displacement window); ADX floor blocking structurally-trending 4H (79/420 no-trade points);
+      `size_class="reduced"` frequency. All are threshold/tuning calls, out of audit scope.
+
 ## DEPLOY EVENT
 
 - [ ] Stop VM monitor + label timer → archive pre-fix `snapshots/` → deploy branch → restart
-      clean under new schema + label_version.
+      clean under new schema + label_version. **Runbook: `AZURE_DEPLOYMENT.md` §5b.**
 
 ## Wave 4 — measurement-gated (needs the NEW clean corpus)
 
@@ -341,6 +389,21 @@ deployed; VM still collecting pre-fix corpus. Promotion + first calibration fit 
   `tools/eval_engine.py`). DST-correct kill zones + minute-slot median volume baseline;
   calendar-anchored POC windows; distance-based episode identity. SCHEMA 3.9.0.
   New `test_sessions_and_episodes.py` (15). 275/275.
+
+- 2026-07-26 — **Pre-Azure-deploy audit → GO.** 5 commits: P0 liveness (4 defects + watchdog)
+  · P0 corpus-generation guard · I7.0 target quantization · B21.0 kill-zone DST · docs.
+  310/310 pytest (275 → +18 liveness, +13 corpus, +4 quantization/DST).
+  **Router frequency measured on REAL candles** (5 symbols x 84 walk-forward points = 420,
+  fresh Binance klines — not the forbidden corpus, not a fit): Transition 50%, tradable
+  rubric 49%, valid geometry 43%, clears the LLM gate 12.9%. **Conservative, not
+  economically broken** (~12 gated bars/day/symbol before the monitor's ACTIVE + 2h-cooldown
+  narrows further). Transition is dominated by legitimate unconfirmed structure (118/420 4H
+  CHoCH pending; 79/420 structurally-trending-but-sub-ADX-floor), **not** by a latched state
+  machine — `neutral/None` accounts for only 17/420, and expiry recovers on the next break.
+  I4.0 MR gate reached 0 `ready` in-sample, but 21 of 25 ranging points simply had no fade
+  LOCATION (price mid-range); the stage machine progressed correctly where one existed
+  (`no_balance`, `awaiting_mss`), so this is an unmeasured question for the clean corpus,
+  not a demonstrated over-gate.
 
 **Wave 3 COMPLETE** (8 commits): B17.0 · I3.0 · I3.0b/B8.0 · I6.0/B9.0 · I5.0/B12.0 ·
 I4.0/B18.0 · I7.0/B11.0/B19.0 · riders B21/B22/B23. 275/275 pytest, SCHEMA 3.4.0→3.9.0.
